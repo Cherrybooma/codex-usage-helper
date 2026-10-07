@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>用量小助手 · 演示数据</title>
+<style>
+  :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; color: #1f2924; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: #d7e0da; }
+  .desktop { min-height: 100vh; padding: 26px 24px; overflow: hidden; position: relative;
+    background: radial-gradient(ellipse at 25% 25%, #f3eee4 0, transparent 60%), radial-gradient(ellipse at 80% 70%, #9dac9a 0, transparent 65%), linear-gradient(145deg, #e1e4d9, #bdcbc4); }
+  .desktop::before { content: ""; position: absolute; width: 950px; height: 950px; border-radius: 50%; border: 100px solid #ffffff13; left: -280px; bottom: -830px; pointer-events: none; }
+  header { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #36433e9e; }
+  header strong { font-weight: 500; }
+  .preview-note { position: absolute; bottom: 32px; left: 0; right: 0; text-align: center; color: #34443d9c; font-size: 12px; line-height: 1.9; padding: 0 20px; }
+  .stage { margin: 62px auto 0; width: max-content; max-width: 100%; }
+  .frame { display: flex; align-items: stretch; gap: 0; padding: 3px; border-radius: 999px; position: relative;
+    border: 1px solid #ffffffbb; background: #ffffffd1; backdrop-filter: blur(28px) saturate(1.25); -webkit-backdrop-filter: blur(28px) saturate(1.25);
+    box-shadow: inset 0 1px 0 #ffffffb3, 0 12px 30px #354d3917, 0 2px 5px #354d3909; }
+  .module { isolation: isolate; position: relative; width: 68px; flex-shrink: 0; display: flex; justify-content: center; }
+  .module + .module::before { content: ""; position: absolute; top: 20px; bottom: 20px; left: 0; width: 1px; background: #3b514616; }
+  .orb { appearance: none; border: 1px solid #ffffff70; margin: 0; width: 64px; height: 64px; border-radius: 50%; cursor: pointer; color: inherit;
+    background: #ffffff1c; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; position: relative; z-index: 2;
+    box-shadow: inset 0 1px 1px #ffffff70; transition: background .22s, box-shadow .22s, transform .22s; outline: none; }
+  .orb .caption { max-width: 56px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 10px; color: #4d5c52; font-weight: 500; }
+  .orb .number { font-size: 16px; font-weight: 550; letter-spacing: -.4px; font-variant-numeric: tabular-nums; }
+  .orb:focus-visible { outline: 2px solid #667d6670; outline-offset: 3px; }
+  .module.open { z-index: 10; }
+  .module.open .orb { background: transparent; border-color: transparent; box-shadow: none; }
+  .module.open .orb .number { color: #26372a; }
+  .orb:active { transform: scale(.97); }
+  .detail { position: absolute; z-index: 1; top: 0; left: 2px; width: 64px; min-height: 240px; border-radius: 32px;
+    background: #f7f9f0e8; border: 1px solid #fffffff5; padding: 84px 7px 26px; text-align: center;
+    backdrop-filter: blur(24px) saturate(1.2); -webkit-backdrop-filter: blur(24px) saturate(1.2);
+    box-shadow: inset 0 1px 1px #fff, 0 16px 32px #354d3924, 0 3px 8px #354d3910;
+    opacity: 0; transform: scaleY(.24); transform-origin: 50% 32px; visibility: hidden; pointer-events: none;
+    transition: opacity .2s, transform .28s cubic-bezier(.2,.8,.2,1), visibility .2s; }
+  .detail::before { content: ""; width: 26px; height: 1px; background: #3b51461c; display: block; margin: -14px auto 16px; }
+  .module.open .detail { opacity: 1; transform: scaleY(1); visibility: visible; pointer-events: auto; }
+  .detail .name { font-size: 11px; font-weight: 550; line-height: 1.5; overflow-wrap: anywhere; }
+  .detail .tokens { font-size: 16px; font-weight: 550; letter-spacing: -.6px; margin-top: 12px; font-variant-numeric: tabular-nums; }
+  .detail .unit { font-size: 10px; margin-top: 4px; color: #4d5c52; }
+  .facts { display: flex; flex-direction: column; gap: 10px; margin: 14px 0 0; }
+  .fact dt { font-size: 10px; color: #4d5c52; line-height: 1.5; }
+  .fact dd { white-space: pre-line; margin: 4px 0 0; font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .detail .foot { font-size: 10px; color: #4d5c52; line-height: 1.6; margin-top: 12px; }
+  .members { margin-top: 20px; max-height: 100px; overflow-y: auto; scrollbar-width: thin; }
+  .member { margin-top: 14px; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+  .member span { display: block; color: #4d5c52; font-variant-numeric: tabular-nums; }
+  .controls { display: flex; gap: 4px; padding: 4px; border-radius: 999px; border: 1px solid #ffffff70; background: #ffffff26; }
+  .controls button { font: inherit; font-size: 11px; border: 0; background: none; color: #47564c; padding: 7px 12px; border-radius: 999px; cursor: pointer; }
+  .controls button[aria-pressed=true] { background: #ffffff9c; box-shadow: 0 1px 3px #253b2f0a; }
+  .connected .orb { border-color: transparent; background: transparent; box-shadow: none; }
+  .connected .module.open .orb { background: transparent; box-shadow: none; }
+  .connected .module + .module::before { opacity: .65; }
+  @media (max-width: 580px) {
+    header { align-items: start; gap: 16px; } .controls { flex-shrink: 0; }
+    .stage { margin-top: 72px; } .frame { padding: 8px 4px; }
+    .module { width: 62px; } .orb { width: 60px; height: 60px; gap: 5px; }
+    .orb .number { font-size: 16px; letter-spacing: -.5px; } .orb .caption { font-size: 10px; }
+    .detail { top: 0; left: 1px; width: 60px; padding: 80px 5px 26px; border-radius: 30px; transform-origin: 50% 30px; }
+    .detail .name { font-size: 10px; } .detail .tokens { font-size: 14px; } .fact dd { font-size: 11px; }
+    .module + .module::before { top: 20px; bottom: 20px; }
+  }
+  @media (prefers-reduced-motion: reduce) { *, *::before { transition: none !important; } }
+</style>
+</head>
+<body>
+<main class="desktop">
+  <header>
+    <strong>用量小助手 · 演示数据</strong>
+    <div class="controls" aria-label="预览样式">
+      <button type="button" aria-pressed="true" data-style="round">圆形模块</button>
+      <button type="button" aria-pressed="false" data-style="connected">连体胶囊</button>
+    </div>
+  </header>
+  <section class="stage" aria-label="用量组件">
+    <div class="frame" id="widget"></div>
+  </section>
+  <div class="preview-note">点击圆形模块，完整竖向胶囊浮在横条前面。悬停看详情，点击保持展开。<br>右上角可切换两种圆润程度 · 所有任务、数值与额度均为演示数据，不读取本机日志。</div>
+</main>
+<script>
+
+  const data = {"total_tokens": 10000000, "request_records": 100, "legacy_updates": 0, "generated_at": "2026-10-07T04:00:00+00:00", "tasks": [{"name": "创作项目", "total_tokens": 4200000, "percent": 42, "sessions_count": 6, "request_records": 42}, {"name": "播客整理", "total_tokens": 2800000, "percent": 28, "sessions_count": 4, "request_records": 28}, {"name": "个人网站", "total_tokens": 1800000, "percent": 18, "sessions_count": 3, "request_records": 18}, {"name": "其他", "total_tokens": 1200000, "percent": 12, "sessions_count": null, "request_records": 12, "is_other": true, "members_count": 2}], "other_tasks": [{"name": "练习项目", "total_tokens": 700000, "percent": 7, "sessions_count": 2, "request_records": 7}, {"name": "示例任务", "total_tokens": 500000, "percent": 5, "sessions_count": 1, "request_records": 5}], "quota_windows": [{"remaining_percent": 72, "used_percent": 28, "duration_mins": 10080, "resets_at": 1791948600}, {"remaining_percent": 65, "used_percent": 35, "duration_mins": 300, "resets_at": 1791365400}], "quota_stale": false, "weekly_budget": {"status": "estimated", "observed_total_percent": 128, "excess_percent": 28, "reset_count": 1, "notes": []}};
+  const token = n => n >= 1e6 ? (n/1e6).toFixed(2) + 'M' : n >= 1000 ? (n/1000).toFixed(1) + 'K' : String(n);
+  const escapeText = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const fact = (label,value) => `<div class="fact"><dt>${escapeText(label)}</dt><dd>${escapeText(value)}</dd></div>`;
+  const weeks = data.quota_windows.find(w => w.duration_mins === 10080);
+  const hours = data.quota_windows.find(w => w.duration_mins === 300);
+  const remaining = weeks ? (data.quota_stale ? '≈' : '') + weeks.remaining_percent.toFixed(0)+'%' : '—';
+  const ranked = [...data.tasks.filter(t=>!t.is_other),...data.other_tasks].sort((a,b)=>b.total_tokens-a.total_tokens || a.name.localeCompare(b.name));
+  const resetTime = weeks ? new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',weekday:'short',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(weeks.resets_at*1000)) : '未取得';
+  const budget = data.weekly_budget;
+  const weeklyUsed = budget?.observed_total_percent == null ? (budget ? '待核实' : '尚无记录') : '≈'+budget.observed_total_percent.toFixed(1)+'%';
+  const weeklyExcess = !budget ? '尚无记录' : budget.observed_total_percent != null && budget.observed_total_percent <= 100 ? '未超额' : budget.excess_percent == null ? '待核实' : budget.excess_percent > 0 ? (budget.status === 'incomplete' ? '≥' : '+')+budget.excess_percent.toFixed(1)+'%' : '未超额';
+  const quotaFoot = [data.quota_stale ? '额度待更新' : '', budget?.status === 'incomplete' ? '周记录不完整' : ''].filter(Boolean).join(' · ') || '账号额度窗口';
+  const entries = [
+    {label:'周额度剩余',value:remaining,name:'额度详情',facts:(weeks ? fact('当前已用',(data.quota_stale?'≈':'')+weeks.used_percent.toFixed(0)+'%') : '')+fact('本周已用',weeklyUsed)+fact('本周超额',weeklyExcess)+fact('下次重置',resetTime)+fact('5小时剩余',hours ? hours.remaining_percent.toFixed(0)+'%' : '未取得'),foot:quotaFoot},
+    {label:'本周记录',value:token(data.total_tokens),name:'本机用量',amount:data.total_tokens,facts:fact('任务数量',ranked.length+' 个')+fact('模型响应',data.request_records+' 次'),foot:data.legacy_updates?'含旧记录估算':'本机记录汇总'}
+  ];
+  ranked.slice(0,3).forEach(task => {
+    const rank=ranked.findIndex(t=>t.name===task.name)+1;
+    entries.push({label:task.name,value:task.percent.toFixed(1)+'%',name:task.name,amount:task.total_tokens,
+      facts:fact('本周排名','第 '+rank+' 名')+fact('会话数量',task.sessions_count == null ? '未记录' : task.sessions_count+' 个')+
+        fact('模型响应',task.request_records+' 次')+
+        (data.legacy_updates === 0 && task.request_records > 0 ? fact('平均/响应',token(Math.round(task.total_tokens/task.request_records))+'\nToken') : ''),foot:''});
+  });
+  const rest=ranked.slice(3);
+  if(rest.length) {
+    const amount=rest.reduce((sum,t)=>sum+t.total_tokens,0);
+    entries.push({label:'其他',value:(data.total_tokens ? amount*100/data.total_tokens : 0).toFixed(1)+'%',name:'其他任务',amount,
+      facts:fact('合并任务',rest.length+' 个'),members:rest,foot:'其余任务合计'});
+  }
+  document.querySelector('#widget').innerHTML = entries.map((e,i)=>`<div class="module">
+    <button class="orb" aria-label="${escapeText(e.name+' '+e.value)}" aria-expanded="false" aria-controls="detail-${i}"><span class="caption">${escapeText(e.label)}</span><span class="number">${escapeText(e.value)}</span></button>
+    <div class="detail" id="detail-${i}" aria-hidden="true"><div class="name">${escapeText(e.name)}</div>
+      ${e.amount == null ? '' : `<div class="tokens">${token(e.amount)}</div><div class="unit">Token</div>`}
+      <dl class="facts">${e.facts}</dl>
+      ${e.members ? `<div class="members">${e.members.map(m=>`<div class="member">${escapeText(m.name)}<span>${m.percent.toFixed(1)}%</span></div>`).join('')}</div>` : ''}
+      ${e.foot ? `<div class="foot">${escapeText(e.foot)}</div>` : ''}
+    </div></div>`).join('');
+  const modules = [...document.querySelectorAll('.module')];
+  let active = null, locked = false, timer;
+  function show(module) {
+    active = module;
+    modules.forEach(m => {
+      const open = m === module;
+      m.classList.toggle('open', open);
+      m.querySelector('.orb').setAttribute('aria-expanded', String(open));
+      m.querySelector('.detail').setAttribute('aria-hidden', String(!open));
+    });
+  }
+  function close() { clearTimeout(timer); locked = false; show(null); }
+  modules.forEach(module => {
+    module.addEventListener('mouseenter', () => { clearTimeout(timer); if (!locked) timer = setTimeout(() => show(module), 140); });
+    module.addEventListener('mouseleave', () => { clearTimeout(timer); if (!locked) timer = setTimeout(() => show(null), 220); });
+    module.querySelector('.orb').addEventListener('click', () => {
+      clearTimeout(timer);
+      if (locked && active === module) close(); else { locked = true; show(module); }
+    });
+    module.querySelector('.orb').addEventListener('focus', () => { if (!locked) show(module); });
+    module.addEventListener('focusout', e => { if (!locked && !module.contains(e.relatedTarget)) show(null); });
+  });
+  document.addEventListener('click', e => { if (!e.target.closest('.module')) close(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+  document.querySelectorAll('[data-style]').forEach(button => {
+    button.addEventListener('click', () => {
+      document.querySelector('#widget').classList.toggle('connected', button.dataset.style === 'connected');
+      document.querySelectorAll('[data-style]').forEach(b => b.setAttribute('aria-pressed', String(b === button)));
+    });
+  });
+</script>
+</body>
+</html>

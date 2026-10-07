@@ -1,0 +1,21 @@
+# Local runtimes and build outputs
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+widget/build/
+
+# Private local records, diagnostics and export reports
+widget/data/
+validation/
+report.json
+codex-usage.json
+.env
+.env.*
+
+# Local review previews contain real snapshot data; publish only the demo
+widget/preview/*
+!widget/preview/demo.html
+
+# Local design notes
+widget/brand-spec.md

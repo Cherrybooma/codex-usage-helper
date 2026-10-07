@@ -1,0 +1,3 @@
+# Optional: zstd-compressed logs and IANA timezone data.
+zstandard>=0.22,<1
+tzdata>=2024.1
