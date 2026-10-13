@@ -462,6 +462,7 @@ def scan_usage(
     sessions: dict[str, dict] = {}
     models: dict[str, dict] = {}
     daily: dict[str, dict] = {}
+    project_daily: dict[tuple[str, str], dict] = {}
     totals = empty_counts()
     canonical_responses: dict[str, UsageEvent] = {}
     project_cache: dict[str | None, str] = {}
@@ -528,11 +529,17 @@ def scan_usage(
         })
         model_row = models.setdefault(model_name, {"model": model_name, **empty_counts()})
         day_row = daily.setdefault(day, {"day": day, **empty_counts()})
-        for bucket in (totals, project_row, session_row, model_row, day_row):
+        # Keep this joint grouping on the accepted-event path: separate project
+        # and daily totals cannot recover which project incurred each day's use.
+        project_day_row = project_daily.setdefault((day, project), {
+            "project": project, "day": day, **empty_counts(), "thread_ids": set(),
+        })
+        for bucket in (totals, project_row, session_row, model_row, day_row, project_day_row):
             for name in TOKEN_FIELDS:
                 bucket[name] += values[name]
             bucket["request_records" if kind == "response" else "legacy_updates"] += 1
         project_row["thread_ids"].add(event.thread_id)
+        project_day_row["thread_ids"].add(event.thread_id)
         session_row["projects"].add(project)
         session_row["models"].add(model_name)
         for name in event.missing_fields:
@@ -708,6 +715,14 @@ def scan_usage(
     for row in sessions.values():
         row["projects"] = sorted(row["projects"])
         row["models"] = sorted(row["models"])
+    project_daily_rows = []
+    for key in sorted(project_daily):
+        row = project_daily[key]
+        # Session counts are distinct within a project/day. A weekly count must
+        # union these IDs rather than sum days when sessions cross midnight.
+        row["sessions_count"] = len(row["thread_ids"])
+        row["thread_ids"] = sorted(row["thread_ids"])
+        project_daily_rows.append(row)
     ranked = lambda rows: sorted(rows, key=lambda row: (-row["total_tokens"], json.dumps(row, sort_keys=True)))
     return {
         "schema_version": 1,
@@ -723,6 +738,7 @@ def scan_usage(
         "sessions": ranked(sessions.values()),
         "models": ranked(models.values()),
         "daily": sorted(daily.values(), key=lambda row: row["day"]),
+        "project_daily": project_daily_rows,
         "coverage": coverage,
         "warnings": list(dict.fromkeys(warnings)),
     }

@@ -5,10 +5,96 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import subprocess
+import json
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from widget_backend import group_tasks, normalize_limits, save_observation, cycle_history, open_history, weekly_budget, WEEK_SECONDS, calendar_week
+from widget_backend import build_snapshot
+
+
+class SnapshotIntegrationTests(unittest.TestCase):
+    NOW = datetime(2026, 10, 13, 1, tzinfo=timezone.utc)
+
+    def report(self):
+        project = "/tmp/widget-root/task/sub"
+        return {"range": {"since_inclusive": "2026-10-11T16:00:00+00:00", "until_exclusive": self.NOW.isoformat()},
+                "totals": {"total_tokens": 100, "request_records": 1, "legacy_updates": 0},
+                "projects": [{"project": project, "total_tokens": 100, "request_records": 1, "thread_ids": ["private-session-id"]}],
+                "project_daily": [{"project": project, "day": "2026-10-13", "total_tokens": 100, "request_records": 1, "thread_ids": ["private-session-id"]}],
+                "coverage": {"files_found": 1, "files_scanned": 1, "files_skipped": 0, "malformed_lines": 0}, "warnings": []}
+
+    def test_corrupt_notion_cache_is_local_only_error_with_unchanged_tokens(self):
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()):
+            data = Path(temporary)
+            (data / "notion-config.json").write_text('{"version":1}')
+            (data / "notion-state.json").write_text('{"version":1}')
+            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+            self.assertEqual(snapshot["total_tokens"], 100)
+            self.assertEqual(snapshot["notion"]["state"], "error")
+
+    def test_bound_root_cannot_be_silently_regrouped_by_cli_override(self):
+        from notion_sync import NotionWorkspace
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()):
+            data = Path(temporary)
+            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+            workspace = NotionWorkspace(data)
+            with workspace._locked():
+                workspace.config["bindings"][snapshot["available_projects"][0]["task_id"]] = "00000000-0000-0000-0000-000000000001"
+            with self.assertRaises(ValueError):
+                build_snapshot(data, Path("/tmp/another-root"), data, False, self.NOW)
+
+    def test_sync_cli_config_error_is_structured_and_does_not_emit_private_text(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary)
+            (data / "notion-config.json").write_text("PRIVATE_SYNTHETIC_MARKER")
+            (data / "notion-state.json").write_text('{}')
+            process = subprocess.run([sys.executable, str(Path(__file__).with_name("widget_backend.py")),
+                "--sync-notion", "--data-dir", str(data)], capture_output=True, text=True)
+            self.assertEqual(process.returncode, 1)
+            self.assertFalse(json.loads(process.stdout)["ok"])
+            self.assertEqual(process.stderr, "")
+            self.assertNotIn("PRIVATE_SYNTHETIC_MARKER", process.stdout)
+
+    def test_snapshot_and_daily_share_counts_without_credentials_or_network(self):
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()), \
+             patch("notion_sync.keychain_token", side_effect=AssertionError("credential accessed")), \
+             patch("notion_sync.urllib_transport", side_effect=AssertionError("network accessed")):
+            data = Path(temporary)
+            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+            self.assertEqual(snapshot["total_tokens"], 100)
+            self.assertEqual(snapshot["tasks"][0]["name"], "task")
+            self.assertEqual(snapshot["tasks"][0]["percent"], 100)
+            self.assertFalse(snapshot["notion"]["connected"])
+            import json
+            rows = json.loads((data / "notion-daily.json").read_text())["rows"]
+            self.assertEqual(sum(row["total_tokens"] for row in rows), 100)
+            self.assertNotIn("private-session-id", str(rows))
+            again = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+            self.assertEqual(snapshot["tasks"], again["tasks"])
+
+    def test_first_scan_metadata_error_does_not_break_local_usage(self):
+        from notion_sync import NotionError
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()), \
+             patch("notion_sync.NotionWorkspace.project_for_task", side_effect=NotionError("invalid_input")):
+            data = Path(temporary)
+            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+            self.assertEqual(snapshot["total_tokens"], 100)
+            self.assertEqual(snapshot["notion"]["state"], "error")
+
+    def test_official_cache_staleness_uses_fixed_snapshot_clock(self):
+        import json
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()):
+            data = Path(temporary)
+            quota = {"observed_at": self.NOW.isoformat(), "plan": "plus", "source": "test", "limit_id": "codex",
+                     "windows": [{"key": "secondary", "label": "weekly", "duration_mins": 10080,
+                                  "used_percent": 10, "remaining_percent": 90, "resets_at": self.NOW.timestamp() + 5000}]}
+            (data / "official-latest.json").write_text(json.dumps(quota))
+            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+            self.assertFalse(snapshot["quota"]["stale"])
+            self.assertEqual(snapshot["quota"]["age_seconds"], 0)
 
 
 class WidgetTests(unittest.TestCase):

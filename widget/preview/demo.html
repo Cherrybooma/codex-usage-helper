@@ -1,155 +1,52 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>用量小助手 · 演示数据</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>用量小助手 · Codex × Notion 预览</title>
 <style>
-  :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; color: #1f2924; }
-  * { box-sizing: border-box; }
-  body { margin: 0; min-height: 100vh; background: #d7e0da; }
-  .desktop { min-height: 100vh; padding: 26px 24px; overflow: hidden; position: relative;
-    background: radial-gradient(ellipse at 25% 25%, #f3eee4 0, transparent 60%), radial-gradient(ellipse at 80% 70%, #9dac9a 0, transparent 65%), linear-gradient(145deg, #e1e4d9, #bdcbc4); }
-  .desktop::before { content: ""; position: absolute; width: 950px; height: 950px; border-radius: 50%; border: 100px solid #ffffff13; left: -280px; bottom: -830px; pointer-events: none; }
-  header { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #36433e9e; }
-  header strong { font-weight: 500; }
-  .preview-note { position: absolute; bottom: 32px; left: 0; right: 0; text-align: center; color: #34443d9c; font-size: 12px; line-height: 1.9; padding: 0 20px; }
-  .stage { margin: 62px auto 0; width: max-content; max-width: 100%; }
-  .frame { display: flex; align-items: stretch; gap: 0; padding: 3px; border-radius: 999px; position: relative;
-    border: 1px solid #ffffffbb; background: #ffffffd1; backdrop-filter: blur(28px) saturate(1.25); -webkit-backdrop-filter: blur(28px) saturate(1.25);
-    box-shadow: inset 0 1px 0 #ffffffb3, 0 12px 30px #354d3917, 0 2px 5px #354d3909; }
-  .module { isolation: isolate; position: relative; width: 68px; flex-shrink: 0; display: flex; justify-content: center; }
-  .module + .module::before { content: ""; position: absolute; top: 20px; bottom: 20px; left: 0; width: 1px; background: #3b514616; }
-  .orb { appearance: none; border: 1px solid #ffffff70; margin: 0; width: 64px; height: 64px; border-radius: 50%; cursor: pointer; color: inherit;
-    background: #ffffff1c; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; position: relative; z-index: 2;
-    box-shadow: inset 0 1px 1px #ffffff70; transition: background .22s, box-shadow .22s, transform .22s; outline: none; }
-  .orb .caption { max-width: 56px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 10px; color: #4d5c52; font-weight: 500; }
-  .orb .number { font-size: 16px; font-weight: 550; letter-spacing: -.4px; font-variant-numeric: tabular-nums; }
-  .orb:focus-visible { outline: 2px solid #667d6670; outline-offset: 3px; }
-  .module.open { z-index: 10; }
-  .module.open .orb { background: transparent; border-color: transparent; box-shadow: none; }
-  .module.open .orb .number { color: #26372a; }
-  .orb:active { transform: scale(.97); }
-  .detail { position: absolute; z-index: 1; top: 0; left: 2px; width: 64px; min-height: 240px; border-radius: 32px;
-    background: #f7f9f0e8; border: 1px solid #fffffff5; padding: 84px 7px 26px; text-align: center;
-    backdrop-filter: blur(24px) saturate(1.2); -webkit-backdrop-filter: blur(24px) saturate(1.2);
-    box-shadow: inset 0 1px 1px #fff, 0 16px 32px #354d3924, 0 3px 8px #354d3910;
-    opacity: 0; transform: scaleY(.24); transform-origin: 50% 32px; visibility: hidden; pointer-events: none;
-    transition: opacity .2s, transform .28s cubic-bezier(.2,.8,.2,1), visibility .2s; }
-  .detail::before { content: ""; width: 26px; height: 1px; background: #3b51461c; display: block; margin: -14px auto 16px; }
-  .module.open .detail { opacity: 1; transform: scaleY(1); visibility: visible; pointer-events: auto; }
-  .detail .name { font-size: 11px; font-weight: 550; line-height: 1.5; overflow-wrap: anywhere; }
-  .detail .tokens { font-size: 16px; font-weight: 550; letter-spacing: -.6px; margin-top: 12px; font-variant-numeric: tabular-nums; }
-  .detail .unit { font-size: 10px; margin-top: 4px; color: #4d5c52; }
-  .facts { display: flex; flex-direction: column; gap: 10px; margin: 14px 0 0; }
-  .fact dt { font-size: 10px; color: #4d5c52; line-height: 1.5; }
-  .fact dd { white-space: pre-line; margin: 4px 0 0; font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-  .detail .foot { font-size: 10px; color: #4d5c52; line-height: 1.6; margin-top: 12px; }
-  .members { margin-top: 20px; max-height: 100px; overflow-y: auto; scrollbar-width: thin; }
-  .member { margin-top: 14px; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
-  .member span { display: block; color: #4d5c52; font-variant-numeric: tabular-nums; }
-  .controls { display: flex; gap: 4px; padding: 4px; border-radius: 999px; border: 1px solid #ffffff70; background: #ffffff26; }
-  .controls button { font: inherit; font-size: 11px; border: 0; background: none; color: #47564c; padding: 7px 12px; border-radius: 999px; cursor: pointer; }
-  .controls button[aria-pressed=true] { background: #ffffff9c; box-shadow: 0 1px 3px #253b2f0a; }
-  .connected .orb { border-color: transparent; background: transparent; box-shadow: none; }
-  .connected .module.open .orb { background: transparent; box-shadow: none; }
-  .connected .module + .module::before { opacity: .65; }
-  @media (max-width: 580px) {
-    header { align-items: start; gap: 16px; } .controls { flex-shrink: 0; }
-    .stage { margin-top: 72px; } .frame { padding: 8px 4px; }
-    .module { width: 62px; } .orb { width: 60px; height: 60px; gap: 5px; }
-    .orb .number { font-size: 16px; letter-spacing: -.5px; } .orb .caption { font-size: 10px; }
-    .detail { top: 0; left: 1px; width: 60px; padding: 80px 5px 26px; border-radius: 30px; transform-origin: 50% 30px; }
-    .detail .name { font-size: 10px; } .detail .tokens { font-size: 14px; } .fact dd { font-size: 11px; }
-    .module + .module::before { top: 20px; bottom: 20px; }
-  }
-  @media (prefers-reduced-motion: reduce) { *, *::before { transition: none !important; } }
+:root{color-scheme:light;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif;--ink:#1f2924;--muted:#4d5c52;--size:64px;--slot:68px;--border:#fff9;color:var(--ink)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#dce3dc}button,select{font:inherit}button{color:inherit}button:focus-visible,select:focus-visible{outline:2px solid #75836f;outline-offset:3px}
+.desktop{min-height:100vh;position:relative;padding:24px 28px;background:radial-gradient(ellipse at 25% 25%,#f3eee4 0,transparent 65%),radial-gradient(ellipse at 80% 72%,#aebbad 0,transparent 65%),linear-gradient(145deg,#e1e4d9,#bdcbc4)}
+header{display:flex;align-items:center;justify-content:space-between;gap:24px;font-size:12px;color:#425348}header strong{font-weight:500}.tools{display:flex;gap:12px;align-items:center}.controls{padding:4px;display:flex;gap:2px;border:1px solid #fff9;border-radius:999px;background:#ffffff36}.controls button{font-size:11px;padding:7px 12px;border:0;background:transparent;border-radius:999px;cursor:pointer}.controls button[aria-pressed=true]{background:#ffffffe0;box-shadow:0 1px 3px #253b2f0a}select{border:1px solid #ffffffb8;border-radius:8px;padding:7px 9px;background:#ffffffe0;color:#425348;font-size:11px}
+.stage{margin:68px auto 0;width:max-content;position:relative;max-width:100%}.frame{display:flex;align-items:stretch;gap:0;padding:3px;border:1px solid var(--border);border-radius:999px;background:#ffffffe0;backdrop-filter:blur(28px) saturate(1.15);-webkit-backdrop-filter:blur(28px) saturate(1.15);box-shadow:inset 0 1px 0 #ffffffb3,0 12px 30px #354d3917,0 2px 5px #354d3909;position:relative;height:72px}
+.module{position:relative;width:var(--slot);flex-shrink:0;display:flex;justify-content:center;isolation:isolate}.module+.module::before{content:"";position:absolute;top:20px;height:24px;left:0;width:1px;background:#3b514619;pointer-events:none}.orb{appearance:none;border:0;margin:0;width:var(--size);height:var(--size);border-radius:50%;cursor:pointer;background:transparent;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;position:relative;z-index:3;outline:none}.orb:active{transform:scale(.97)}.avatar{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;background:#dbe3d9;color:#293b31;font-size:12px;font-weight:600;flex-shrink:0}.avatar.emoji{font-size:22px;background:none}.avatar.logo,.avatar.symbol{background:none;width:22px;height:22px}.avatar img,.avatar svg{width:20px;height:20px;display:block}.orb.project{gap:4px}.orb .caption{font-size:10px;font-weight:500;color:var(--muted);line-height:12px}.orb .number{font-size:16px;font-weight:550;letter-spacing:-.4px;font-variant-numeric:tabular-nums;line-height:19px;white-space:nowrap}.module.open{z-index:20}
+.detail{position:absolute;top:0;left:2px;width:64px;border-radius:32px;background:#f8faf3f5;border:1px solid #fffffff5;box-shadow:inset 0 1px 1px #fff,0 16px 32px #354d3924,0 3px 8px #354d3910;backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);opacity:0;transform:scaleY(.18);transform-origin:50% 32px;visibility:hidden;pointer-events:none;transition:opacity .18s,transform .24s cubic-bezier(.2,.8,.2,1),visibility .18s;z-index:1;padding-top:64px;overflow:hidden}.module.open .detail{opacity:1;transform:scaleY(1);visibility:visible;pointer-events:auto}.detail-content{overflow:auto;scrollbar-width:none;text-align:center;padding:8px 7px 26px;max-height:440px}.detail-content::-webkit-scrollbar{display:none}.divider{height:1px;width:26px;background:#3b514621;margin:0 auto 10px}.name{font-size:11px;font-weight:600;line-height:1.45;overflow-wrap:anywhere}.status{font-size:10px;margin-top:10px;line-height:1.5;color:#425448}.stale{font-size:10px;color:var(--muted);margin-top:3px;line-height:1.5}.tokens{font-size:16px;font-weight:550;margin-top:10px;letter-spacing:-.6px;font-variant-numeric:tabular-nums}.unit{font-size:10px;color:var(--muted);margin-top:4px}.facts{display:flex;flex-direction:column;gap:10px;margin:10px 0 0}.fact dt{font-size:10px;color:var(--muted);line-height:1.5}.fact dd{white-space:pre-line;margin:4px 0 0;font-size:11px;font-weight:500;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;line-height:1.4}.foot{font-size:10px;color:var(--muted);line-height:1.6;margin-top:10px;white-space:pre-line}.detail-action{appearance:none;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;background:transparent;border:0;border-radius:8px;margin:10px auto 0;width:48px;height:44px;font-size:10px;cursor:pointer;color:#314537}.detail-action svg{width:12px;height:12px}.detail-action:hover{background:#dce5d783}.members{font-size:10px;line-height:1.5}.member{margin-top:10px;overflow-wrap:anywhere}.member span{display:block;color:var(--muted)}
+.round .orb{border:1px solid #ffffff85;box-shadow:inset 0 1px 1px #ffffff85;background:#ffffff20}.round .module.open .orb{background:transparent;border-color:transparent;box-shadow:none}
+.help{position:absolute;bottom:32px;left:24px;right:24px;text-align:center;font-size:12px;line-height:1.9;color:#4d5c52}.help strong{font-weight:500}.toast{position:fixed;bottom:110px;left:50%;transform:translateX(-50%);background:#f8faf3f5;box-shadow:0 12px 40px #233b2e18;border:1px solid #fff;border-radius:14px;padding:14px 20px;max-width:460px;font-size:12px;line-height:1.7;opacity:0;pointer-events:none;transition:opacity .2s}.toast.visible{opacity:1}.legend{display:flex;justify-content:center;gap:18px;flex-wrap:wrap;margin-top:24px;color:#53634f;font-size:11px}.legend span:before{content:"";display:inline-block;width:5px;height:5px;margin:0 5px 1px 0;border-radius:50%;background:#829579}.menu{position:absolute;top:79px;left:-50px;width:164px;border:1px solid #fff;border-radius:12px;background:#f8faf3f5;box-shadow:0 16px 35px #233b2e18;padding:5px;display:none;z-index:40}.menu.open{display:block}.menu button{width:100%;text-align:left;border:0;background:transparent;border-radius:7px;font-size:12px;padding:9px;cursor:pointer}.menu button:hover,.menu button[aria-checked=true]{background:#dce5d7}
+@media(max-width:580px){.desktop{padding:20px 12px}header{align-items:flex-start;gap:12px;flex-direction:column}.tools{gap:8px;flex-wrap:wrap}.stage{margin-top:48px}.help{font-size:11px;bottom:24px}.legend{gap:10px}}
+@media(prefers-reduced-motion:reduce){*,*::before{transition:none!important}}
 </style>
 </head>
 <body>
 <main class="desktop">
-  <header>
-    <strong>用量小助手 · 演示数据</strong>
-    <div class="controls" aria-label="预览样式">
-      <button type="button" aria-pressed="true" data-style="round">圆形模块</button>
-      <button type="button" aria-pressed="false" data-style="connected">连体胶囊</button>
-    </div>
-  </header>
-  <section class="stage" aria-label="用量组件">
-    <div class="frame" id="widget"></div>
-  </section>
-  <div class="preview-note">点击圆形模块，完整竖向胶囊浮在横条前面。悬停看详情，点击保持展开。<br>右上角可切换两种圆润程度 · 所有任务、数值与额度均为演示数据，不读取本机日志。</div>
+<header><strong>用量小助手 · Codex × Notion</strong><div class="tools"><div class="controls" aria-label="预览样式"><button type="button" aria-pressed="true" data-style="connected">连体胶囊</button><button type="button" aria-pressed="false" data-style="round">圆形分隔</button></div><label><span class="sr-only">数据状态 </span><select id="scenario" aria-label="数据状态"><option value="normal">正常 · 部分项目已绑定</option><option value="offline">离线 · 使用旧缓存</option><option value="unbound">尚未绑定 Notion</option><option value="legacy">含旧版 Token 估算</option><option value="missing">尚未取得额度</option></select></label></div></header>
+<section class="stage" aria-label="Codex 项目用量胶囊"><div class="frame" id="widget"></div></section>
+<div class="help"><strong>所有数值、头像和状态均为固定演示数据。</strong><br>悬停看详情 · 点击保持 · Esc 收起 · Codex 上滚轮切换指标<br>Notion 操作在此预览中仅展示交互，不读取日志或写入账号。</div>
+<div class="toast" role="status" aria-live="polite" id="toast"></div>
 </main>
 <script>
-
-  const data = {"total_tokens": 10000000, "request_records": 100, "legacy_updates": 0, "generated_at": "2026-10-07T04:00:00+00:00", "tasks": [{"name": "创作项目", "total_tokens": 4200000, "percent": 42, "sessions_count": 6, "request_records": 42}, {"name": "播客整理", "total_tokens": 2800000, "percent": 28, "sessions_count": 4, "request_records": 28}, {"name": "个人网站", "total_tokens": 1800000, "percent": 18, "sessions_count": 3, "request_records": 18}, {"name": "其他", "total_tokens": 1200000, "percent": 12, "sessions_count": null, "request_records": 12, "is_other": true, "members_count": 2}], "other_tasks": [{"name": "练习项目", "total_tokens": 700000, "percent": 7, "sessions_count": 2, "request_records": 7}, {"name": "示例任务", "total_tokens": 500000, "percent": 5, "sessions_count": 1, "request_records": 5}], "quota_windows": [{"remaining_percent": 72, "used_percent": 28, "duration_mins": 10080, "resets_at": 1791948600}, {"remaining_percent": 65, "used_percent": 35, "duration_mins": 300, "resets_at": 1791365400}], "quota_stale": false, "weekly_budget": {"status": "estimated", "observed_total_percent": 128, "excess_percent": 28, "reset_count": 1, "notes": []}};
-  const token = n => n >= 1e6 ? (n/1e6).toFixed(2) + 'M' : n >= 1000 ? (n/1000).toFixed(1) + 'K' : String(n);
-  const escapeText = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  const fact = (label,value) => `<div class="fact"><dt>${escapeText(label)}</dt><dd>${escapeText(value)}</dd></div>`;
-  const weeks = data.quota_windows.find(w => w.duration_mins === 10080);
-  const hours = data.quota_windows.find(w => w.duration_mins === 300);
-  const remaining = weeks ? (data.quota_stale ? '≈' : '') + weeks.remaining_percent.toFixed(0)+'%' : '—';
-  const ranked = [...data.tasks.filter(t=>!t.is_other),...data.other_tasks].sort((a,b)=>b.total_tokens-a.total_tokens || a.name.localeCompare(b.name));
-  const resetTime = weeks ? new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',weekday:'short',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(weeks.resets_at*1000)) : '未取得';
-  const budget = data.weekly_budget;
-  const weeklyUsed = budget?.observed_total_percent == null ? (budget ? '待核实' : '尚无记录') : '≈'+budget.observed_total_percent.toFixed(1)+'%';
-  const weeklyExcess = !budget ? '尚无记录' : budget.observed_total_percent != null && budget.observed_total_percent <= 100 ? '未超额' : budget.excess_percent == null ? '待核实' : budget.excess_percent > 0 ? (budget.status === 'incomplete' ? '≥' : '+')+budget.excess_percent.toFixed(1)+'%' : '未超额';
-  const quotaFoot = [data.quota_stale ? '额度待更新' : '', budget?.status === 'incomplete' ? '周记录不完整' : ''].filter(Boolean).join(' · ') || '账号额度窗口';
-  const entries = [
-    {label:'周额度剩余',value:remaining,name:'额度详情',facts:(weeks ? fact('当前已用',(data.quota_stale?'≈':'')+weeks.used_percent.toFixed(0)+'%') : '')+fact('本周已用',weeklyUsed)+fact('本周超额',weeklyExcess)+fact('下次重置',resetTime)+fact('5小时剩余',hours ? hours.remaining_percent.toFixed(0)+'%' : '未取得'),foot:quotaFoot},
-    {label:'本周记录',value:token(data.total_tokens),name:'本机用量',amount:data.total_tokens,facts:fact('任务数量',ranked.length+' 个')+fact('模型响应',data.request_records+' 次'),foot:data.legacy_updates?'含旧记录估算':'本机记录汇总'}
-  ];
-  ranked.slice(0,3).forEach(task => {
-    const rank=ranked.findIndex(t=>t.name===task.name)+1;
-    entries.push({label:task.name,value:task.percent.toFixed(1)+'%',name:task.name,amount:task.total_tokens,
-      facts:fact('本周排名','第 '+rank+' 名')+fact('会话数量',task.sessions_count == null ? '未记录' : task.sessions_count+' 个')+
-        fact('模型响应',task.request_records+' 次')+
-        (data.legacy_updates === 0 && task.request_records > 0 ? fact('平均/响应',token(Math.round(task.total_tokens/task.request_records))+'\nToken') : ''),foot:''});
-  });
-  const rest=ranked.slice(3);
-  if(rest.length) {
-    const amount=rest.reduce((sum,t)=>sum+t.total_tokens,0);
-    entries.push({label:'其他',value:(data.total_tokens ? amount*100/data.total_tokens : 0).toFixed(1)+'%',name:'其他任务',amount,
-      facts:fact('合并任务',rest.length+' 个'),members:rest,foot:'其余任务合计'});
-  }
-  document.querySelector('#widget').innerHTML = entries.map((e,i)=>`<div class="module">
-    <button class="orb" aria-label="${escapeText(e.name+' '+e.value)}" aria-expanded="false" aria-controls="detail-${i}"><span class="caption">${escapeText(e.label)}</span><span class="number">${escapeText(e.value)}</span></button>
-    <div class="detail" id="detail-${i}" aria-hidden="true"><div class="name">${escapeText(e.name)}</div>
-      ${e.amount == null ? '' : `<div class="tokens">${token(e.amount)}</div><div class="unit">Token</div>`}
-      <dl class="facts">${e.facts}</dl>
-      ${e.members ? `<div class="members">${e.members.map(m=>`<div class="member">${escapeText(m.name)}<span>${m.percent.toFixed(1)}%</span></div>`).join('')}</div>` : ''}
-      ${e.foot ? `<div class="foot">${escapeText(e.foot)}</div>` : ''}
-    </div></div>`).join('');
-  const modules = [...document.querySelectorAll('.module')];
-  let active = null, locked = false, timer;
-  function show(module) {
-    active = module;
-    modules.forEach(m => {
-      const open = m === module;
-      m.classList.toggle('open', open);
-      m.querySelector('.orb').setAttribute('aria-expanded', String(open));
-      m.querySelector('.detail').setAttribute('aria-hidden', String(!open));
-    });
-  }
-  function close() { clearTimeout(timer); locked = false; show(null); }
-  modules.forEach(module => {
-    module.addEventListener('mouseenter', () => { clearTimeout(timer); if (!locked) timer = setTimeout(() => show(module), 140); });
-    module.addEventListener('mouseleave', () => { clearTimeout(timer); if (!locked) timer = setTimeout(() => show(null), 220); });
-    module.querySelector('.orb').addEventListener('click', () => {
-      clearTimeout(timer);
-      if (locked && active === module) close(); else { locked = true; show(module); }
-    });
-    module.querySelector('.orb').addEventListener('focus', () => { if (!locked) show(module); });
-    module.addEventListener('focusout', e => { if (!locked && !module.contains(e.relatedTarget)) show(null); });
-  });
-  document.addEventListener('click', e => { if (!e.target.closest('.module')) close(); });
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
-  document.querySelectorAll('[data-style]').forEach(button => {
-    button.addEventListener('click', () => {
-      document.querySelector('#widget').classList.toggle('connected', button.dataset.style === 'connected');
-      document.querySelectorAll('[data-style]').forEach(b => b.setAttribute('aria-pressed', String(b === button)));
-    });
-  });
+const OPENAI_LOGO='data:image/svg+xml;base64,PHN2ZyBmaWxsPSJjdXJyZW50Q29sb3IiIGZpbGwtcnVsZT0iZXZlbm9kZCIgaGVpZ2h0PSIxZW0iIHN0eWxlPSJmbGV4Om5vbmU7bGluZS1oZWlnaHQ6MSIgdmlld0JveD0iMCAwIDI0IDI0IiB3aWR0aD0iMWVtIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjx0aXRsZT5PcGVuQUk8L3RpdGxlPjxwYXRoIGQ9Ik0gOS4yMDUgOC42NTggdiAtMi4yNiBjIDAgLS4xOSAuMDcyIC0uMzMzIC4yMzggLS40MjggbCA0LjU0MyAtMi42MTYgYyAuNjE5IC0uMzU3IDEuMzU2IC0uNTIzIDIuMTE3IC0uNTIzIDIuODU0IDAgNC42NjIgMi4yMTIgNC42NjIgNC41NjYgMCAuMTY3IDAgLjM1NyAtLjAyNCAuNTQ3IGwgLTQuNzEgLTIuNzU5IGEgLjc5NyAuNzk3IDAgMCAwIC0uODU2IDAgbCAtNS45NyAzLjQ3MyB6IG0gMTAuNjA5IDguOCBWIDEyLjA2IGMgMCAtLjMzMyAtLjE0MyAtLjU3IC0uNDI5IC0uNzM3IGwgLTUuOTcgLTMuNDczIDEuOTUgLTEuMTE4IGEgLjQzMyAuNDMzIDAgMCAxIC40NzYgMCBsIDQuNTQzIDIuNjE3IGMgMS4zMDkgLjc2IDIuMTg5IDIuMzc4IDIuMTg5IDMuOTQ4IDAgMS44MDggLTEuMDcgMy40NzMgLTIuNzYgNC4xNjMgeiBNIDcuODAyIDEyLjcwMyBsIC0xLjk1IC0xLjE0MiBjIC0uMTY3IC0uMDk1IC0uMjM5IC0uMjM4IC0uMjM5IC0uNDI4IFYgNS44OTkgYyAwIC0yLjU0NSAxLjk1IC00LjQ3MiA0LjU5MSAtNC40NzIgMSAwIDEuOTI3IC4zMzMgMi43MTIgLjkyOCBMIDguMjMgNS4wNjcgYyAtLjI4NSAuMTY2IC0uNDI4IC40MDQgLS40MjggLjczNyB2IDYuODk4IHogTSAxMiAxNS4xMjggbCAtMi43OTUgLTEuNTcgdiAtMy4zMyBMIDEyIDguNjU4IGwgMi43OTUgMS41NyB2IDMuMzMgTCAxMiAxNS4xMjggeiBtIDEuNzk2IDcuMjMgYyAtMSAwIC0xLjkyNyAtLjMzMiAtMi43MTIgLS45MjcgbCA0LjY4NiAtMi43MTIgYyAuMjg1IC0uMTY2IC40MjggLS40MDQgLjQyOCAtLjczNyB2IC02Ljg5OCBsIDEuOTc0IDEuMTQyIGMgLjE2NyAuMDk1IC4yMzggLjIzOCAuMjM4IC40MjggdiA1LjIzMyBjIDAgMi41NDUgLTEuOTc0IDQuNDcyIC00LjYxNCA0LjQ3MiB6IG0gLTUuNjM3IC01LjMwMyBsIC00LjU0NCAtMi42MTcgYyAtMS4zMDggLS43NjEgLTIuMTg4IC0yLjM3OCAtMi4xODggLTMuOTQ4IEEgNC40ODIgNC40ODIgMCAwIDEgNC4yMSA2LjMyNyB2IDUuNDIzIGMgMCAuMzMzIC4xNDMgLjU3MSAuNDI4IC43MzggbCA1Ljk0NyAzLjQ0OSAtMS45NSAxLjExOCBhIC40MzIgLjQzMiAwIDAgMSAtLjQ3NiAwIHogbSAtLjI2MiAzLjkgYyAtMi42ODggMCAtNC42NjIgLTIuMDIxIC00LjY2MiAtNC41MTkgMCAtLjE5IC4wMjQgLS4zOCAuMDQ3IC0uNTcgbCA0LjY4NiAyLjcxIGMgLjI4NiAuMTY3IC41NzEgLjE2NyAuODU2IDAgbCA1Ljk3IC0zLjQ0OCB2IDIuMjYgYyAwIC4xOSAtLjA3IC4zMzMgLS4yMzcgLjQyOCBsIC00LjU0MyAyLjYxNiBjIC0uNjE5IC4zNTcgLTEuMzU2IC41MjMgLTIuMTE3IC41MjMgeiBtIDUuODk5IDIuODMgYSA1Ljk0NyA1Ljk0NyAwIDAgMCA1LjgyNyAtNC43NTYgQyAyMi4yODcgMTguMzM5IDI0IDE1Ljg0IDI0IDEzLjI5NiBjIDAgLTEuNjY1IC0uNzEzIC0zLjI4MiAtMS45OTggLTQuNDQ4IC4xMTkgLS41IC4xOSAtLjk5OSAuMTkgLTEuNDk4IDAgLTMuNDAxIC0yLjc1OSAtNS45NDcgLTUuOTQ2IC01Ljk0NyAtLjY0MiAwIC0xLjI2IC4wOTUgLTEuODggLjMxIEEgNS45NjIgNS45NjIgMCAwIDAgMTAuMjA1IDAgYSA1Ljk0NyA1Ljk0NyAwIDAgMCAtNS44MjcgNC43NTcgQyAxLjcxMyA1LjQ0NyAwIDcuOTQ1IDAgMTAuNDkgYyAwIDEuNjY2IC43MTMgMy4yODMgMS45OTggNC40NDggLS4xMTkgLjUgLS4xOSAxIC0uMTkgMS40OTkgMCAzLjQwMSAyLjc1OSA1Ljk0NiA1Ljk0NiA1Ljk0NiAuNjQyIDAgMS4yNiAtLjA5NSAxLjg4IC0uMzA5IGEgNS45NiA1Ljk2IDAgMCAwIDQuMTYyIDEuNzEzIHoiPjwvcGF0aD48L3N2Zz4=';
+const token=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1000?(n/1000).toFixed(1)+'K':String(n);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const icon={book:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 3h11v18H7a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3Z"/><path d="M4 18a3 3 0 0 1 3-3h11M8 6h6"/></svg>',arrow:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 12 12 4M4 4h8v8"/></svg>',switch:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13 6A5 5 0 0 0 4 3L2 5m0-4v4h4M3 10a5 5 0 0 0 9 3l2-2m0 4v-4h-4"/></svg>',link:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="m6 10 4-4M5 11l-1 1a2.8 2.8 0 0 1-4-4l3-3a2.8 2.8 0 0 1 4 0m2 0 1-1a2.8 2.8 0 0 1 4 4l-3 3a2.8 2.8 0 0 1-4 0"/></svg>'};
+const projects=[{id:'task-usage',name:'用量小助手 · Codex 项目账本',avatar:'用',tokens:6250000,sessions:6,responses:64,status:'开发中',bound:true},{id:'task-podcast',name:'收藏2播客',avatar:'🎙️',emoji:true,tokens:2100000,sessions:4,responses:22,status:'已发布',bound:true},{id:'task-ip',name:'个人 IP 建立',avatar:'IP',tokens:1650000,sessions:3,responses:14,status:null,bound:false}];
+const total=projects.reduce((sum,p)=>sum+p.tokens,0);
+let metric=0,scenario='normal',active=null,locked=false,timer=null,lastWheel=0,wheelSum=0;
+const metrics=['周剩余','5h 剩余','本周已用','本周超额'];
+const fact=(label,value)=>'<div class="fact"><dt>'+esc(label)+'</dt><dd>'+esc(value)+'</dd></div>';
+const snapshot=()=>({total_tokens:total,projects:projects.map(p=>({...p,percent:p.tokens*100/total})),scenario,metric});
+function quotaValue(){if(scenario==='missing')return '—';const vals=['72%','65%','≈128.0%','+28.0%'];return scenario==='offline'&&metric<2?'≈'+vals[metric]:vals[metric]}
+function quotaFacts(){const stale=scenario==='offline';const missing=scenario==='missing';return fact('当前已用',missing?'尚未取得':(stale?'≈':'')+'28%')+fact('本周已用',missing?'尚无记录':stale?'≈128.0%':'≈128.0%')+fact('本周超额',missing?'尚无记录':'+28.0%')+fact('下次重置',missing?'尚未取得':'周日 21:30')+fact('5小时剩余',missing?'尚未取得':(stale?'≈':'')+'65%')}
+function detail(e){let content='<div class="divider"></div><div class="name">'+esc(e.name)+'</div>';if(e.project){const bound=e.bound&&scenario!=='unbound';content+='<div class="status">'+esc(bound?e.status:'未绑定')+'</div>';if(bound&&scenario==='offline')content+='<div class="stale">状态待更新</div>'}if(e.amount!=null)content+='<div class="tokens">'+token(e.amount)+'</div><div class="unit">Token</div>';content+='<dl class="facts">'+e.facts+'</dl>';if(e.foot)content+='<div class="foot">'+esc(e.foot)+'</div>';if(e.id==='quota')content+='<button class="detail-action" type="button" data-action="cycle" aria-label="切换额度指标">'+icon.switch+'<span>切换指标</span></button>';else if(e.project){const bound=e.bound&&scenario!=='unbound';content+='<button class="detail-action" type="button" data-action="notion" data-bound="'+bound+'" aria-label="'+esc((bound?'打开 Notion 项目 ':'绑定项目 ')+e.name)+'">'+icon[bound?'arrow':'link']+'<span>'+(bound?'Notion':'绑定项目')+'</span></button>'}return '<div class="detail" id="detail-'+e.id+'" aria-hidden="true"><div class="detail-content">'+content+'</div></div>'}
+function entries(){return [{id:'quota',label:metrics[metric],value:quotaValue(),name:'Codex 额度',avatar:'<img src="'+OPENAI_LOGO+'" alt="">',kind:'logo',facts:quotaFacts(),foot:scenario==='missing'?'尚未取得额度':scenario==='offline'?'上次记录\n周记录不完整':metric>1?'已记录累计\n不是 Token 比例':'账号当前额度窗口'},{id:'total',label:'本周记录',value:token(total),name:'本机 Token',amount:total,avatar:icon.book,kind:'symbol',facts:fact('任务数量','3 个')+fact('模型响应','100 次')+(scenario==='legacy'?fact('记录质量','含旧版估算'):''),foot:scenario==='legacy'?'含旧记录估算':scenario==='offline'?'上次记录 · 等待更新':'本机保留记录'},...projects.map((p,i)=>({...p,id:p.id,project:true,label:p.name,value:(p.tokens*100/total).toFixed(1)+'%',amount:p.tokens,kind:p.emoji?'emoji':'initial',avatar:esc(p.avatar),facts:fact('本周排名','第 '+(i+1)+' 名')+fact('会话数量',p.sessions+' 个')+fact('模型响应',p.responses+' 次')+(scenario==='legacy'?'':fact('平均/响应',token(Math.round(p.tokens/p.responses))+'\nToken'))}))]}
+function render(){const state=active;document.querySelector('#widget').innerHTML=entries().map(e=>'<div class="module" data-id="'+e.id+'"><button class="orb '+(e.project?'project':'')+'" type="button" aria-label="'+esc(e.name+'，'+(e.project?'本周占比 ':e.label+' ')+e.value)+'" aria-expanded="false" aria-controls="detail-'+e.id+'"><span class="avatar '+e.kind+'">'+e.avatar+'</span><span class="number">'+esc(e.value)+'</span>'+(e.project?'':'<span class="caption">'+esc(e.label)+'</span>')+'</button>'+detail(e)+(e.id==='quota'?'<div class="menu" role="menu" aria-label="额度指标">'+metrics.map((m,i)=>'<button type="button" role="menuitemradio" aria-checked="'+(metric===i)+'" data-metric="'+i+'">'+m+'</button>').join('')+'</div>':'')+'</div>').join('');bind();show(state)}
+function show(id){active=id;document.querySelectorAll('.module').forEach(m=>{const open=m.dataset.id===id;m.classList.toggle('open',open);m.querySelector('.orb').setAttribute('aria-expanded',String(open));m.querySelector('.detail').setAttribute('aria-hidden',String(!open))})}
+function close(){clearTimeout(timer);locked=false;show(null);document.querySelector('.menu')?.classList.remove('open')}
+function setMetric(next){metric=((next%4)+4)%4;const quota=document.querySelector('[data-id="quota"]');quota.querySelector('.number').textContent=quotaValue();quota.querySelector('.caption').textContent=metrics[metric];quota.querySelector('.orb').setAttribute('aria-label','Codex 额度，'+metrics[metric]+' '+quotaValue());quota.querySelector('.foot').textContent=scenario==='missing'?'尚未取得额度':scenario==='offline'?'上次记录\n周记录不完整':metric>1?'已记录累计\n不是 Token 比例':'账号当前额度窗口';quota.querySelectorAll('[data-metric]').forEach(b=>b.setAttribute('aria-checked',String(Number(b.dataset.metric)===metric)));quota.querySelector('.menu').classList.remove('open')}
+function toast(s){const el=document.querySelector('#toast');el.textContent=s;el.classList.add('visible');setTimeout(()=>el.classList.remove('visible'),4000)}
+function bind(){document.querySelectorAll('.module').forEach(m=>{m.addEventListener('mouseenter',()=>{clearTimeout(timer);if(!locked)timer=setTimeout(()=>show(m.dataset.id),180)});m.addEventListener('mouseleave',()=>{clearTimeout(timer);if(!locked)timer=setTimeout(()=>show(null),240)});const button=m.querySelector('.orb');button.addEventListener('click',()=>{clearTimeout(timer);if(locked&&active===m.dataset.id)close();else{locked=true;show(m.dataset.id)}});button.addEventListener('focus',()=>{if(!locked)show(m.dataset.id)});m.addEventListener('focusout',e=>{if(!locked&&!m.contains(e.relatedTarget))show(null)});m.querySelector('[data-action="cycle"]')?.addEventListener('click',()=>setMetric(metric+1));m.querySelector('[data-action="notion"]')?.addEventListener('click',e=>toast(e.currentTarget.dataset.bound==='true'?'此处会打开对应的 Notion 项目页。预览使用演示数据，不访问真实账号。':'此处会打开绑定设置，由你选择已有项目或创建新项目，不自动建一堆项目。'));if(m.dataset.id==='quota'){m.querySelectorAll('[data-metric]').forEach(b=>b.addEventListener('click',()=>setMetric(Number(b.dataset.metric))));button.addEventListener('wheel',e=>{if(Math.abs(e.deltaY)<=Math.abs(e.deltaX))return;e.preventDefault();wheelSum+=e.deltaY;const now=performance.now();if(Math.abs(wheelSum)>18&&now-lastWheel>220){setMetric(metric+(wheelSum>0?1:-1));wheelSum=0;lastWheel=now}},{passive:false});button.addEventListener('contextmenu',e=>{e.preventDefault();m.querySelector('.menu').classList.toggle('open')})}})}
+document.addEventListener('click',e=>{if(!e.target.closest('.module'))close()});document.addEventListener('keydown',e=>{if(e.key==='Escape')close()});document.querySelector('#scenario').addEventListener('change',e=>{scenario=e.target.value;close();render()});document.querySelectorAll('[data-style]').forEach(b=>b.addEventListener('click',()=>{document.querySelector('#widget').classList.toggle('round',b.dataset.style==='round');document.querySelectorAll('[data-style]').forEach(x=>x.setAttribute('aria-pressed',String(x===b)))}));render();
+window.previewSnapshot=snapshot;
 </script>
 </body>
 </html>

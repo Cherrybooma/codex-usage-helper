@@ -6,7 +6,7 @@ import json
 import gzip
 import os
 import builtins
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
 import subprocess
@@ -118,6 +118,155 @@ class UsageScannerTests(unittest.TestCase):
 
     def project_rows(self, report):
         return {row["project"]: row for row in report["projects"]}
+
+    def assert_project_daily_consistent(self, report):
+        rows = report["project_daily"]
+        fields = TOKEN_FIELDS + ("request_records", "legacy_updates")
+        self.assertEqual(
+            [(row["day"], row["project"]) for row in rows],
+            sorted((row["day"], row["project"]) for row in rows),
+        )
+        for row in rows:
+            self.assertEqual(
+                set(row),
+                {"project", "day", "thread_ids", "sessions_count", *fields},
+            )
+            self.assertEqual(row["thread_ids"], sorted(set(row["thread_ids"])))
+            self.assertEqual(row["sessions_count"], len(row["thread_ids"]))
+        for field in fields:
+            self.assertEqual(sum(row[field] for row in rows), report["totals"][field])
+            for project in report["projects"]:
+                self.assertEqual(
+                    sum(row[field] for row in rows if row["project"] == project["project"]),
+                    project[field],
+                )
+            for day in report["daily"]:
+                self.assertEqual(
+                    sum(row[field] for row in rows if row["day"] == day["day"]),
+                    day[field],
+                )
+        for project in report["projects"]:
+            thread_ids = set().union(*(
+                set(row["thread_ids"]) for row in rows
+                if row["project"] == project["project"]
+            ))
+            self.assertEqual(sorted(thread_ids), project["thread_ids"])
+            self.assertEqual(len(thread_ids), project["sessions_count"])
+        json.dumps(report)
+
+    def test_project_daily_uses_local_midnight_and_distinct_sessions(self):
+        self.write_log("cross-midnight.jsonl", [
+            session("s", self.project_a),
+            turn("a", self.project_a),
+            request("2026-10-01T15:59:59Z", "s", "a", "before-midnight", usage(10)),
+            request("2026-10-01T16:00:00Z", "s", "a", "after-midnight", usage(20)),
+            turn("b", self.project_b, "2026-10-01T16:01:00Z"),
+            request("2026-10-01T16:02:00Z", "s", "b", "changed-project", usage(5)),
+        ])
+        self.write_log("another-session.jsonl", [
+            session("a-session", self.project_a),
+            request("2026-10-01T16:03:00Z", "a-session", "a", "another", usage(3)),
+        ])
+
+        report = self.scan(timezone=timezone(timedelta(hours=8)))
+        rows = {(row["day"], row["project"]): row for row in report["project_daily"]}
+        project = str(self.project_a.resolve())
+
+        self.assertEqual(rows[("2026-10-01", project)]["total_tokens"], 10)
+        self.assertEqual(rows[("2026-10-02", project)]["total_tokens"], 23)
+        self.assertEqual(rows[("2026-10-02", project)]["thread_ids"], ["a-session", "s"])
+        self.assertEqual(self.project_rows(report)[project]["sessions_count"], 2)
+        self.assertEqual(sum(row["sessions_count"] for row in rows.values()
+                             if row["project"] == project), 3)
+        self.assertEqual(len(report["sessions"]), 2)
+        self.assert_project_daily_consistent(report)
+
+    def test_project_daily_preserves_response_owner_across_archive_and_fork(self):
+        original = [
+            session("parent", self.project_a),
+            request("2026-10-01T00:02:00Z", "parent", "t", "shared", usage(10)),
+        ]
+        self.write_log("original.jsonl", original)
+        self.write_log("archive.jsonl", original, archived=True)
+        self.write_log("fork.jsonl", [
+            session("child", self.project_b, "2026-10-02T00:00:00Z",
+                    forked_from_id="parent"),
+            request("2026-10-02T00:01:00Z", "parent", "t", "shared", usage(10)),
+            request("2026-10-02T00:02:00Z", "child", "t", "new", usage(5)),
+        ])
+
+        report = self.scan(timezone=timezone.utc)
+        rows = report["project_daily"]
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["day"], rows[0]["project"], rows[0]["thread_ids"]),
+                         ("2026-10-01", str(self.project_a.resolve()), ["parent"]))
+        self.assertEqual(rows[0]["total_tokens"], 10)
+        self.assertEqual((rows[1]["day"], rows[1]["project"], rows[1]["thread_ids"]),
+                         ("2026-10-02", str(self.project_b.resolve()), ["child"]))
+        self.assertEqual(rows[1]["total_tokens"], 5)
+        self.assertEqual(report["totals"]["request_records"], 2)
+        self.assert_project_daily_consistent(report)
+
+    def test_project_daily_keeps_legacy_window_baseline_and_mixed_cutover(self):
+        self.write_log("mixed-window.jsonl", [
+            session("s", self.project_a),
+            legacy("2026-10-01T23:59:00Z", usage(80, 20, cached=40, total=110)),
+            legacy("2026-10-02T00:01:00Z", usage(100, 25, cached=50, total=145)),
+            turn("new", self.project_b, "2026-10-03T00:00:00Z"),
+            request("2026-10-03T00:01:00Z", "s", "new", "native", usage(7, 3, total=12)),
+            legacy("2026-10-03T00:01:01Z", usage(107, 28, cached=50, total=157)),
+        ])
+
+        report = self.scan(
+            since=datetime(2026, 10, 2, tzinfo=timezone.utc),
+            until=datetime(2026, 10, 4, tzinfo=timezone.utc),
+            timezone=timezone.utc,
+        )
+        old, new = report["project_daily"]
+
+        self.assert_tokens(old, usage(20, 5, cached=10, total=35))
+        self.assertEqual((old["legacy_updates"], old["request_records"]), (1, 0))
+        self.assert_tokens(new, usage(7, 3, total=12))
+        self.assertEqual((new["legacy_updates"], new["request_records"]), (0, 1))
+        self.assertEqual(report["totals"]["total_tokens"], 47)
+        self.assertEqual(report["coverage"]["legacy_snapshots_superseded"], 1)
+        self.assert_project_daily_consistent(report)
+
+    def test_project_daily_preserves_explicit_total_without_adding_subcategories(self):
+        self.write_log("explicit-total-daily.jsonl", [
+            session("s", self.project_a),
+            request("2026-10-01T00:02:00Z", "s", "t", "r",
+                    usage(7, 3, cached=6, cache_write=2, reasoning=2, total=12)),
+            event("2026-10-01T00:03:00Z", "thread_token_usage", {"usage": usage(1000)}),
+            event("2026-10-01T00:04:00Z", "turn_token_usage", {"usage": usage(1000)}),
+        ])
+
+        report = self.scan()
+        row = report["project_daily"][0]
+
+        self.assert_tokens(row, usage(7, 3, cached=6, cache_write=2, reasoning=2, total=12))
+        self.assertEqual(row["request_records"], 1)
+        self.assert_project_daily_consistent(report)
+
+    def test_project_daily_keeps_unknown_project_and_date_without_inventing_dates(self):
+        self.write_log("unknown-daily.jsonl", [
+            event("2026-10-01T00:00:00Z", "session_meta", {"id": "s"}),
+            request(None, "s", "t", "undated", usage(5)),
+            request("2026-10-01T00:02:00Z", "s", "t", "dated", usage(3)),
+        ])
+
+        complete = self.scan(timezone=timezone.utc)
+        bounded = self.scan(until=datetime(2026, 10, 2, tzinfo=timezone.utc),
+                            timezone=timezone.utc)
+
+        self.assertEqual([(row["day"], row["project"], row["total_tokens"])
+                          for row in complete["project_daily"]],
+                         [("2026-10-01", "unknown", 3), ("unknown", "unknown", 5)])
+        self.assertEqual(len(bounded["project_daily"]), 1)
+        self.assertEqual(bounded["totals"]["total_tokens"], 3)
+        self.assert_project_daily_consistent(complete)
+        self.assert_project_daily_consistent(bounded)
 
     def test_new_records_deduplicate_across_archive_copy_and_fork(self):
         shared_usage = usage(100, 20, cached=60, cache_write=5, reasoning=10)

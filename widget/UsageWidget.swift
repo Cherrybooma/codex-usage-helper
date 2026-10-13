@@ -3,7 +3,7 @@ import SwiftUI
 import CoreGraphics
 
 struct TaskRow: Decodable, Identifiable {
-    var id: String { is_other == true ? "__other_bucket__" : "folder:\(name)" }
+    var id: String { is_other == true ? "__other_bucket__" : "folder:\(task_id ?? name)" }
     let name: String
     let total_tokens: Int
     let percent: Double
@@ -11,6 +11,36 @@ struct TaskRow: Decodable, Identifiable {
     let is_other: Bool?
     let members_count: Int?
     let sessions_count: Int?
+    let task_id: String?
+    let display_name: String?
+    let project_status: String?
+    let icon_type: String?
+    let icon_value: String?
+    let notion_url: String?
+    let notion_stale: Bool?
+}
+
+struct LocalProject: Decodable, Identifiable {
+    var id: String { task_id }
+    let task_id: String
+    let name: String
+    let display_name: String?
+    let notion_page_id: String?
+    let project_status: String?
+}
+
+struct SnapshotRange: Decodable {
+    let since_inclusive: String?
+    let until_exclusive: String?
+}
+
+struct NotionConnectionStatus: Decodable {
+    let connected: Bool?
+    let state: String?
+    let message: String?
+    let projects_url: String?
+    let usage_url: String?
+    let last_synced_at: String?
 }
 
 struct QuotaWindow: Decodable, Identifiable {
@@ -63,6 +93,11 @@ struct Snapshot: Decodable {
     let quota: Quota?
     let quota_error: String?
     let weekly_budget: WeeklyBudget?
+    let range: SnapshotRange?
+    let warnings_count: Int?
+    let dataset_id: String?
+    let available_projects: [LocalProject]?
+    let notion: NotionConnectionStatus?
 }
 
 enum Palette {
@@ -82,6 +117,15 @@ func compactTokens(_ value: Int) -> String {
     value >= 1_000 ? String(format: "%.1fK", Double(value) / 1_000) : "\(value)"
 }
 
+func pointInCapsule(_ point: CGPoint, rect: CGRect) -> Bool {
+    guard rect.contains(point) else { return false }
+    let radius = min(rect.width, rect.height) / 2
+    let nearest = CGPoint(x: min(rect.maxX - radius, max(rect.minX + radius, point.x)),
+                          y: min(rect.maxY - radius, max(rect.minY + radius, point.y)))
+    let dx = point.x - nearest.x, dy = point.y - nearest.y
+    return dx * dx + dy * dy <= radius * radius
+}
+
 func localDate(_ seconds: Double) -> String {
     let format = DateFormatter()
     format.timeZone = TimeZone(identifier: "Asia/Shanghai")
@@ -92,7 +136,9 @@ func localDate(_ seconds: Double) -> String {
 func timestampLabel(_ value: String) -> String {
     let iso = ISO8601DateFormatter()
     iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    guard let date = iso.date(from: value) else { return "刚刚" }
+    var date = iso.date(from: value)
+    if date == nil { iso.formatOptions = [.withInternetDateTime]; date = iso.date(from: value) }
+    guard let date else { return "时间待核实" }
     let format = DateFormatter()
     format.timeZone = TimeZone(identifier: "Asia/Shanghai")
     format.dateFormat = "HH:mm"
@@ -108,6 +154,8 @@ final class UsageModel: ObservableObject {
     @Published var pinned = false
     @Published var tab = 0
     @Published var showOther = false
+    @Published var notionSyncing = false
+    @Published var notionSyncMessage: String?
     @Published var enabledWidgets: Set<WidgetKind> = [.horizontal]
     var onVisibility: (() -> Void)?
     var onUpdated: (() -> Void)?
@@ -116,6 +164,8 @@ final class UsageModel: ObservableObject {
     let root: URL
     let python: URL
     var timer: Timer?
+    var notionTimer: Timer?
+    var settingsController: ProjectSettingsController?
 
     init(root: URL) {
         self.root = root
@@ -140,6 +190,49 @@ final class UsageModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
+        notionTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.syncNotion() }
+        }
+    }
+
+    func openSettings() {
+        if settingsController == nil { settingsController = ProjectSettingsController(usage: self) }
+        NSApp.setActivationPolicy(.regular)
+        settingsController?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        settingsController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    func openProject(_ value: String) {
+        guard let url = URL(string: value), url.scheme == "https", let host = url.host,
+              host == "notion.so" || host.hasSuffix(".notion.so") || host == "notion.site" || host.hasSuffix(".notion.site") || host == "notion.com" || host.hasSuffix(".notion.com") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func syncNotion(force: Bool = false) {
+        guard !notionSyncing else { return }
+        if !force && snapshot?.notion?.connected != true { return }
+        notionSyncing = true
+        notionSyncMessage = nil
+        let executable = python, folder = root
+        Task {
+            let result: Result<Data, Error> = await Task.detached(priority: .utility) {
+                do {
+                    var args = [folder.appendingPathComponent("widget/widget_backend.py").path, "--sync-notion"]
+                    if force { args.append("--force-sync") }
+                    return .success(try runWidgetProcess(python: executable, root: folder, arguments: args, timeout: 180))
+                } catch { return .failure(error) }
+            }.value
+            switch result {
+            case .success(let data):
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], json["ok"] as? Bool == true {
+                    notionSyncMessage = "摘要同步已检查；未绑定项目保留在本机。"
+                } else { notionSyncMessage = "同步未完成，本地记录已保留。" }
+            case .failure: notionSyncMessage = "同步未完成，本地记录已保留。"
+            }
+            notionSyncing = false
+            refresh()
+        }
     }
 
     func toggleWidget(_ kind: WidgetKind) {
@@ -162,21 +255,8 @@ final class UsageModel: ObservableObject {
         Task {
             let result: Result<Data, Error> = await Task.detached(priority: .utility) {
                 do {
-                    let process = Process()
-                    process.executableURL = pythonURL
-                    process.arguments = [folder.appendingPathComponent("widget/widget_backend.py").path]
-                    process.currentDirectoryURL = folder
-                    let pipe = Pipe()
-                    process.standardOutput = pipe
-                    process.standardError = FileHandle.nullDevice
-                    try process.run()
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    process.waitUntilExit()
-                    guard process.terminationStatus == 0 else {
-                        throw NSError(domain: "UsageWidget", code: 1,
-                                      userInfo: [NSLocalizedDescriptionKey: "本机扫描失败，保留上次数据。"])
-                    }
-                    return .success(data)
+                    return .success(try runWidgetProcess(python: pythonURL, root: folder,
+                        arguments: [folder.appendingPathComponent("widget/widget_backend.py").path]))
                 } catch { return .failure(error) }
             }.value
             switch result {
@@ -426,6 +506,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var localEvents: Any?
     var globalEvents: Any?
+    var pointerTimer: Timer?
+    var pointerZones: [WidgetKind: String] = [:]
+    var positions: [String: [String: Double]] = [:]
     let root: URL
     let diagnosticsQueue = DispatchQueue(label: "local.codex.widget-diagnostics", qos: .utility)
 
@@ -434,6 +517,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         model = UsageModel(root: root)
+        if let data = try? Data(contentsOf: root.appendingPathComponent("widget/data/positions.json")),
+           let saved = try? JSONDecoder().decode([String: [String: Double]].self, from: data) { positions = saved }
         if let data = try? Data(contentsOf: root.appendingPathComponent("widget/data/display-settings.json")),
            let saved = try? JSONDecoder().decode(Set<WidgetKind>.self, from: data) {
             model.enabledWidgets = saved
@@ -446,6 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let frame = NSScreen.main?.visibleFrame {
             panel.setFrameOrigin(NSPoint(x: max(frame.minX, frame.maxX - 560), y: frame.maxY - 648))
         }
+        restorePosition(panel, kind: .box)
         for kind in [WidgetKind.horizontal, .vertical] {
             let state = StripInteraction()
             let strip = makePanel(width: 108, height: 108)
@@ -470,6 +556,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.representedObject = kind.rawValue
         }
         menu.addItem(.separator())
+        menu.addItem(withTitle: "项目与 Notion 设置…", action: #selector(openSettings), keyEquivalent: ",")
+        menu.addItem(withTitle: "同步 Notion 摘要", action: #selector(syncNotion), keyEquivalent: "")
         menu.addItem(withTitle: "刷新", action: #selector(refresh), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "退出用量小助手", action: #selector(quit), keyEquivalent: "q")
@@ -501,9 +589,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NotificationCenter.default.addObserver(self, selector: #selector(recordWindowState),
             name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(windowMoved(_:)),
+            name: NSWindow.didMoveNotification, object: nil)
+        pointerTimer = Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.updatePointerPassthrough() }
+        }
         updateStatus()
         updateVisibility()
         model.start()
+        if CommandLine.arguments.contains("--settings") { model.openSettings() }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        model.openSettings()
+        return true
     }
 
     func makePanel(width: CGFloat, height: CGFloat) -> FloatingPanel {
@@ -515,6 +614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.hasShadow = true
         window.isMovableByWindowBackground = true
         window.hidesOnDeactivate = false
+        window.becomesKeyOnlyIfNeeded = false
         window.acceptsMouseMovedEvents = true
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         return window
@@ -526,12 +626,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func resizeStrip(_ kind: WidgetKind, initial: Bool = false) {
         guard let window = strips[kind], let state = interactions[kind] else { return }
-        let items = StripItem.items(model.snapshot, failed: model.error != nil)
-        let count = CGFloat(items.count)
+        let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric)
         let vertical = kind == .vertical
-        let width = vertical ? UsageStrip.diameter + 2 * UsageStrip.inset : count * UsageStrip.moduleWidth + 2 * UsageStrip.inset
-        let naturalHeight = (vertical ? count * (UsageStrip.diameter + 2 * UsageStrip.rowInset) : UsageStrip.headerHeight)
-            + 2 * UsageStrip.inset + (items.first(where: { $0.id == state.expanded }).map { UsageStrip.detailHeight(for: $0) } ?? 0)
+        let natural = UsageStrip.naturalSize(itemCount: items.count, vertical: vertical)
+        let width = natural.width
+        // Reserve a fixed overlay budget so hover never moves its anchor.
+        let naturalHeight = natural.height + UsageStrip.maxDetailHeight
         let bounds = (window.screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let height = min(naturalHeight, bounds.height - 64)
         var x = window.frame.minX
@@ -546,7 +646,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let host = window.contentView as? NSHostingView<UsageStrip> { host.rootView = view }
         else { window.contentView = NSHostingView(rootView: view) }
         window.setFrame(NSRect(x: x, y: top - height, width: width, height: height), display: true)
+        if initial { restorePosition(window, kind: kind) }
+        updatePointerPassthrough()
         recordWindowState()
+    }
+
+    func updatePointerPassthrough() {
+        let mouse = NSEvent.mouseLocation
+        for (kind, window) in strips {
+            guard let state = interactions[kind], window.isVisible else { continue }
+            let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric)
+            let x = mouse.x - window.frame.minX
+            let y = window.frame.maxY - mouse.y
+            var hovered: String?
+            if kind == .horizontal {
+                if pointInCapsule(CGPoint(x: x, y: y), rect: CGRect(x: UsageStrip.inset, y: UsageStrip.inset,
+                        width: window.frame.width - 2 * UsageStrip.inset, height: UsageStrip.headerHeight)) {
+                    let index = Int((x - UsageStrip.inset) / UsageStrip.moduleWidth)
+                    if items.indices.contains(index) { hovered = items[index].id }
+                } else if let selected = state.expanded, let index = items.firstIndex(where: { $0.id == selected }) {
+                    let left = UsageStrip.inset + CGFloat(index) * UsageStrip.moduleWidth + UsageStrip.rowInset
+                    if pointInCapsule(CGPoint(x: x, y: y), rect: CGRect(x: left, y: UsageStrip.inset,
+                        width: UsageStrip.diameter, height: UsageStrip.headerHeight + UsageStrip.detailHeight(for: items[index]))) { hovered = selected }
+                }
+            } else {
+                let total = UsageStrip.naturalSize(itemCount: items.count, vertical: true).height
+                    + (items.first(where: { $0.id == state.expanded }).map { UsageStrip.detailHeight(for: $0) } ?? 0)
+                if pointInCapsule(CGPoint(x: x, y: y), rect: CGRect(x: UsageStrip.inset, y: UsageStrip.inset,
+                        width: UsageStrip.diameter, height: min(total, window.frame.height) - 2 * UsageStrip.inset)) {
+                    // SwiftUI knows the scrolled item geometry. Sampling only
+                    // determines pass-through for this vertical viewport.
+                    hovered = "__vertical_surface__"
+                }
+            }
+            window.ignoresMouseEvents = hovered == nil
+            if pointerZones[kind] != hovered {
+                if hovered == nil { state.leaveAllHoverZones() }
+                else if let previous = pointerZones[kind] { state.hover(previous, inside: false, zone: "native-pointer") }
+                if let hovered, kind == .horizontal { state.hover(hovered, inside: true, zone: "native-pointer") }
+                pointerZones[kind] = hovered
+            }
+        }
+    }
+
+    func restorePosition(_ window: NSWindow, kind: WidgetKind) {
+        guard let saved = positions[kind.rawValue] else { return }
+        let screen = NSScreen.screens.first { Double(($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0) == saved["screen"] } ?? NSScreen.main
+        guard let bounds = screen?.visibleFrame else { return }
+        let x = bounds.minX + min(1, max(0, saved["x"] ?? 0.5)) * max(0, bounds.width - window.frame.width)
+        let top = bounds.maxY - min(1, max(0, saved["top"] ?? 0)) * max(0, bounds.height - window.frame.height)
+        window.setFrameOrigin(NSPoint(x: x, y: top - window.frame.height))
+    }
+
+    @objc func windowMoved(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, let screen = window.screen else { return }
+        let kind: WidgetKind?
+        if window === panel { kind = .box }
+        else { kind = strips.first(where: { $0.value === window })?.key }
+        guard let kind else { return }
+        let bounds = screen.visibleFrame
+        positions[kind.rawValue] = ["screen": Double((screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0),
+            "x": (window.frame.minX - bounds.minX) / max(1, bounds.width - window.frame.width),
+            "top": (bounds.maxY - window.frame.maxY) / max(1, bounds.height - window.frame.height)]
+        if let data = try? JSONEncoder().encode(positions) {
+            try? data.write(to: root.appendingPathComponent("widget/data/positions.json"), options: .atomic)
+        }
     }
 
     func updateVisibility() {
@@ -607,7 +771,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let snapshot = model.snapshot,
            let week = snapshot.quota?.windows.first(where: { $0.duration_mins == 10080 }) {
             let cached = snapshot.quota?.stale == true || snapshot.quota_error != nil
-            statusItem.button?.title = " 剩余 \(cached ? "≈" : "")\(Int(week.remaining_percent))%"
+            let value = week.remaining_percent > 0 && week.remaining_percent < 1 ? "<1" : String(format: "%.0f", week.remaining_percent)
+            statusItem.button?.title = " 剩余 \(cached ? "≈" : "")\(value)%"
             statusItem.button?.toolTip = "官方周额度剩余；\(compactTokens(snapshot.total_tokens)) 本机 tokens / 本周"
         } else { statusItem.button?.title = " 用量" }
     }
@@ -617,6 +782,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.toggleWidget(kind)
     }
     @objc func refresh() { model.refresh() }
+    @objc func openSettings() { model.openSettings() }
+    @objc func syncNotion() { model.syncNotion(force: true) }
     @objc func quit() { NSApp.terminate(nil) }
 }
 

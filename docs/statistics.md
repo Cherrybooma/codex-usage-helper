@@ -43,7 +43,7 @@ since 包含起始时刻，until 排除结束时刻。没有时区的日期或�
 
     python3 codex_usage.py --all-time --format json --output codex-usage.json
 
-JSON 同时包含 totals、projects、sessions、models、daily、coverage 和 warnings。--group-by 只改变终端表格，不影响 JSON 的完整内容。
+JSON 同时包含 totals、projects、sessions、models、daily、project_daily、coverage 和 warnings。project_daily 是项目与上海日期的交叉汇总，从同一条已经完成去重、窗口过滤和旧差分计算的记录归集；各 Token/记录计数与总数对齐，会话数以该行 thread_ids 的并集计算，不能跨日简单相加。--group-by 只改变终端表格，不影响 JSON 的完整内容。
 
 如果系统没有时区数据库，使用 IANA 时区时可能需要安装 tzdata：
 

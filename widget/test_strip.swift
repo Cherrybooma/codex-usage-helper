@@ -25,9 +25,14 @@ struct StripChecks {
         [{"name":"用量小助手","total_tokens":800,"percent":80,"request_records":20,"sessions_count":6},
          {"name":"Codex","total_tokens":200,"percent":20,"request_records":2,"sessions_count":1}]
         """)
+        let hitRect = CGRect(x: 10, y: 10, width: 64, height: 400)
+        check(pointInCapsule(CGPoint(x: 42, y: 11), rect: hitRect), "竖胶囊顶部中心接收鼠标")
+        check(!pointInCapsule(CGPoint(x: 11, y: 11), rect: hitRect), "胶囊圆角的透明部分不接收鼠标")
+        check(pointInCapsule(CGPoint(x: 11, y: 200), rect: hitRect), "胶囊主体仍可交互")
+        check(!pointInCapsule(CGPoint(x: 42, y: 420), rect: hitRect), "预留详情外的透明区域穿透鼠标")
         let items = StripItem.items(fixture)
         check(items[2].footnote == "6 个会话", "展示真实会话数，不误用响应数")
-        check(items[2].caption == "用量小助手", "顶部直接显示任务名称")
+        check(items[2].caption == "用量小助手", "完整任务名保留在详情和可访问性语义")
         check(items[2].detailValue == "800" && items[2].unit == "Token", "任务详情显示 Token")
         check(items[2].facts.first(where: { $0.label == "本周排名" })?.value == "第 1 名", "详情排名按全部任务的用量计算")
         check(items[2].facts.first(where: { $0.label == "模型响应" })?.value == "20 次", "详情区分响应次数与会话数")
@@ -99,7 +104,62 @@ struct StripChecks {
         let empty = try snapshot("[]")
         check(StripItem.items(empty).last!.id == "empty", "空用量状态可解释")
 
+        let linked = try snapshot("""
+        [{"name":"本地文件夹","task_id":"task-stable-001","display_name":"用量小助手：这是一个改名后依然应完整显示的长项目名称",
+          "total_tokens":1000,"percent":100,"request_records":22,"sessions_count":6,
+          "project_status":"开发中","icon_type":"emoji","icon_value":"📘",
+          "notion_url":"https://www.notion.so/abcdef0123456789abcdef0123456789","notion_stale":true}]
+        """)
+        let linkedItem = StripItem.items(linked)[2]
+        check(linkedItem.id == "folder:task-stable-001", "项目改名使用稳定任务 ID")
+        check(linkedItem.title == linked.tasks[0].display_name && linkedItem.title.count > 20, "长项目名称完整保留，不截断计量身份")
+        check(linkedItem.projectStatus == "开发中" && linkedItem.notionStale, "Notion 状态与离线旧缓存明确区分")
+        check(linkedItem.avatar == .emoji("📘") && linkedItem.notionURL?.contains("notion.so") == true, "使用用户 Notion 头像与项目链接")
+        check(StripAvatar.initials(for: " 用量小助手 ") == "用" && StripAvatar.initials(for: "IP 项目") == "IP", "缺少头像时按名称生成首字")
+        check(StripAvatar.initials(for: " ") == "项", "空名称仍有可解释默认头像")
+        let remote = try snapshot("""
+        [{"name":"远程头像","total_tokens":1000,"percent":100,"request_records":22,"icon_type":"external","icon_value":"https://example.com/avatar.png"}]
+        """)
+        check(StripItem.items(remote)[2].avatar == .remote("https://example.com/avatar.png"), "支持 Notion HTTPS 项目 Logo")
+        let customAvatar = try snapshot("""
+        [{"name":"自定义头像","total_tokens":1000,"percent":100,"request_records":22,"icon_type":"custom_emoji","icon_value":"https://example.com/custom.png"}]
+        """)
+        check(StripItem.items(customAvatar)[2].avatar == .remote("https://example.com/custom.png"), "支持 Notion custom_emoji 的 HTTPS 头像")
+        let unsafe = try snapshot("""
+        [{"name":"安全头像","total_tokens":1000,"percent":100,"request_records":22,"icon_type":"external","icon_value":"file:///Users/user/private.png"}]
+        """)
+        check(StripItem.items(unsafe)[2].avatar == .initials("安"), "不读取头像字段中的任意本地文件")
+        let freshQuota = quota.replacingOccurrences(of: "\"stale\":true", with: "\"stale\":false")
+        let switching = try snapshot("""
+        [{"name":"A","total_tokens":800,"percent":80,"request_records":20},
+         {"name":"B","total_tokens":200,"percent":20,"request_records":2}]
+        """, quota: freshQuota, budget: excessBudget)
+        check(StripItem.items(switching, metric: .shortRemaining)[0].value == "50%", "滚轮指标读取实际五小时窗口")
+        check(StripItem.items(switching, metric: .weeklyObserved)[0].value == "≈150.0%", "周累计与当前窗口分别显示")
+        check(StripItem.items(switching, metric: .weeklyExcess)[0].value == "≥50.0%", "超额显示观测下限而非新造额度")
+        check(StripItem.items(fixture, metric: .shortRemaining)[0].value == "—", "缺少短周期额度不补零")
+        check(StripItem.items(fixture, metric: .weeklyObserved)[0].value == "—", "缺少累计观测不补零")
+        let baselineProjects = StripItem.items(switching).dropFirst(2).map { "\($0.id):\($0.value)" }
+        check(StripQuotaMetric.allCases.allSatisfy {
+            StripItem.items(switching, metric: $0).dropFirst(2).map { "\($0.id):\($0.value)" } == baselineProjects
+        }, "切换额度指标不改变项目排行和占比分母")
+        let tinyQuota = freshQuota.replacingOccurrences(of: "\"used_percent\":10,\"remaining_percent\":90", with: "\"used_percent\":99.6,\"remaining_percent\":0.4")
+        let tinyItem = StripItem.items(try snapshot("[]", quota: tinyQuota))[0]
+        check(tinyItem.value == "<1%" && tinyItem.footnote != "当前窗口已用尽", "小于1%的正剩余额度不四舍五入成耗尽")
+        let depleted = freshQuota.replacingOccurrences(of: "\"used_percent\":10,\"remaining_percent\":90", with: "\"used_percent\":100,\"remaining_percent\":0")
+        let depletedItem = StripItem.items(try snapshot("[]", quota: depleted))[0]
+        check(depletedItem.footnote == "当前窗口已用尽", "合法零剩余标记耗尽，区别读取失败")
+        let expired = StripItem.items(try snapshot("[]", quota: freshQuota), now: Date(timeIntervalSince1970: 9999999999))
+        check(expired[0].value == "≈90%" && expired[0].footnote.contains("等待更新"), "超过重置时间的读数不能冒充当前额度")
+        check(StripQuotaMetric.weeklyRemaining.advanced(by: -1) == .weeklyExcess && StripQuotaMetric.weeklyExcess.advanced(by: 1) == .weeklyRemaining, "四个额度指标双向循环")
+        check(UsageStrip.naturalSize(itemCount: 5).height == UsageStrip.naturalSize(itemCount: 6).height, "项目增加只改变横条宽度，不移动顶部锚点")
+        check(UsageStrip.detailHeight(for: linkedItem) <= UsageStrip.maxDetailHeight, "长名称详情使用固定最大预算内滚动")
+
         let interaction = StripInteraction()
+        interaction.click("A")
+        interaction.cycleQuota(steps: 1)
+        check(interaction.quotaMetric == .shortRemaining && interaction.expanded == "A" && interaction.locked, "切换额度不关闭或切换锁定的项目详情")
+        interaction.dismiss()
         interaction.hover("A", inside: true)
         check(interaction.expanded == nil, "快速经过不立刻展开")
         drain(0.22)
@@ -151,6 +211,19 @@ struct StripChecks {
         interaction.hover("A", inside: false, zone: "row")
         drain(0.28)
         check(interaction.expanded == "B", "旧圆形退出事件不会清除新圆形悬停")
+        interaction.leaveAllHoverZones()
+        drain(0.28)
+        check(interaction.expanded == nil, "透明区域停止鼠标事件后，原生指针清除旧悬停区")
+        interaction.click("A")
+        interaction.leaveAllHoverZones()
+        drain(0.28)
+        check(interaction.expanded == "A" && interaction.locked, "离开透明区域保留点击锁定的详情")
+        interaction.dismiss()
+        interaction.hover("A", inside: true, zone: "row")
+        interaction.leaveAllHoverZones()
+        interaction.hover("B", inside: true, zone: "native-pointer")
+        drain(0.28)
+        check(interaction.expanded == "B", "重新进入真实模块取消透明区域延迟收起")
         print("\(passed) UI checks passed")
     }
 }

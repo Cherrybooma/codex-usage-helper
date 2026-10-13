@@ -4,20 +4,21 @@
 
 一个在本机运行的 Codex 用量扫描器和 macOS 桌面组件。根据已有会话记录统计项目、会话、模型和日期用量，再把最常用的任务放进桌面上的小胶囊。
 
-![桌面组件界面示意，所有数值均为演示数据](docs/widget-preview.svg)
+![桌面组件界面示意，所有数值均为演示数据](docs/widget-preview.png)
 
 > 图中为演示数据。项目 Token 来自本机保留的记录；官方剩余额度是另一种数据，二者不能直接换算。
 
 ## 可以做什么
 
 - **按项目看用量**：桌面组件按 `Documents` 下一级文件夹名称归集任务；命令行扫描器还会识别工作目录和 Git 仓库。
-- **桌面小胶囊**：横条直接显示任务名称与本周占比，优先展示用量最高的三个任务，其余放进“其他”。
+- **桌面小胶囊**：横条直接显示项目头像或 Logo 与本周占比，展开显示完整名称，优先展示用量最高的三个任务，其余放进“其他”。
 - **悬停或点击看详情**：查看 Token、本周排名、会话数、模型响应次数，以及可确认时的平均每次响应 Token。
 - **三种展示方式**：顶部横条、右侧竖条、桌面小框分别开关，也可以同时开启。默认在桌面层，普通窗口可以盖住它。
 - **额度详情**：通过官方 Codex app-server 的只读接口读取当前窗口剩余百分比及重置时间；保存观测后显示本周已记录累计和超额情况。
+- **Notion 项目账本**：读取项目名称、头像和状态，把绑定项目的每日用量摘要写入 Notion；离线仍显示本地统计。
 - **终端与导出**：按项目、会话、模型、日期汇总，并输出完整 JSON。
 
-所有日志扫描和汇总都在本机进行。组件读取官方额度时会使用官方客户端的账户连接，但不会把会话日志、项目目录或统计报告发送给它。
+日志扫描和计量在本机进行。启用 Notion 后，只有绑定项目的日期、计数、关系和统计质量摘要会发送到指定工作区；原始日志不会上传。组件读取官方额度时会使用官方客户端的账户连接，但不会把会话日志、项目目录或统计报告发送给它。
 
 ## 快速开始：macOS 桌面组件
 
@@ -41,6 +42,8 @@ sh widget/run.command
 启动后，在菜单栏或组件右键菜单中选择“顶部横条 / 右侧竖条 / 桌面小框”。悬停展开、点击保持，再点收起；点击其他模块切换详情，Esc 或外部点击关闭详情。在菜单栏选择退出才会停止后台刷新。
 
 构建产物位于 `widget/build/用量小助手.app`。这是本地 ad-hoc 签名的开发应用，尚未提供可独立安装的发行包；请保留项目目录和 `.venv`，应用目前依赖其中的 Python 数据层。
+
+项目根目录和 Notion 连接可在菜单栏的“项目与 Notion 设置…”中配置。连接凭据只保存在系统钥匙串；首次同步从本周开始，不会自动为所有文件夹创建项目。见 [Notion 说明](docs/notion.md)。
 
 更完整的运行说明见 [桌面组件文档](widget/README.md)。
 
@@ -110,6 +113,7 @@ Windows 可将 `python3` 替换为 `py -3`。优先使用 `CODEX_HOME`，否则�
 - 扫描器不联网，不直接读取 `auth.json` 或认证环境变量，不修改 Codex 会话记录。
 - 报告只导出用量与归因元数据，不包含提示词、代码、回复或工具输出；报告仍可能包含私人目录和会话 ID。
 - 官方额度认证由官方客户端处理，本项目只调用 `account/rateLimits/read`，保留必要额度字段。
+- Notion 同步采用稳定项目身份和“项目 × 日期 × Codex × 匿名来源数据集”摘要键，重复扫描替换数值；会话哈希键只在本地用于去重。
 - 本地缓存、额度历史和窗口设置位于 `widget/data/`；真实验证导出位于 `validation/`，均被 Git 忽略。
 - 仓库中的 UI 预览和示意图使用演示数据，不包含作者的真实用量记录。
 
@@ -118,7 +122,7 @@ Windows 可将 `python3` 替换为 `py -3`。优先使用 `CODEX_HOME`，否则�
 Python 测试使用临时模拟日志与临时 Git 仓库，不读取用户真实会话：
 
 ```sh
-.venv/bin/python3 -m unittest -v test_codex_usage.py widget/test_widget_backend.py
+.venv/bin/python3 -m unittest -v test_codex_usage.py widget/test_widget_backend.py widget/test_project_store.py widget/test_notion_sync.py
 ```
 
 Swift 数据与交互检查：
@@ -126,8 +130,8 @@ Swift 数据与交互检查：
 ```sh
 mkdir -p widget/build/module-cache
 xcrun swiftc -parse-as-library -swift-version 5 -D WIDGET_CHECKS \
-  widget/UsageWidget.swift widget/UsageStrip.swift widget/test_strip.swift \
-  -o widget/build/strip-checks -framework AppKit -framework SwiftUI \
+  widget/UsageWidget.swift widget/UsageStrip.swift widget/NotionSettings.swift widget/test_strip.swift \
+  -o widget/build/strip-checks -framework AppKit -framework SwiftUI -framework Security \
   -module-cache-path widget/build/module-cache
 widget/build/strip-checks
 ```
@@ -142,6 +146,10 @@ test_codex_usage.py           扫描器测试
 widget/UsageWidget.swift      macOS 应用与桌面小框
 widget/UsageStrip.swift       条形组件与交互
 widget/widget_backend.py     本周归集、官方额度读取和历史估算
+widget/project_store.py      稳定项目身份和项目每日事实
+widget/notion_sync.py         Notion 元数据、绑定与摘要同步
+widget/NotionSettings.swift   原生设置和专用钥匙串凭据
+widget/test_notion_sync.py    同步、重试与幂等测试
 widget/test_widget_backend.py 数据层测试
 widget/test_strip.swift       Swift 数据与交互检查
 widget/preview/demo.html     使用演示数据的交互预览

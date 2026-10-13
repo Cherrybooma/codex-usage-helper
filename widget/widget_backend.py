@@ -1,8 +1,9 @@
-"""Local-only token aggregation plus read-only official quota RPC.
+"""Local token aggregation, read-only official quota, opt-in Notion summaries.
 
 Never opens auth.json or reads credential environment variables. Authentication
 belongs to the already-installed official Codex app-server. The sole upstream
 method used here is account/rateLimits/read; no tasks or quota resets are sent.
+Notion sync runs in a separate invocation and sends allowlisted daily summaries.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from codex_usage import scan_usage
+from project_store import ProjectRegistry, aggregate, split_small, remember_daily
 
 DATA = Path(__file__).resolve().parent / "data"
 UTC = timezone.utc
@@ -377,7 +379,48 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
     week_start, _ = calendar_week(end)
     report = scan_usage(home, since=week_start, until=end,
                         timezone=ZoneInfo("Asia/Shanghai"))
-    major, small = group_tasks(report["projects"], task_root)
+    registry = ProjectRegistry(data, home)
+    metadata = {}
+    workspace = None
+    notion_status = {"connected": False, "state": "disconnected", "message": "尚未连接 Notion"}
+    try:
+        from notion_sync import NotionWorkspace, NotionError
+        workspace = NotionWorkspace(data)
+        # Cached project metadata only. Cloud I/O belongs to --sync-notion.
+        for entry in registry.data["projects"].values():
+            item = workspace.project_for_task(entry["task_id"])
+            if item:
+                metadata[entry["task_id"]] = item
+        notion_status = workspace.status()
+    except ImportError:
+        pass
+    except (OSError, ValueError, RuntimeError, NotionError):
+        workspace = None
+        notion_status = {"connected": False, "state": "error", "message": "Notion 配置暂不可读，本地统计正常"}
+    grouping = registry.data.setdefault("grouping_roots", {})
+    normalized_root = str(task_root.expanduser().resolve())
+    previous_root = grouping.get(registry.dataset_id)
+    if previous_root and previous_root != normalized_root and (workspace is None or notion_status.get("binding_count", 0)):
+        raise ValueError("已绑定账本的项目根目录不能直接改变；请先解除绑定或使用独立 data-dir。")
+    grouping[registry.dataset_id] = normalized_root
+    all_tasks, daily_rows, local_projects = aggregate(report, task_root, registry, metadata)
+    # Initial ids are assigned during aggregation; apply existing bindings on
+    # the following pass without changing any count or its denominator.
+    if workspace is not None:
+        try:
+            for entry in local_projects:
+                if entry["task_id"] not in metadata:
+                    item = workspace.project_for_task(entry["task_id"])
+                    if item:
+                        metadata[entry["task_id"]] = item
+        except (OSError, ValueError, RuntimeError, NotionError):
+            notion_status = {"connected": False, "state": "error", "message": "Notion 配置暂不可读，本地统计正常"}
+        if metadata:
+            all_tasks, daily_rows, local_projects = aggregate(report, task_root, registry, metadata)
+    major, small = split_small(all_tasks, report["totals"]["total_tokens"])
+    saved_daily = remember_daily(data / "daily-ledger.sqlite3", daily_rows, registry.dataset_id)
+    atomic_json(data / "notion-daily.json", {"dataset_id": registry.dataset_id,
+        "statistics_until": report["range"]["until_exclusive"], "rows": saved_daily})
     quota_file = data / "official-latest.json"
     quota = None
     quota_error = None
@@ -396,14 +439,16 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
         history = cycle_history(db, observed_now)
         budget = weekly_budget(db, observed_now, read_failed=quota_error is not None)
     if quota:
-        age = max(0, (datetime.now(UTC) - datetime.fromisoformat(quota["observed_at"])).total_seconds())
+        age = max(0, (end - datetime.fromisoformat(quota["observed_at"])).total_seconds())
         quota = {**quota, "age_seconds": round(age), "stale": age > 180 or
-                 any(window["resets_at"] <= datetime.now(UTC).timestamp() for window in quota["windows"])}
+                 any(window["resets_at"] <= end.timestamp() for window in quota["windows"])}
     return {"generated_at": datetime.now(UTC).isoformat(), "range": report["range"],
             "period_mode": "calendar_week", "timezone": "Asia/Shanghai", "total_tokens": report["totals"]["total_tokens"],
             "request_records": report["totals"]["request_records"],
             "legacy_updates": report["totals"]["legacy_updates"],
             "tasks": major, "other_tasks": small,
+            "dataset_id": registry.dataset_id, "available_projects": local_projects,
+            "notion": notion_status,
             "coverage": {name: report["coverage"][name] for name in
                          ("files_found", "files_scanned", "files_skipped", "malformed_lines")},
             "warnings_count": len(report["warnings"]),
@@ -416,12 +461,37 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex-home", type=Path,
                         default=Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser())
-    parser.add_argument("--task-root", type=Path, default=Path.home() / "Documents")
+    parser.add_argument("--task-root", type=Path)
     parser.add_argument("--data-dir", type=Path, default=DATA)
     parser.add_argument("--offline", action="store_true", help="Use only saved official snapshot")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--sync-notion", action="store_true", help="Sync saved summaries independently of local scanning")
+    parser.add_argument("--force-sync", action="store_true", help="Bypass the Notion sync interval")
     args = parser.parse_args()
     try:
+        if args.sync_notion:
+            from notion_sync import NotionWorkspace, NotionError
+            try:
+                workspace = NotionWorkspace(args.data_dir)
+                if not workspace.status().get("ready"):
+                    print(json.dumps({"ok": False, "error": {"message": "尚未配置 Notion；本地统计继续可用。"}}, ensure_ascii=False))
+                    return 1
+                workspace.projects(force=args.force_sync)
+                source = args.data_dir / "notion-daily.json"
+                saved = json.loads(source.read_text(encoding="utf-8")) if source.is_file() else {}
+                rows = saved.get("rows", [])
+                result = workspace.sync(rows, now=datetime.now(UTC), force=args.force_sync,
+                                        complete_dataset_ids=[saved["dataset_id"]] if saved.get("dataset_id") else [],
+                                        complete_until=saved.get("statistics_until"))
+            except NotionError as error:
+                print(json.dumps({"ok": False, "error": error.public()}, ensure_ascii=False))
+                return 1
+            okay = not result.get("error") and not result.get("projects_error")
+            print(json.dumps({"ok": okay, "result": result, "error": result.get("error") or result.get("projects_error")}, ensure_ascii=False))
+            return 0 if okay else 1
+        settings_file = args.data_dir / "app-settings.json"
+        settings = json.loads(settings_file.read_text(encoding="utf-8")) if settings_file.is_file() else {}
+        args.task_root = args.task_root or Path(settings.get("task_root") or Path.home() / "Documents")
         result = build_snapshot(args.codex_home, args.task_root, args.data_dir, not args.offline)
         atomic_json(args.data_dir / "latest.json", result)
         if args.output:
