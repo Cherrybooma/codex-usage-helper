@@ -470,6 +470,18 @@ def main():
     args = parser.parse_args()
     try:
         if args.sync_notion:
+            # Opt-in is persisted independently of any cached connection or
+            # database configuration. Even a manual retry cannot bypass local
+            # mode and provoke a Keychain prompt or a remote request.
+            settings_file = args.data_dir / "app-settings.json"
+            try:
+                settings = json.loads(settings_file.read_text(encoding="utf-8")) if settings_file.is_file() else {}
+            except (ValueError, OSError):
+                settings = {}
+            if not isinstance(settings, dict) or settings.get("notion_sync_enabled") is not True:
+                print(json.dumps({"ok": False, "error": {"code": "local_mode",
+                    "message": "当前为本机模式，Notion 同步未开启；本地统计继续可用。"}}, ensure_ascii=False))
+                return 1
             from notion_sync import NotionWorkspace, NotionError
             try:
                 workspace = NotionWorkspace(args.data_dir)

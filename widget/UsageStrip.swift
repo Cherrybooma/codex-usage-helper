@@ -472,7 +472,7 @@ struct UsageStrip: View {
                         .frame(width: Self.diameter, height: Self.diameter)
                 }
             }
-            .accessibilityLabel(item.isProject ? "\(item.title)，本周占比 \(item.value)，\(item.projectStatus ?? (item.notionURL == nil ? "未绑定 Notion" : "未设置状态"))" : "\(item.title)，\(item.caption) \(item.value)")
+            .accessibilityLabel(item.isProject ? "\(item.title)，本周占比 \(item.value)，\(item.projectStatus ?? (item.notionURL == nil ? "本地任务" : "未设置状态"))" : "\(item.title)，\(item.caption) \(item.value)")
             .help(item.id == "quota" ? "滚轮切换额度指标；点击保持详情，右键选择指标" : "\(item.title) · 悬停查看详情，点击保持展开")
             .contextMenu {
                 if item.id == "quota" {
@@ -480,8 +480,8 @@ struct UsageStrip: View {
                         Button(metric.caption) { interaction.quotaMetric = metric }
                     }
                 } else if item.isProject {
-                    if let url = item.notionURL { Button("打开 Notion 项目") { model.openProject(url) } }
-                    Button("项目绑定设置…") { model.openSettings() }
+                    if model.notionEnabled, let url = item.notionURL { Button("打开 Notion 项目") { model.openProject(url) } }
+                    Button(model.notionEnabled ? "项目绑定设置…" : "项目设置…") { model.openSettings() }
                 }
             }
     }
@@ -495,7 +495,7 @@ struct UsageStrip: View {
                     .frame(maxWidth: .infinity)
                 if item.isProject {
                     VStack(spacing: 3) {
-                        Text(item.projectStatus ?? (item.notionURL == nil ? "未绑定" : "未设置状态")).font(.system(size: 10, weight: .medium))
+                        Text(item.projectStatus ?? (item.notionURL == nil ? "本地任务" : "未设置状态")).font(.system(size: 10, weight: .medium))
                         if item.notionStale {
                             Text("状态待更新").font(.system(size: 10)).foregroundStyle(StripInk.secondary)
                         }
@@ -535,14 +535,14 @@ struct UsageStrip: View {
                     }.buttonStyle(.plain).help("也可在 Codex 模块上滚动切换")
                 } else if item.isProject {
                     Button {
-                        if let url = item.notionURL { model.openProject(url) }
+                        if model.notionEnabled, let url = item.notionURL { model.openProject(url) }
                         else { model.openSettings() }
                     } label: {
                         VStack(spacing: 3) {
-                            Image(systemName: item.notionURL == nil ? "link" : "arrow.up.right").font(.system(size: 12))
-                            Text(item.notionURL == nil ? "绑定项目" : "Notion").font(.system(size: 10))
+                            Image(systemName: !model.notionEnabled ? "gearshape" : (item.notionURL == nil ? "link" : "arrow.up.right")).font(.system(size: 12))
+                            Text(!model.notionEnabled ? "设置" : (item.notionURL == nil ? "绑定项目" : "Notion")).font(.system(size: 10))
                         }.frame(width: 48, height: 44)
-                    }.buttonStyle(.plain).help(item.notionURL == nil ? "在设置中绑定本地任务与 Notion 项目" : "打开对应 Notion 项目")
+                    }.buttonStyle(.plain).help(!model.notionEnabled ? "打开本机项目与显示设置" : (item.notionURL == nil ? "在设置中绑定本地任务与 Notion 项目" : "打开对应 Notion 项目"))
                 }
             }.padding(.horizontal, 7).padding(.top, 8).padding(.bottom, 26)
                 .frame(maxWidth: .infinity)

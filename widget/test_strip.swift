@@ -1,4 +1,10 @@
 import Foundation
+import AppKit
+
+final class EditCommandRecorder: NSObject {
+    var pasteCount = 0
+    @objc func paste(_ sender: Any?) { pasteCount += 1 }
+}
 
 @main
 struct StripChecks {
@@ -13,6 +19,45 @@ struct StripChecks {
             let end = Date().addingTimeInterval(seconds)
             while Date() < end { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
         }
+        let temporaryRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        let local = UsageModel(root: temporaryRoot)
+        check(!local.notionEnabled, "未配置时默认本机模式")
+        local.syncNotion(force: true)
+        check(!local.notionSyncing && local.notionSyncMessage?.contains("本机模式") == true, "手动强制同步在本机模式也不会启动进程")
+        let disabledSettings = ProjectSettingsModel(usage: local)
+        disabledSettings.perform(["command": "setup", "parent_page": "fixture"])
+        check(!disabledSettings.busy && disabledSettings.message.contains("本机模式"), "本机模式不能从设置绕过连接开关")
+        local.setNotionEnabled(true)
+        try WidgetPreferences.update(root: temporaryRoot, values: ["task_root": "/tmp/example", "future_setting": "keep"])
+        let reloaded = UsageModel(root: temporaryRoot)
+        check(reloaded.notionEnabled, "启用同步后设置持久化，保存项目根目录不会抹掉开关")
+        reloaded.setNotionEnabled(false)
+        let preferences = try WidgetPreferences.read(root: temporaryRoot)
+        check(preferences["task_root"] as? String == "/tmp/example" && preferences["future_setting"] as? String == "keep", "关闭同步保留目录及其他本地设置")
+        check(!UsageModel(root: temporaryRoot).notionEnabled, "重启后保留本机模式")
+        let invalidValues: [Any] = [1, "true", NSNull()]
+        check(invalidValues.allSatisfy { !WidgetPreferences.notionEnabled(in: ["notion_sync_enabled": $0]) }, "数值或字符串不能被误当成同步授权")
+        let settingsFile = temporaryRoot.appendingPathComponent("widget/data/app-settings.json")
+        let broken = Data("[]".utf8)
+        try broken.write(to: settingsFile)
+        let brokenModel = UsageModel(root: temporaryRoot)
+        brokenModel.setNotionEnabled(true)
+        check(!brokenModel.notionEnabled && (try? Data(contentsOf: settingsFile)) == broken, "设置损坏时不覆盖原文件或启用同步")
+
+        _ = NSApplication.shared
+        let mainMenu = WidgetApplicationMenu.make()
+        let edit = mainMenu.items.first(where: { $0.title == "编辑" })!.submenu!
+        check(edit.items.allSatisfy { $0.target == nil }, "编辑命令交给当前输入框响应链")
+        let keys = ["x": "cut:", "c": "copy:", "v": "paste:", "a": "selectAll:"]
+        check(keys.allSatisfy { key, action in edit.items.contains { $0.keyEquivalent == key && $0.action == Selector(action) && $0.keyEquivalentModifierMask == [.command] } }, "原生编辑菜单包含正确的剪切复制粘贴全选快捷键")
+        let recorder = EditCommandRecorder()
+        let pasteItem = edit.items.first(where: { $0.keyEquivalent == "v" })!
+        pasteItem.target = recorder
+        let pasteEvent = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command],
+            timestamp: 0, windowNumber: 0, context: nil, characters: "v", charactersIgnoringModifiers: "v", isARepeat: false, keyCode: 9)!
+        check(edit.performKeyEquivalent(with: pasteEvent) && recorder.pasteCount == 1, "真实菜单快捷键分派 Cmd+V；测试不读取剪贴板或凭据")
+        pasteItem.target = nil
         func snapshot(_ taskJSON: String, other: String = "[]", quota: String = "null", legacyUpdates: Int = 0, budget: String = "null") throws -> Snapshot {
             let json = """
             {"generated_at":"2026-10-07T06:00:00Z","total_tokens":1000,

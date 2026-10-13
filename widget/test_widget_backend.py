@@ -1,5 +1,7 @@
 """Meaningful boundaries of display aggregation and quota accounting."""
 from datetime import datetime, timedelta, timezone
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import sqlite3
 import sys
@@ -12,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from widget_backend import group_tasks, normalize_limits, save_observation, cycle_history, open_history, weekly_budget, WEEK_SECONDS, calendar_week
-from widget_backend import build_snapshot
+from widget_backend import build_snapshot, main as backend_main
 
 
 class SnapshotIntegrationTests(unittest.TestCase):
@@ -49,6 +51,7 @@ class SnapshotIntegrationTests(unittest.TestCase):
     def test_sync_cli_config_error_is_structured_and_does_not_emit_private_text(self):
         with tempfile.TemporaryDirectory() as temporary:
             data = Path(temporary)
+            (data / "app-settings.json").write_text('{"notion_sync_enabled":true}')
             (data / "notion-config.json").write_text("PRIVATE_SYNTHETIC_MARKER")
             (data / "notion-state.json").write_text('{}')
             process = subprocess.run([sys.executable, str(Path(__file__).with_name("widget_backend.py")),
@@ -57,6 +60,73 @@ class SnapshotIntegrationTests(unittest.TestCase):
             self.assertFalse(json.loads(process.stdout)["ok"])
             self.assertEqual(process.stderr, "")
             self.assertNotIn("PRIVATE_SYNTHETIC_MARKER", process.stdout)
+
+    def sync_command(self, data, force=False):
+        arguments = ["widget_backend.py", "--sync-notion", "--data-dir", str(data)]
+        if force:
+            arguments.append("--force-sync")
+        output = io.StringIO()
+        with patch("sys.argv", arguments), redirect_stdout(output):
+            code = backend_main()
+        return code, json.loads(output.getvalue())
+
+    def test_sync_requires_literal_opt_in_before_workspace_credentials_or_network(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data = Path(temporary)
+            # A corrupt previously configured workspace must not be inspected
+            # in local mode, nor should a saved connection trigger a request.
+            (data / "notion-config.json").write_text("PRIVATE_SYNTHETIC_MARKER")
+            with patch("notion_sync.NotionWorkspace", side_effect=AssertionError("workspace accessed")), \
+                 patch("notion_sync.keychain_token", side_effect=AssertionError("credential accessed")), \
+                 patch("notion_sync.urllib_transport", side_effect=AssertionError("network accessed")):
+                cases = [{}, {"notion_sync_enabled": False}, {"notion_sync_enabled": 1},
+                         {"notion_sync_enabled": "true"}, {"notion_sync_enabled": None}, []]
+                for settings in cases:
+                    with self.subTest(settings=settings):
+                        (data / "app-settings.json").write_text(json.dumps(settings))
+                        code, result = self.sync_command(data)
+                        self.assertEqual(code, 1)
+                        self.assertFalse(result["ok"])
+                        self.assertEqual(result["error"]["code"], "local_mode")
+
+    def test_forced_sync_without_settings_stays_local(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch("notion_sync.NotionWorkspace", side_effect=AssertionError("workspace accessed")):
+            code, result = self.sync_command(Path(temporary), force=True)
+            self.assertEqual(code, 1)
+            self.assertEqual(result["error"]["code"], "local_mode")
+
+    def test_corrupt_opt_in_settings_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch("notion_sync.NotionWorkspace", side_effect=AssertionError("workspace accessed")):
+            data = Path(temporary)
+            (data / "app-settings.json").write_text("PRIVATE_SYNTHETIC_MARKER")
+            code, result = self.sync_command(data)
+            self.assertEqual(code, 1)
+            self.assertEqual(result["error"]["code"], "local_mode")
+            self.assertNotIn("PRIVATE_SYNTHETIC_MARKER", str(result))
+
+    def test_explicit_opt_in_preserves_forced_summary_sync(self):
+        with tempfile.TemporaryDirectory() as temporary, patch("notion_sync.NotionWorkspace") as constructor, \
+             patch("notion_sync.keychain_token", side_effect=AssertionError("credential accessed")), \
+             patch("notion_sync.urllib_transport", side_effect=AssertionError("network accessed")):
+            data = Path(temporary)
+            (data / "app-settings.json").write_text('{"notion_sync_enabled":true}')
+            saved = {"rows": [{"total_tokens": 100}], "dataset_id": "test-dataset",
+                     "statistics_until": self.NOW.isoformat()}
+            (data / "notion-daily.json").write_text(json.dumps(saved))
+            workspace = constructor.return_value
+            workspace.status.return_value = {"ready": True}
+            workspace.sync.return_value = {"changed": 1}
+            code, result = self.sync_command(data, force=True)
+            self.assertEqual(code, 0)
+            self.assertTrue(result["ok"])
+            constructor.assert_called_once_with(data)
+            workspace.projects.assert_called_once_with(force=True)
+            self.assertEqual(workspace.sync.call_args.args, (saved["rows"],))
+            self.assertTrue(workspace.sync.call_args.kwargs["force"])
+            self.assertEqual(workspace.sync.call_args.kwargs["complete_dataset_ids"], ["test-dataset"])
+            self.assertEqual(workspace.sync.call_args.kwargs["complete_until"], self.NOW.isoformat())
 
     def test_snapshot_and_daily_share_counts_without_credentials_or_network(self):
         with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()), \

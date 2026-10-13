@@ -156,6 +156,7 @@ final class UsageModel: ObservableObject {
     @Published var showOther = false
     @Published var notionSyncing = false
     @Published var notionSyncMessage: String?
+    @Published private(set) var notionEnabled = false
     @Published var enabledWidgets: Set<WidgetKind> = [.horizontal]
     var onVisibility: (() -> Void)?
     var onUpdated: (() -> Void)?
@@ -170,7 +171,7 @@ final class UsageModel: ObservableObject {
     init(root: URL) {
         self.root = root
         python = root.appendingPathComponent(".venv/bin/python3")
-
+        notionEnabled = WidgetPreferences.notionEnabled(in: (try? WidgetPreferences.read(root: root)) ?? [:])
     }
 
     func start() {
@@ -210,6 +211,10 @@ final class UsageModel: ObservableObject {
     }
 
     func syncNotion(force: Bool = false) {
+        guard notionEnabled else {
+            notionSyncMessage = "本机模式；Notion 同步已关闭。"
+            return
+        }
         guard !notionSyncing else { return }
         if !force && snapshot?.notion?.connected != true { return }
         notionSyncing = true
@@ -233,6 +238,17 @@ final class UsageModel: ObservableObject {
             notionSyncing = false
             refresh()
         }
+    }
+
+    func setNotionEnabled(_ enabled: Bool) {
+        // An in-flight request may already have reached Notion; finish it first.
+        guard !notionSyncing else { return }
+        do {
+            try WidgetPreferences.update(root: root, values: ["notion_sync_enabled": enabled])
+            notionEnabled = enabled
+            notionSyncMessage = enabled ? "已开启；连接完成后每 5 分钟同步摘要。" : "本机模式；Notion 同步已关闭。"
+            onUpdated?()
+        } catch { notionSyncMessage = "运行方式未保存，保留原设置。" }
     }
 
     func toggleWidget(_ kind: WidgetKind) {
@@ -516,6 +532,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        NSApp.mainMenu = WidgetApplicationMenu.make(settingsTarget: self)
         model = UsageModel(root: root)
         if let data = try? Data(contentsOf: root.appendingPathComponent("widget/data/positions.json")),
            let saved = try? JSONDecoder().decode([String: [String: Double]].self, from: data) { positions = saved }
@@ -548,6 +565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.xaxis", accessibilityDescription: "用量小助手")
         statusItem.button?.imagePosition = .imageLeading
         let menu = NSMenu()
+        menu.autoenablesItems = false
         let label = NSMenuItem(title: "展示形式 · 可同时开启", action: nil, keyEquivalent: "")
         label.isEnabled = false
         menu.addItem(label)
@@ -768,6 +786,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func updateStatus() {
+        if let syncItem = statusItem.menu?.items.first(where: { $0.action == #selector(syncNotion) }) {
+            syncItem.isEnabled = model.notionEnabled && !model.notionSyncing
+        }
         if let snapshot = model.snapshot,
            let week = snapshot.quota?.windows.first(where: { $0.duration_mins == 10080 }) {
             let cached = snapshot.quota?.stale == true || snapshot.quota_error != nil

@@ -19,6 +19,8 @@ sh widget/run.command
 
 菜单栏或组件右键菜单可以切换三种形式。“项目与 Notion 设置…”也在这两个菜单中；找不到菜单时可双击 `设置.command`，或重新打开应用直接进入设置。关闭全部展示后刷新仍继续；菜单栏“退出用量小助手”停止应用。桌面小框可用图钉临时置顶，横条与竖条保持桌面层。
 
+默认使用本机模式，无需填写 Notion Token。设置里可以选择项目目录和桌面显示形式；“启用 Notion 同步”关闭时隐藏连接表单，定时与手动同步均不会读取 Notion 凭据或联网。标准编辑菜单支持 ⌘V 粘贴；加载状态时输入框仍可编辑。
+
 ## 交互与显示
 
 - 共用胶囊外框、64pt圆形模块、16pt主数字与10pt辅助标签。
@@ -48,7 +50,7 @@ sh widget/run.command
 
 原生应用可在“项目与 Notion 设置…”选择持久项目根目录。CLI 的 --task-root 对本次执行优先。
 
-Notion 每5分钟在独立进程中同步摘要，不阻塞每分钟本地扫描。未绑定项目留在本机。可以显式绑定已有项目，或创建并绑定一个项目；详细连接、数据与重试口径见 [Notion 说明](../docs/notion.md)。
+只有开启 Notion 同步并完成连接后，才每5分钟在独立进程中同步摘要，不阻塞每分钟本地扫描。未绑定项目留在本机。可以显式绑定已有项目，或创建并绑定一个项目；详细连接、数据与重试口径见 [Notion 说明](../docs/notion.md)。
 
 ## 官方额度与本周累计
 
@@ -68,7 +70,7 @@ Notion 每5分钟在独立进程中同步摘要，不阻塞每分钟本地扫描
 | `data/official-latest.json` | 最近一次官方额度观测 |
 | `data/quota-history.sqlite3` | 保存的额度观测与周期历史 |
 | `data/display-settings.json` | 三种展示形式开关 |
-| `data/app-settings.json` | 项目根目录 |
+| `data/app-settings.json` | 项目根目录、Notion 同步开关 |
 | `data/positions.json` | 归一化的窗口位置 |
 | `data/project-registry.json` | 稳定任务与匿名来源数据集身份 |
 | `data/daily-ledger.sqlite3` | 已观测项目每日摘要 |
