@@ -12,6 +12,8 @@ report.json
 codex-usage.json
 .env
 .env.*
+token*.pages
+*密钥*.pages
 
 # Local review previews contain real snapshot data; publish only the demo
 widget/preview/*

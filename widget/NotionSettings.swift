@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Security
+import UniformTypeIdentifiers
 
 enum WidgetPreferences {
     static func read(root: URL) throws -> [String: Any] {
@@ -123,6 +124,7 @@ final class ProjectSettingsModel: ObservableObject {
     @Published var taskRoot: String
     @Published var parentPage = ""
     @Published var token = ""
+    @Published var tokenSourceFile = ""
     @Published var busy = false
     @Published var message = ""
     @Published var choices: [NotionChoice] = []
@@ -139,6 +141,7 @@ final class ProjectSettingsModel: ObservableObject {
         self.usage = usage; root = usage.root; python = usage.python
         let settings = try? WidgetPreferences.read(root: root)
         taskRoot = settings?["task_root"] as? String ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents").path
+        tokenSourceFile = settings?["notion_token_source_file"] as? String ?? ""
         let configFile = root.appendingPathComponent("widget/data/notion-config.json")
         if let data = try? Data(contentsOf: configFile),
            let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -222,9 +225,29 @@ final class ProjectSettingsModel: ObservableObject {
     }
     func connect() {
         guard !busy, usage?.notionEnabled == true else { return }
-        do { try NotionCredential.save(token); token = "" }
+        do {
+            if tokenSourceFile.isEmpty { try NotionCredential.save(token) }
+            token = ""
+        }
         catch { message = error.localizedDescription; return }
         perform(["command": "setup", "parent_page": parentPage])
+    }
+    func chooseTokenSource() {
+        let picker = NSOpenPanel()
+        picker.canChooseDirectories = false; picker.canChooseFiles = true
+        picker.allowsMultipleSelection = false
+        if let type = UTType(filenameExtension: "pages") { picker.allowedContentTypes = [type] }
+        if picker.runModal() == .OK, let url = picker.url {
+            setTokenSource(url.path)
+        }
+    }
+    func setTokenSource(_ path: String) {
+        guard !busy, usage?.notionSyncing != true else { return }
+        do {
+            try WidgetPreferences.update(root: root, values: ["notion_token_source_file": path.isEmpty ? NSNull() : path as Any])
+            tokenSourceFile = path; token = ""
+            message = "密钥来源已保存；点击连接以验证权限。"
+        } catch { message = "密钥来源未保存，保留原设置。" }
     }
     func create() {
         guard let task = tasks.first(where: { $0.task_id == selectedTask }) else { return }
@@ -261,7 +284,18 @@ struct ProjectSettingsView: View {
             if usage.notionEnabled {
                 Section("连接 Notion") {
                     Text(model.statusText).font(.callout)
-                    SecureField("Notion Integration Token（仅存系统钥匙串）", text: $model.token)
+                    HStack {
+                        Text(model.tokenSourceFile.isEmpty ? "密钥来源：系统钥匙串" : "密钥来源：" + URL(fileURLWithPath: model.tokenSourceFile).lastPathComponent)
+                            .font(.callout).lineLimit(1)
+                        Button("选择 Pages 文件…") { model.chooseTokenSource() }
+                        if !model.tokenSourceFile.isEmpty { Button("改用钥匙串") { model.setTokenSource("") } }
+                    }.disabled(model.busy || usage.notionSyncing)
+                    if model.tokenSourceFile.isEmpty {
+                        SecureField("Notion Integration Token（仅存系统钥匙串）", text: $model.token)
+                    } else {
+                        Text("从所选文件提取 Token 用于 Notion 认证；不会上传 Pages 文件。")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
                     TextField("已分享给 Integration 的父页面链接", text: $model.parentPage)
                     HStack {
                         Button("连接并创建两个数据库") { model.connect() }

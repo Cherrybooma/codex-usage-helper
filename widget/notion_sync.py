@@ -1,7 +1,8 @@
 """Opt-in Notion project metadata and absolute daily Codex summaries.
 
 Only calculated, whitelisted aggregates leave the computer. Credentials come
-from this app's dedicated Keychain item, never Codex auth or environment vars.
+from a selected Pages file or this app's dedicated Keychain item, never Codex
+auth or environment vars.
 The transport and credential provider are injectable for network-free tests.
 """
 from __future__ import annotations
@@ -24,6 +25,11 @@ from typing import Callable
 from urllib import error, parse, request
 import uuid
 from zoneinfo import ZoneInfo
+
+if __package__:
+    from .notion_credentials import configured_token
+else:
+    from notion_credentials import configured_token
 
 API_VERSION = "2026-03-11"
 API_BASE = "https://api.notion.com/v1"
@@ -169,7 +175,7 @@ class NotionWorkspace:
                  transport: Callable | None = None, clock: Callable | None = None,
                  sleeper: Callable | None = None):
         self.data_dir = Path(data_dir)
-        self.token_provider = token_provider or keychain_token
+        self.token_provider = token_provider if token_provider is not None else lambda: configured_token(self.data_dir)
         self.transport = transport or urllib_transport
         self.clock = clock or (lambda: datetime.now(UTC))
         self.sleeper = sleeper or time.sleep
@@ -887,7 +893,7 @@ class NotionWorkspace:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Notion 项目与每日摘要同步；JSON 命令由 stdin 输入，凭据仅从专用 Keychain 读取。")
+    parser = argparse.ArgumentParser(description="Notion 项目与每日摘要同步；JSON 命令由 stdin 输入，凭据从明确选择的 Pages 文件或应用专用钥匙串读取。")
     parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "data")
     args = parser.parse_args(argv)
     workspace = None

@@ -21,6 +21,8 @@ sh widget/run.command
 
 默认使用本机模式，无需填写 Notion Token。设置里可以选择项目目录和桌面显示形式；“启用 Notion 同步”关闭时隐藏连接表单，定时与手动同步均不会读取 Notion 凭据或联网。标准编辑菜单支持 ⌘V 粘贴；加载状态时输入框仍可编辑。
 
+连接 Notion 时，密钥默认使用本应用专用钥匙串；也可明确选择自己的 Pages 密钥文件作为来源。设置显示所选文件名，后台仅在内存中提取 Token 进行认证，不上传整个文件；移动或删除来源文件会使连接暂停。可随时切换回钥匙串。
+
 ## 交互与显示
 
 - 共用胶囊外框、64pt圆形模块、16pt主数字与10pt辅助标签。
@@ -70,7 +72,7 @@ sh widget/run.command
 | `data/official-latest.json` | 最近一次官方额度观测 |
 | `data/quota-history.sqlite3` | 保存的额度观测与周期历史 |
 | `data/display-settings.json` | 三种展示形式开关 |
-| `data/app-settings.json` | 项目根目录、Notion 同步开关 |
+| `data/app-settings.json` | 项目根目录、Notion 同步开关、可选密钥来源文件路径（不含 Token） |
 | `data/positions.json` | 归一化的窗口位置 |
 | `data/project-registry.json` | 稳定任务与匿名来源数据集身份 |
 | `data/daily-ledger.sqlite3` | 已观测项目每日摘要 |

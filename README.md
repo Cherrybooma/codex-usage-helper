@@ -43,7 +43,7 @@ sh widget/run.command
 
 构建产物位于 `widget/build/用量小助手.app`。这是本地 ad-hoc 签名的开发应用，尚未提供可独立安装的发行包；请保留项目目录和 `.venv`，应用目前依赖其中的 Python 数据层。
 
-项目根目录和 Notion 连接可在菜单栏的“项目与 Notion 设置…”中配置。连接凭据只保存在系统钥匙串；首次同步从本周开始，不会自动为所有文件夹创建项目。见 [Notion 说明](docs/notion.md)。
+项目根目录和 Notion 连接可在菜单栏的“项目与 Notion 设置…”中配置。连接凭据默认保存在系统钥匙串，也可明确选择自己的 Pages 密钥文件作为来源；应用不保存明文副本。首次同步从本周开始，不会自动为所有文件夹创建项目。见 [Notion 说明](docs/notion.md)。
 
 更完整的运行说明见 [桌面组件文档](widget/README.md)。
 
@@ -122,7 +122,7 @@ Windows 可将 `python3` 替换为 `py -3`。优先使用 `CODEX_HOME`，否则�
 Python 测试使用临时模拟日志与临时 Git 仓库，不读取用户真实会话：
 
 ```sh
-.venv/bin/python3 -m unittest -v test_codex_usage.py widget/test_widget_backend.py widget/test_project_store.py widget/test_notion_sync.py
+.venv/bin/python3 -m unittest -v test_codex_usage.py widget/test_widget_backend.py widget/test_project_store.py widget/test_notion_sync.py widget/test_notion_credentials.py
 ```
 
 Swift 数据与交互检查：
@@ -148,6 +148,7 @@ widget/UsageStrip.swift       条形组件与交互
 widget/widget_backend.py     本周归集、官方额度读取和历史估算
 widget/project_store.py      稳定项目身份和项目每日事实
 widget/notion_sync.py         Notion 元数据、绑定与摘要同步
+widget/notion_credentials.py  用户选定的 Pages 密钥来源
 widget/NotionSettings.swift   原生设置和专用钥匙串凭据
 widget/test_notion_sync.py    同步、重试与幂等测试
 widget/test_widget_backend.py 数据层测试

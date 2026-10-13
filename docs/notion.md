@@ -10,10 +10,14 @@
 
 1. 在 Notion 建立一个用于用量小助手的父页面。
 2. 建立内部连接，授予读取、插入与更新内容能力。将这个父页面共享给该连接。
-3. 在应用的 Notion 设置中开启“启用 Notion 同步”，保存连接凭据，再填写父页面链接或页面 ID。支持 ⌘V 粘贴，加载状态不禁用输入框。
+3. 在应用的 Notion 设置中开启“启用 Notion 同步”，保存连接凭据，或明确选择自己的 Pages 密钥文件；再填写父页面链接或页面 ID。支持 ⌘V 粘贴，加载状态不禁用输入框。
 4. 建立两个新库后，从本地任务中选择“绑定已有项目”，或明确选择创建一个项目。不自动将所有本地文件夹上传或批量建立项目。
 
-凭据由应用保存到 macOS Keychain 的专用项目：服务 `local.codex.usage-widget.notion`，账号 `integration`。Python 只读取这一项；不读取 Codex 认证文件、浏览器、其他 Keychain 项目或认证环境变量。凭据不放入 JSON、命令行参数、仓库和日志，也不通过聊天收集。后台状态与胶囊渲染仅读取本地缓存，不探测 Keychain。
+默认凭据由应用保存到 macOS Keychain 的专用项目：服务 `local.codex.usage-widget.notion`，账号 `integration`。也可以在设置中明确选择一个包含 Notion Token 的 `.pages` 文件作为来源；后台仅从该文件在内存中提取唯一 Token，不搜索其他文件、不生成明文副本、不上传 Pages 文件。文件中已有的 Token 仍需要用户自行保护；应用只将提取的 Token 用于 Notion 官方认证。来源文件移动或解析失败时暂停连接，不静默改用旧凭据。
+
+文件来源只在本地 `app-settings.json` 保存路径，不保存 Token。选择“改用钥匙串”后恢复专用钥匙串模式。Python 不读取 Codex 认证文件、浏览器、其他 Keychain 项目或认证环境变量；凭据不放入 JSON、命令行参数、仓库和日志，也不通过聊天收集。后台状态与胶囊渲染仅读取本地缓存，不读取来源文档或探测 Keychain。
+
+文件来源支持含 `Index/Document.iwa` 的 ZIP 格式 Pages 文档；仅允许一个可识别的 Notion Token。旧目录式文档、多个不同 Token 或超过读取上限的文件会拒绝连接，不猜测内容。
 
 第一次同步从连接时的北京时间自然周周一开始。例如 2026-10-13 连接，起点为 2026-10-12。这个起点持久保存，不会在下周自动把前周失败的队列抛弃。数据库位置一经建立保持固定，避免重新填父页面后误创建另一套库。
 
@@ -127,7 +131,7 @@ stdin 命令为 `status`、`projects`、`setup`、`bind`、`unbind`、`create_pr
 测试命令：
 
 ```sh
-python3 -m unittest -v widget/test_notion_sync.py
+python3 -m unittest -v widget/test_notion_sync.py widget/test_notion_credentials.py
 ```
 
 ## 官方 API 依据
