@@ -745,7 +745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else { hovered = "__vertical_surface__" }
             }
             if hovered == nil, let selected = state.expanded, let index = items.firstIndex(where: { $0.id == selected }) {
-                let card = UsageStrip.detailFrame(for: items[index], index: index, itemCount: items.count, vertical: vertical, canvas: canvas, headerOffset: offset)
+                let card = UsageStrip.detailFrame(for: items[index], index: index, itemCount: items.count, vertical: vertical, canvas: canvas, headerOffset: offset, locked: state.locked)
                 let bridge = UsageStrip.connectorFrame(index: index, itemCount: items.count, vertical: vertical, canvas: canvas, detail: card, headerOffset: offset)
                 if pointInRoundedRectangle(point, rect: card, radius: UsageStrip.detailRadius) || bridge.contains(point) { hovered = selected }
             }

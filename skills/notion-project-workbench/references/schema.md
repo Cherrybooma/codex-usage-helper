@@ -14,7 +14,7 @@
 | Priority / Health | select | 高／中／低；正常／有风险／受阻 |
 | Development Progress | number | 有明确依据的 0–100 开发进度，未知留空 |
 | Target Date / Last Reviewed | date | 明确计划日期与实际复盘日期，未知留空 |
-| Summary / Outcome | rich_text / url | 当前状态摘要、成果链接 |
+| Summary / Outcome | rich_text / url | 当前状态摘要、经核实的阶段产出或成果索引入口 |
 | Binding Key | rich_text | 若已有应用使用，保留其去重语义 |
 
 任务、事件和投入都关联到同一个项目页面身份。项目改名不能断开关系或生成第二个项目。
@@ -30,9 +30,12 @@
 | Status | status 或 select | 待处理、进行中、待确认、阻塞、已完成、取消 |
 | Priority / Due | select / date | 优先级、已确认日期 |
 | Managed By | select | AI 或人类确认 |
-| Acceptance / Evidence | rich_text / url | 完成条件与可核查依据 |
+| Acceptance / Evidence | rich_text / url | 完成条件、对应产出入口与可核查验收依据 |
+| Decision / Recommendation / Impact（可选） | rich_text | 待决定事项、推荐方案及影响，供紧凑确认卡展示 |
 
 桌面用量小助手当前 Tasks 计数适配器要求 Status 为上述选项的 select，以及 Project relation 指向配置的 Projects 数据源。连接其他 status 结构时先兼容适配，不通过改写远端结构让计数“看似正确”。
+
+确认卡已有 Decision、Recommendation、Impact 或语义对应字段时优先映射使用；没有时用任务正文写三项。它们是可选展示字段，不为每次维护强制所有库增加列。
 
 待办包含待处理、进行中、待确认和阻塞；受阻是待办的子集。已完成保留数据库行，视图可以隐藏它；取消和归档不计入当前待办。计数读取失败或不完整时不是零。
 
@@ -46,7 +49,7 @@ Events 存开发事实，不能替代 Tasks 当前状态。若已有事件库采
 | Project | relation → Projects | 事件所属项目 |
 | Tasks | relation → Tasks | 相关行动项，一个事件可关联多个 Tasks |
 | Occurred At | date | 实际发生时间，支持精确时间与时区 |
-| Result | rich_text | 实际动作、结果，以及仍未验证的部分 |
+| Result | rich_text | 实际动作、产出名称、已实现／验收的内容，以及仍未验证的部分 |
 | Evidence | url | 可核查结果的主链接；其余链接放正文 |
 | Event Key | rich_text | 一次实际推进的稳定标识，用于重试去重 |
 | Created At | created_time | Notion 实际建立记录时间，用于区分发生与录入 |
@@ -59,10 +62,20 @@ Event Key 的富文本属性没有唯一约束。一个项目由一个写者顺�
 
 事件结果后续被纠正时追加更正记录，关联原任务并在正文链接原事件。旧结果保留为当时的历史事实，不篡改成最终答案。
 
+## 阶段产出与文档
+
+默认沿用项目正文的“阶段产出”紧凑表／索引、Project Outcome、Tasks Evidence／正文、Events Evidence／Result，不为本轮要求新建 Outputs 数据库。已有适用的 Artifacts 库时读取并复用其关系；缺少专用字段时用正文建立可追溯链接，不为格式整齐强增列。
+
+每个产出说明名称／阶段、入口、实现了什么及验收范围。同一产出在项目、任务和事件之间使用同一入口，方便从进展追到文档，从文档追到完成任务。一个 Evidence URL 只能放主入口，其余文档和功能说明放正文。
+
+本机未推送成果使用“本机待发布 · 相对项目路径”，功能和验收写成摘要；没有可访问的云端入口时 URL 留空，或使用确实存在的 Notion 产出索引页，并在该页注明本机待发布。不得生成未经发布的 GitHub URL、把 `localhost` 当可分享入口、上传原始日志或绝对私人路径。
+
 ## Usage Daily
 
 复用已有账本：Project、Day、Provider、Included、Counted Tokens、Total Tokens、细分计数、Quality、Data Scope、Statistics Until ISO、匿名 Dataset、Summary Key 等。不要重算原始日志或把两次扫描结果相加。
 
 首页投入视图过滤 Included = true，用 Counted Tokens 汇总，同一来源的绝对摘要采用现有稳定键替换。已停计的旧分配留在审计视图。日会话数非可加量；多来源没有去重依据时分列展示，不声称完成了跨设备归并。
+
+周记录与月核算目前是待确认的周期设计。保留现有自然周统计；不得擅自把历史分组换成重置日周期，或把自然月、订阅账期混为同一窗口。官方额度只读窗口不等于本地 Token 账本，月也不等于四周。
 
 项目管理内容以用户授权的摘要维护；计量部分只传摘要。原始日志、代码、会话、工具输出、认证信息和本机绝对路径不进入 Notion。

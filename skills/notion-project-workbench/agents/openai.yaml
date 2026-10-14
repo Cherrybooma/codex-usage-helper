@@ -1,4 +1,4 @@
 interface:
   display_name: "Notion 项目工作台"
-  short_description: "按愿景、待确认、当前行动、开发历史与 Token 投入更新 Notion 项目工作台"
-  default_prompt: "用 $notion-project-workbench 更新当前项目工作台，保留开发历史，并补充这次任务的实际结果和证据。"
+  short_description: "维护愿景、待确认、当前行动与阶段产出、开发历史和 Token 投入的 Notion 看板"
+  default_prompt: "用 $notion-project-workbench 更新当前项目工作台，关联这次阶段产出的入口、功能与验收结果，并保留开发历史。"
