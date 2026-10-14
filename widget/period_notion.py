@@ -34,6 +34,7 @@ WINDOW_NOTES = {
     "incompatible_bucket": "套餐或额度分类不一致，不能比较为同一份容量。",
     "deadline_changed": "观测到截止时间变化；不能单凭变化确认福利重置或最终剩余。",
     "final_usage_unknown": "只保留末次观测，不代表窗口结束时的最终使用或未用完额度。",
+    "superseded_window": "后续报告已观测到同类新窗口，此记录已不再是当前观测窗口；切换时刻未保留。原 End 仍为旧读数的预计重置时间，末次读数不代表最终消耗，不能据此确认福利重置。",
 }
 
 
@@ -201,6 +202,8 @@ class PeriodNotionWorkspace(NotionWorkspace):
             raise NotionError("invalid_response")
         schedules = state.setdefault("schedules", {})
         if not isinstance(schedules, dict):
+            raise NotionError("invalid_response")
+        if not isinstance(state.setdefault("window_currents", {}), dict):
             raise NotionError("invalid_response")
         # Upgrade the original single-source state once. New sources must not
         # replace the freshness guard belonging to another scanner dataset.
@@ -492,6 +495,19 @@ class PeriodNotionWorkspace(NotionWorkspace):
         operation = "period:" + key
         if found:
             page_id = notion_id(found[0].get("id"))
+            if row["family"] == "windows":
+                existing = found[0].get("properties", {})
+                observed = _plain(existing.get("Observed At ISO", {}).get("rich_text"))
+                until = _plain(existing.get("Statistics Until ISO", {}).get("rich_text"))
+                note = _plain(existing.get("Note", {}).get("rich_text"))
+                if (observed and self._now(observed) > self._now(row["observed_at"])) or (
+                        until and self._now(until) > self._now(row["scan_cutoff"])) or (
+                        row["state"] == "current" and WINDOW_NOTES["superseded_window"] in note
+                        and observed and self._now(row["observed_at"]) <= self._now(observed)):
+                    self._period_state()["pending"].pop(key, None)
+                    self.state["uncertain_creates"].pop(operation, None)
+                    self._save(self.state_path, self.state)
+                    return False
             self._request("PATCH", "/pages/" + page_id, {"properties": props}, idempotent=True)
         else:
             if operation in self.state["uncertain_creates"]:
@@ -525,11 +541,16 @@ class PeriodNotionWorkspace(NotionWorkspace):
                                 "scan_cutoff": row["scan_cutoff"], "schedule_id": row.get("schedule_id")}
         state["pending"].pop(key, None)
         self._save(self.state_path, self.state)
+        return True
 
     def sync(self, ledger_rows: list[dict], window_rows: list[dict], *, now=None, force=False,
              complete_kinds=None, complete_until=None, billing_configured=None,
              active_monthly_schedule=None) -> dict:
         """Reconcile explicit complete kinds only; partial inputs never retire history.
+
+        A uniquely observed current quota window may close a superseded current
+        observation of the same dataset/kind. This only changes display state:
+        it does not exclude history, alter samples, or prove an actual reset.
 
         Rows use dataset_id, kind, start/end (aware ISO), statistics_until,
         counters/coverage/quality. Window rows add observed_at, duration_minutes,
@@ -577,6 +598,31 @@ class PeriodNotionWorkspace(NotionWorkspace):
                     active_monthly_schedule = None
                 complete -= stale
                 rows = [row for row in rows if row["kind"] not in stale]
+                # A bounded history can still identify its current window. A
+                # Dataset+kind guard prevents a delayed report from reviving
+                # a superseded observation, including after a failed create.
+                current_groups = {}
+                for row in rows:
+                    if row["family"] == "windows" and row["state"] == "current":
+                        scope = row["dataset_id"] + ":" + row["kind"]
+                        current_groups.setdefault(scope, []).append(row)
+                current_windows = {scope: values[0] for scope, values in current_groups.items() if len(values) == 1}
+                submitted_currents = dict(current_windows)
+                stale_windows = set()
+                for scope, row in current_windows.items():
+                    guard = state["window_currents"].get(scope, {})
+                    prior_cutoffs = [self._now(prior.get("scan_cutoff", prior["statistics_until"]))
+                                     for prior in state["synced"].values()
+                                     if prior["family"] == "windows" and prior["dataset_id"] == row["dataset_id"]
+                                     and prior["kind"] == row["kind"]]
+                    if (prior_cutoffs and self._now(row["scan_cutoff"]) < max(prior_cutoffs)) or (guard and (
+                            self._now(row["scan_cutoff"]) < self._now(guard["cutoff"])
+                            or self._now(row["observed_at"]) < self._now(guard["observed_at"])
+                            or (row["scan_cutoff"] == guard["cutoff"] and self._key(row) != guard["key"]))):
+                        stale_windows.add(scope)
+                rows = [row for row in rows if row["dataset_id"] + ":" + row["kind"] not in stale_windows]
+                current_windows = {scope: row for scope, row in current_windows.items() if scope not in stale_windows}
+                complete -= {kind for kind in WINDOW_KINDS if dataset + ":" + kind in stale_windows}
                 active = {self._key(row) for row in rows}
                 for row in rows:
                     key = self._key(row)
@@ -606,7 +652,7 @@ class PeriodNotionWorkspace(NotionWorkspace):
                 # Validate both data sources before any cloud writes.
                 for family in ("ledger", "windows"):
                     self._validate_source(family, self._source(family))
-                retire = {}
+                retire, retire_scopes, superseded = {}, {}, {}
                 query_datasets = datasets | {row["dataset_id"] for row in state["pending"].values()}
                 if complete or active_monthly_schedule:
                     query_datasets.add(dataset)
@@ -625,6 +671,8 @@ class PeriodNotionWorkspace(NotionWorkspace):
                                 raise NotionError("invalid_response")
                             if (props.get("Provider", {}).get("select") or {}).get("name") != "Codex":
                                 continue
+                            if _plain(props.get("Dataset", {}).get("rich_text")) != remote_dataset:
+                                continue
                             display_kind = (props.get("Kind", {}).get("select") or {}).get("name")
                             kind = next((kind for kind, label in ALL_KINDS.items() if label == display_kind), None)
                             if kind not in (LEDGER_KINDS if family == "ledger" else WINDOW_KINDS):
@@ -642,6 +690,66 @@ class PeriodNotionWorkspace(NotionWorkspace):
                                 obsolete = True
                             if obsolete and props.get("Included", {}).get("checkbox"):
                                 retire[key] = (notion_id(page.get("id")), family)
+                                retire_scopes[key] = remote_dataset + ":" + kind
+                            scope = remote_dataset + ":" + str(kind)
+                            current = current_windows.get(scope)
+                            if family == "windows" and current and (props.get("State", {}).get("select") or {}).get("name") == "进行中":
+                                observed = _plain(props.get("Observed At ISO", {}).get("rich_text"))
+                                until = _plain(props.get("Statistics Until ISO", {}).get("rich_text"))
+                                if not observed or not until:
+                                    raise NotionError("schema_mismatch")
+                                # Exact remote observation times also protect
+                                # against stale input after local cache loss.
+                                prior = state["synced"].get(key, {})
+                                if (self._now(observed) > self._now(current["observed_at"])
+                                        or self._now(until) > self._now(current["scan_cutoff"])
+                                        or (prior.get("scan_cutoff") and self._now(prior["scan_cutoff"]) > self._now(current["scan_cutoff"]))):
+                                    stale_windows.add(scope)
+                                elif key != self._key(current) and key not in active:
+                                    superseded[key] = (notion_id(page.get("id")), props, scope)
+                # Discovery is finished before any write. A newer remote
+                # current window invalidates this old report's whole scope.
+                for key, row in list(state["pending"].items()):
+                    scope = row["dataset_id"] + ":" + row["kind"]
+                    incoming = submitted_currents.get(scope)
+                    if (row["family"] == "windows" and scope in stale_windows and incoming
+                            and self._now(row["scan_cutoff"]) <= self._now(incoming["scan_cutoff"])
+                            and self._now(row["observed_at"]) <= self._now(incoming["observed_at"])):
+                        state["pending"].pop(key, None)
+                current_windows = {scope: row for scope, row in current_windows.items() if scope not in stale_windows}
+                complete -= {kind for kind in WINDOW_KINDS if dataset + ":" + kind in stale_windows}
+                retire = {key: value for key, value in retire.items() if retire_scopes[key] not in stale_windows}
+                for scope, current in current_windows.items():
+                    state["window_currents"][scope] = {"key": self._key(current), "cutoff": current["scan_cutoff"],
+                                                      "observed_at": current["observed_at"]}
+                # Keep unsent older rows as history rather than dropping their
+                # observed usage or allowing an outbox retry to reopen them.
+                for row in state["pending"].values():
+                    scope = row["dataset_id"] + ":" + row["kind"]
+                    guard = state["window_currents"].get(scope)
+                    if (row["family"] == "windows" and guard and row["state"] == "current"
+                            and self._key(row) != guard["key"]
+                            and self._now(row["scan_cutoff"]) <= self._now(guard["cutoff"])
+                            and self._now(row["observed_at"]) <= self._now(guard["observed_at"])):
+                        row["state"] = "closed"
+                        row["scan_cutoff"] = guard["cutoff"]
+                        row["note_flags"] = sorted(set(row["note_flags"]) | {"superseded_window", "final_usage_unknown"})
+                self._save(self.state_path, self.state)
+                for key, (page_id, old_props, scope) in superseded.items():
+                    if scope not in current_windows or key in state["pending"]:
+                        continue
+                    current = current_windows[scope]
+                    note = _plain(old_props.get("Note", {}).get("rich_text"))
+                    if WINDOW_NOTES["superseded_window"] not in note:
+                        note = (note + "\n" + WINDOW_NOTES["superseded_window"]).strip()
+                    self._request("PATCH", "/pages/" + page_id, {"properties": {
+                        "State": {"select": {"name": "已结束"}}, "Note": {"rich_text": _text(note)},
+                        "Synced At": {"date": {"start": now.isoformat()}}}}, idempotent=True)
+                    if key in state["synced"]:
+                        state["synced"][key]["fingerprint"] = None
+                        state["synced"][key]["scan_cutoff"] = current["scan_cutoff"]
+                    changed += 1
+                    self._save(self.state_path, self.state)
                 for key, prior in state["synced"].items():
                     obsolete = prior["kind"] in complete and key not in active
                     if active_monthly_schedule and prior["kind"] == "billing_month" and prior.get("schedule_id") not in (None, active_monthly_schedule):
@@ -658,8 +766,7 @@ class PeriodNotionWorkspace(NotionWorkspace):
                     changed += 1
                     self._save(self.state_path, self.state)
                 for key, row in list(state["pending"].items()):
-                    self._upsert_period(key, row, now)
-                    changed += 1
+                    changed += int(self._upsert_period(key, row, now))
                 for kind in complete:
                     state["complete_cutoffs"][cutoff_keys[kind]] = cutoff.isoformat()
                 if active_monthly_schedule:

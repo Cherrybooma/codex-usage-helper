@@ -70,6 +70,13 @@ class PeriodNotionTests(unittest.TestCase):
                 "reset_kind": "unknown", "coverage": {"observations_complete": False},
                 "boundary_basis": "duration_before_reset"}
 
+    def shifted_window(self, minutes=1, **changes):
+        result = self.window()
+        for field in ("start", "end", "statistics_until", "observed_at"):
+            result[field] = (datetime.fromisoformat(result[field]) + timedelta(minutes=minutes)).isoformat()
+        result.update(changes)
+        return result
+
     def sync(self, rows, windows=None, **kwargs):
         return self.ws.sync(rows, windows or [], force=True, **kwargs)
 
@@ -376,6 +383,190 @@ class PeriodNotionTests(unittest.TestCase):
         self.assertIn("原截止时间已被替换", note)
         self.assertIn("按实际 reset 与时长回推", note)
         self.assertNotIn("SECRET_WARNING", note)
+
+    def test_partial_quota_report_closes_superseded_current_without_changing_readings(self):
+        old = self.window()
+        self.sync([], [old])
+        old_page = self.api.period_pages()[0]
+        before = deepcopy(old_page["properties"])
+        self.now += timedelta(minutes=1)
+        current = self.shifted_window(used_percent=0, remaining_percent=100)
+        result = self.sync([], [current])
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["changed"], 2)
+        self.assertEqual(old_page["properties"]["State"]["select"]["name"], "已结束")
+        for field, value in before.items():
+            if field not in {"State", "Note", "Synced At"}:
+                self.assertEqual(old_page["properties"][field], value, field)
+        note = ns._plain(old_page["properties"]["Note"]["rich_text"])
+        self.assertIn(pn.WINDOW_NOTES["superseded_window"], note)
+        self.assertIn("切换时刻未保留", note)
+        self.assertIn("原 End 仍为旧读数的预计重置时间", note)
+        self.assertIn("不能据此确认福利重置", note)
+        self.assertEqual(sum(p["properties"]["State"]["select"]["name"] == "进行中" for p in self.api.period_pages()), 1)
+        self.assertEqual(self.sync([], [current])["changed"], 0)
+
+    def test_partial_quota_keeps_old_closed_history_and_included_false_unchanged(self):
+        old = self.window()
+        historical = self.shifted_window(-600, state="已结束")
+        self.sync([], [old, historical])
+        old_page = next(p for p in self.api.period_pages() if p["properties"]["State"]["select"]["name"] == "进行中")
+        old_page["properties"]["Included"] = {"checkbox": False}
+        historical_page = next(p for p in self.api.period_pages() if p is not old_page)
+        before_history = deepcopy(historical_page)
+        self.now += timedelta(minutes=1)
+        self.sync([], [self.shifted_window()])
+        self.assertEqual(old_page["properties"]["State"]["select"]["name"], "已结束")
+        self.assertFalse(old_page["properties"]["Included"]["checkbox"])
+        self.assertEqual(historical_page, before_history)
+        self.assertEqual(len(self.api.period_pages()), 3)
+
+    def test_superseded_quota_does_not_close_other_kind_or_dataset(self):
+        other_dataset = str(uuid.UUID(int=885))
+        old = self.window()
+        weekly = {**old, "kind": "weekly_quota"}
+        other = {**old, "dataset_id": other_dataset}
+        self.sync([], [old, weekly, other])
+        self.now += timedelta(minutes=1)
+        result = self.sync([], [self.shifted_window()])
+        self.assertIsNone(result["error"])
+        for page in self.api.period_pages():
+            props = page["properties"]
+            if props["Kind"]["select"]["name"] == "周额度" or ns._plain(props["Dataset"]["rich_text"]) == other_dataset:
+                self.assertEqual(props["State"]["select"]["name"], "进行中")
+
+    def test_delayed_quota_report_does_not_reopen_superseded_window(self):
+        old = self.window()
+        self.sync([], [old])
+        self.now += timedelta(minutes=1)
+        current = self.shifted_window()
+        self.sync([], [current])
+        before = deepcopy(self.api.period_pages())
+        self.now += timedelta(minutes=1)
+        self.assertEqual(self.sync([], [old])["changed"], 0)
+        newer_scan_old_observation = {**old, "scan_cutoff": self.now.isoformat()}
+        self.assertEqual(self.sync([], [newer_scan_old_observation])["changed"], 0)
+        self.assertEqual(self.api.period_pages(), before)
+
+    def test_old_complete_quota_report_cannot_retire_new_window_or_advance_guard(self):
+        old = self.window()
+        self.sync([], [old])
+        self.now += timedelta(minutes=1)
+        current = self.shifted_window()
+        self.sync([], [current])
+        before = deepcopy(self.api.period_pages())
+        self.now += timedelta(minutes=1)
+        for cutoff in (NOW, self.now):
+            with self.subTest(complete_until=cutoff):
+                result = self.sync([], [old], complete_kinds=["five_hour"], complete_until=cutoff)
+                self.assertIsNone(result["error"])
+                self.assertEqual(result["changed"], 0)
+                self.assertEqual(self.api.period_pages(), before)
+                self.assertNotIn(self.dataset + ":five_hour", self.ws.state["periods"]["complete_cutoffs"])
+
+    def test_supersession_reconciles_remote_current_after_local_cache_loss(self):
+        self.sync([], [self.window()])
+        with self.ws._locked():
+            self.ws.state["periods"]["synced"] = {}
+            self.ws.state["periods"]["window_currents"] = {}
+        self.now += timedelta(minutes=1)
+        result = self.sync([], [self.shifted_window()])
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["changed"], 2)
+        self.assertEqual([p["properties"]["State"]["select"]["name"] for p in self.api.period_pages()], ["已结束", "进行中"])
+
+    def test_newer_remote_current_rejects_old_report_after_cache_loss_including_complete_scope(self):
+        old = self.window()
+        self.sync([], [old])
+        self.now += timedelta(minutes=1)
+        self.sync([], [self.shifted_window()])
+        before = deepcopy(self.api.period_pages())
+        with self.ws._locked():
+            self.ws.state["periods"]["synced"] = {}
+            self.ws.state["periods"]["window_currents"] = {}
+        self.now += timedelta(minutes=1)
+        result = self.sync([], [old], complete_kinds=["five_hour"], complete_until=self.now)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["changed"], 0)
+        self.assertEqual(self.api.period_pages(), before)
+        self.assertEqual(result["pending_count"], 0)
+
+    def test_failed_new_current_create_keeps_old_closed_and_old_replay_retries_only_new_row(self):
+        old = self.window()
+        self.sync([], [old])
+        self.now += timedelta(minutes=1)
+        current = self.shifted_window()
+        self.api.schedule(lambda method, path, payload: method == "POST" and path == "/pages",
+                          (403, {}, {"code": "restricted_resource"}))
+        first = self.sync([], [current])
+        self.assertEqual(first["error"]["code"], "restricted_resource")
+        self.assertEqual(first["pending_count"], 1)
+        self.assertEqual(self.api.period_pages()[0]["properties"]["State"]["select"]["name"], "已结束")
+        self.now += timedelta(minutes=1)
+        retry = self.sync([], [old])
+        self.assertIsNone(retry["error"])
+        self.assertEqual(retry["changed"], 1)
+        self.assertEqual(retry["pending_count"], 0)
+        self.assertEqual([p["properties"]["State"]["select"]["name"] for p in self.api.period_pages()], ["已结束", "进行中"])
+
+    def test_failed_old_window_create_is_preserved_as_closed_history_in_outbox(self):
+        self.api.schedule(lambda method, path, payload: method == "POST" and path == "/pages",
+                          (403, {}, {"code": "restricted_resource"}))
+        first = self.sync([], [self.window()])
+        self.assertEqual(first["pending_count"], 1)
+        self.now += timedelta(minutes=1)
+        result = self.sync([], [self.shifted_window()])
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["pending_count"], 0)
+        self.assertEqual(result["changed"], 2)
+        old, current = self.api.period_pages()
+        self.assertEqual(old["properties"]["State"]["select"]["name"], "已结束")
+        self.assertEqual(old["properties"]["Used Percent"]["number"], 30)
+        self.assertEqual(ns._plain(old["properties"]["Observed At ISO"]["rich_text"]), self.window()["observed_at"])
+        self.assertEqual(ns._plain(old["properties"]["Statistics Until ISO"]["rich_text"]), self.window()["statistics_until"])
+        self.assertTrue(old["properties"]["Included"]["checkbox"])
+        self.assertIn(pn.WINDOW_NOTES["superseded_window"], ns._plain(old["properties"]["Note"]["rich_text"]))
+        self.assertEqual(current["properties"]["State"]["select"]["name"], "进行中")
+
+    def test_supersession_patch_failure_can_retry_without_fabricating_readings(self):
+        self.sync([], [self.window()])
+        old_page = self.api.period_pages()[0]
+        self.now += timedelta(minutes=1)
+        current = self.shifted_window()
+        self.api.schedule(lambda method, path, payload: method == "PATCH" and path.endswith(old_page["id"]),
+                          (403, {}, {"code": "restricted_resource"}))
+        first = self.sync([], [current])
+        self.assertEqual(first["error"]["code"], "restricted_resource")
+        self.assertEqual(old_page["properties"]["State"]["select"]["name"], "进行中")
+        result = self.sync([], [current])
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["changed"], 2)
+        self.assertEqual(old_page["properties"]["State"]["select"]["name"], "已结束")
+        self.assertEqual(old_page["properties"]["Remaining Percent"]["number"], 70)
+
+    def test_no_current_window_or_ambiguous_current_inputs_do_not_guess_supersession(self):
+        self.sync([], [self.window()])
+        old_page = self.api.period_pages()[0]
+        self.now += timedelta(minutes=2)
+        self.sync([], [self.shifted_window(1, state="已结束")])
+        self.assertEqual(old_page["properties"]["State"]["select"]["name"], "进行中")
+        result = self.sync([], [self.shifted_window(1), self.shifted_window(2)])
+        self.assertIsNone(result["error"])
+        self.assertEqual(old_page["properties"]["State"]["select"]["name"], "进行中")
+
+    def test_older_closed_quota_input_cannot_rollback_newer_remote_reading_after_cache_loss(self):
+        closed = {**self.window(), "state": "已结束"}
+        self.sync([], [closed])
+        self.now += timedelta(minutes=1)
+        newer = {**closed, "observed_at": (NOW + timedelta(seconds=30)).isoformat(),
+                 "statistics_until": self.now.isoformat(), "used_percent": 40, "remaining_percent": 60}
+        self.sync([], [newer])
+        before = deepcopy(self.api.period_pages())
+        with self.ws._locked():
+            self.ws.state["periods"]["synced"] = {}
+            self.ws.state["periods"]["window_currents"] = {}
+        self.assertEqual(self.sync([], [closed])["changed"], 0)
+        self.assertEqual(self.api.period_pages(), before)
 
     def test_invalid_percentage_or_boolean_count_never_reaches_network(self):
         for change in ({"used_percent": float("nan")}, {"observations": True}, {"used_percent": 50, "remaining_percent": 70}):
