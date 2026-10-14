@@ -1,17 +1,20 @@
-# Codex 项目与 Notion 每日用量
+# Notion 项目工作台与 Codex 投入账本
 
-第一版只支持 Codex。Notion 管项目名称、头像、状态与成果；本机完成计量，并把项目每日摘要写入 Notion。未连接 Notion、未绑定项目或同步失败都不改变本地 Token 总数与占比分母。
+第一版只支持 Codex。Notion 是项目管理入口，管理项目目标、本周目标、下一步、状态、头像与成果，并用关联任务库组织行动项。本机完成 Token 计量，把绑定项目的每日摘要写入关联账本。用量是项目投入的一部分，不能代替进度或成果。未连接 Notion、未绑定项目或同步失败都不改变本地 Token 总数与占比分母。
 
-当前实现提供数据库建立、项目读取、显式创建/绑定、每日摘要替换同步和本地失败队列。自动化检查使用隔离的状态化 API 模拟服务，没有访问真实账号。真实联调还需要在本机设置中保存连接凭据；对话内 Notion 插件授权不能转交给桌面后台。模拟测试通过不代表已完成真实持续同步验收。
+当前实现提供工作台数据库建立、项目与任务计数读取、带图标的显式创建/绑定、每日摘要替换同步和本地失败队列。自动化检查使用隔离的状态化 API 模拟服务，不访问真实账号；真实联调需要在本机连接用户自己的工作区。对话内 Notion 插件授权不能转交给桌面后台，模拟测试通过不代表其他机器的持续同步已经验证。
+
+Codex 通过 [notion-project-workbench 技能](../skills/notion-project-workbench/SKILL.md)在用户安排的任务中维护项目与行动项，并把实际推进追加为开发事件。桌面后台只刷新管理缓存和同步用量。尚未配置定时 Notion Custom Agent，不宣称已经持续自动分析项目进度。首页组织和 AI 维护约定见 [项目管理说明](project-management.md)。
 
 应用默认本机模式，Notion 为可选项。在“项目与 Notion 设置…”中关闭“启用 Notion 同步”时，连接表单隐藏，后台和手动同步均在读取凭据与联网之前停止；已有绑定、项目缓存及每日摘要保留，本地计量继续。关闭不会撤销此前已完成的云端写入，正在执行的操作完成前开关不可更改。
 
 ## 首次连接
 
-1. 在 Notion 建立一个用于用量小助手的父页面。
+1. 在 Notion 建立一个用于项目管理的父页面。
 2. 建立内部连接，授予读取、插入与更新内容能力。将这个父页面共享给该连接。
 3. 在应用的 Notion 设置中开启“启用 Notion 同步”，保存连接凭据，或明确选择自己的 Pages 密钥文件；再填写父页面链接或页面 ID。支持 ⌘V 粘贴，加载状态不禁用输入框。
-4. 建立两个新库后，从本地任务中选择“绑定已有项目”，或明确选择创建一个项目。不自动将所有本地文件夹上传或批量建立项目。
+4. 点击“初始化项目工作台”，建立或复用 Projects、Tasks 和 Usage Daily。已有 Tasks 数据源配置会复用原库；旧连接未配置 Tasks 时仍可读取项目和同步用量。
+5. 为项目在 Notion 页面顶部设置 icon；从本地任务中选择“绑定已有项目”，或在应用里选择 emoji / HTTPS Logo 后创建并绑定。不自动将所有本地文件夹上传或批量建立项目。
 
 默认凭据由应用保存到 macOS Keychain 的专用项目：服务 `local.codex.usage-widget.notion`，账号 `integration`。也可以在设置中明确选择一个包含 Notion Token 的 `.pages` 文件作为来源；后台仅从该文件在内存中提取唯一 Token，不搜索其他文件、不生成明文副本、不上传 Pages 文件。文件中已有的 Token 仍需要用户自行保护；应用只将提取的 Token 用于 Notion 官方认证。来源文件移动或解析失败时暂停连接，不静默改用旧凭据。
 
@@ -21,9 +24,63 @@
 
 第一次同步从连接时的北京时间自然周周一开始。例如 2026-10-13 连接，起点为 2026-10-12。这个起点持久保存，不会在下周自动把前周失败的队列抛弃。数据库位置一经建立保持固定，避免重新填父页面后误创建另一套库。
 
-## 两个数据库
+## 项目、任务与关联账本
 
-项目库的字段为 `Name`、`Status`、`Weekly Goal`、`Next Step`、`Outcome` 和内部 `Binding Key`。Status 默认计划中、开发中、已发布、暂停、归档。支持 Notion 的 status 属性，以及已有项目库使用同样选项的 select 属性；建立或重新连接时验证属性结构。名称、管理状态和页面图标从 Notion 读取，目标与成果由用户在 Notion 维护。状态不是 agent 的实时运行状态，也不会重写过去消耗。
+项目库的字段如下。旧项目库没有新增的管理属性时仍兼容，应用不会静默补写目标、日期或管理结论。
+
+| 属性 | 用途 |
+| --- | --- |
+| Name / 页面 icon | 项目名称与胶囊中的同一头像身份 |
+| Status | 计划中、开发中、已发布、暂停、归档 |
+| Goal / Weekly Goal / Next Step | 项目目标、本周目标、具体下一步 |
+| Priority / Health | 高／中／低，以及正常／有风险／受阻 |
+| Development Progress | 明确维护的 0–100 开发进度，未知时留空 |
+| Target Date / Last Reviewed | 交付日期、最近复盘日期；未知时留空 |
+| Summary / Outcome | 最近项目摘要与成果链接 |
+| Binding Key | 内部创建去重依据，不用于首页展示 |
+
+Status 支持 Notion 的 status 属性，以及已有项目库使用同样选项的 select 属性；建立或重新连接时验证结构。名称、管理信息和页面图标从 Notion 读取。状态不是 agent 的实时运行状态，也不会重写过去消耗。
+
+### 项目图标
+
+新建项目时，应用要求一个 emoji 或有效 HTTPS Logo，随同创建请求直接写入页面 icon。绑定已有项目前，应用重新检查远端页面；没有可显示图标时拒绝绑定，并提示先在 Notion 设置。读取已有页面时还支持 Notion 文件图标和自定义 emoji 的 HTTPS 图像地址。
+
+Notion 页面 UI 本身不能强制每个项目必须有 icon，这项规则由本应用的创建／绑定流程验证。人或其他客户端之后删除图标时，应用会在详情提示补充，胶囊显示文件夹符号；已有绑定和历史统计保留。不会用名称首字、随意图标或用量占比冒充项目头像。
+
+### Tasks 数据源
+
+工作台的任务库通过 `Project` 关系关联项目。当前后台只读任务数，不创建或修改任务。新建任务库有以下字段：
+
+| 属性 | 用途 |
+| --- | --- |
+| Name / Project | 行动项名称与所属项目 |
+| Status | 待处理、进行中、待确认、阻塞、已完成、取消 |
+| Priority / Due | 高／中／低和计划日期 |
+| Managed By | AI 或人类确认 |
+| Acceptance / Evidence | 验收标准与可核查结果链接 |
+
+任务源配置为本地 `notion-config.json` 中可选的 `tasks_data_source_id`。建立的新工作台会配置此项；已有连接未配置时不显示任务计数，不影响项目读取和用量同步。任务读取要求 `Project` 为指向当前 Projects 数据源的 relation，`Status` 为上述选项的 select；旧任务库可不含新增管理字段。
+
+待办数包含待处理、进行中、待确认与阻塞；受阻数是待办中的子集，不能再加一次形成总任务数。已完成只统计已完成，取消和已归档任务不计。任务读取失败、未知状态、截断关系或缓存过期时保留未知状态，不把缺失数据显示为零，不从 Token 推断任务完成。
+
+胶囊内环优先使用合法的 Development Progress，未设置时可使用 `已完成 / (已完成 + 待办) × 100`，并标为“行动完成率”。只有任务计数完整、可用且分母非零时才计算；它不表示整个项目的完成度。外环仍是本周 Token 占比，与开发进度分别解释。
+
+### Events 开发历史
+
+AI 项目管理工作流还使用 Events，将开发过程与 Tasks 当前状态分开。应用“初始化项目工作台”建立或复用 Projects、Tasks、Usage Daily；Events 由技能在明确的项目管理任务中读取和维护，当前桌面后台不拉取完整事件列表。
+
+| 属性 | 用途 |
+| --- | --- |
+| Name / Project / Tasks | 实际推进标题、项目关系与相关任务关系 |
+| Occurred At / Created At | 发生时间与 Notion 实际录入时间 |
+| Result / Evidence | 实际动作、结果、未核实部分与证据链接 |
+| Event Key | 同一次推进的稳定去重标识 |
+
+每次实际推进必须追加 Events；顺序重试先查询并复用已有记录。已完成 Tasks 保留，当前行动视图可隐藏已完成项，但不能删除它们或覆盖历史事件。需要更正时追加更正事件。原完成时间未知的旧证据记录为“本次回填”，使用实际回填时刻并明确“原完成时间未核实”，不编造过去日期。
+
+Events 按同项目单写者顺序维护，创建后按 Event Key 复查。该键是没有唯一约束的富文本，先查后建不保证并发唯一。已有多条同键记录或并发／创建结果不确定时暂停重复创建，标为待核实并保留全部历史，不自行删除或合并。
+
+首页固定为愿景、待人工确认、当前进展与下一步、历史开发事件、每项目 Token 投入，愿景在首位。人工区主视图只筛选待确认；普通阻塞在当前行动或风险，需人的阻塞形成具体确认项。单项目页面直接展示阶段、完成事实和 AI 下一行动，不重复同名项目卡。历史默认显示日期排序的 Events 列表，另有可展开原生时间线；胶囊目前读取项目 Summary 和任务计数，完整事件在 Notion 中查看。
 
 每日用量库字段如下：
 
@@ -80,9 +137,11 @@ from widget.notion_sync import NotionWorkspace
 workspace = NotionWorkspace(data_dir)
 workspace.status()                       # 只读本地，不读凭据或联网
 workspace.project_for_task(task_id)       # 只读项目缓存
-workspace.setup(parent_page_url_or_id)    # 显式建立两库
+workspace.setup(parent_page_url_or_id)    # 显式建立或复用三库工作台
 workspace.projects(force=True)            # 后台刷新远程项目
-workspace.create_project(task_id, name)   # 显式创建并绑定
+workspace.cached_projects()              # 只读本地管理缓存
+workspace.create_project(task_id, name, {"type": "emoji", "emoji": "📦"})
+                                         # 显式创建带图标的项目并绑定
 workspace.bind(task_id, page_id)
 workspace.unbind(task_id)
 workspace.sync(daily_rows, now=utc_end, force=False)
@@ -124,9 +183,9 @@ workspace.sync(all_saved_rows, now=utc_end, complete_dataset_ids=[dataset_id], c
 python3 widget/notion_sync.py --data-dir /your/local/data
 ```
 
-stdin 命令为 `status`、`projects`、`setup`、`bind`、`unbind`、`create_project` 或 `sync`，例如 `{"command":"setup","parent_page":"父页面 ID 或链接"}`。返回 JSON 包含 `ok`、`result`、`status`，失败只返回固定的安全错误文本，不输出服务器原始报错、请求体或堆栈。
+stdin 命令为 `status`、`projects`、`setup`、`bind`、`unbind`、`create_project` 或 `sync`，例如 `{"command":"setup","parent_page":"父页面 ID 或链接"}`。`create_project` 必须提供 `icon`，例如 `{"type":"emoji","emoji":"📦"}`。返回 JSON 包含 `ok`、`result`、`status`，失败只返回固定的安全错误文本，不输出服务器原始报错、请求体或堆栈。
 
-`status.connected` 是最近一次实际连接操作确认的状态，不能当成实时网络连通性。`state` 为 disconnected、ready 或 error；包含 `message`、`projects_url`、`usage_url`、`last_synced_at`、缓存项目与队列数量。没有连接时本地统计仍可正常使用。
+`status.connected` 是最近一次实际连接操作确认的状态，不能当成实时网络连通性。`state` 为 disconnected、ready 或 error；包含 `message`、`projects_url`、`usage_url`、`last_synced_at`、缓存项目与队列数量；任务读取问题独立记录为 `tasks_error`。没有连接时本地统计仍可正常使用。
 
 测试命令：
 

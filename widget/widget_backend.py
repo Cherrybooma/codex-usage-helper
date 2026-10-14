@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from codex_usage import scan_usage
-from project_store import ProjectRegistry, aggregate, split_small, remember_daily
+from project_store import ProjectRegistry, aggregate, split_small, remember_daily, management_projects
 
 DATA = Path(__file__).resolve().parent / "data"
 UTC = timezone.utc
@@ -404,6 +404,9 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
         raise ValueError("已绑定账本的项目根目录不能直接改变；请先解除绑定或使用独立 data-dir。")
     grouping[registry.dataset_id] = normalized_root
     all_tasks, daily_rows, local_projects = aggregate(report, task_root, registry, metadata)
+    today = end.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    today_known = isinstance(report.get("project_daily"), list)
+    today_tokens = sum(row.get("total_tokens", 0) for row in report.get("project_daily", []) if row["day"] == today) if today_known else None
     # Initial ids are assigned during aggregation; apply existing bindings on
     # the following pass without changing any count or its denominator.
     if workspace is not None:
@@ -418,6 +421,15 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
         if metadata:
             all_tasks, daily_rows, local_projects = aggregate(report, task_root, registry, metadata)
     major, small = split_small(all_tasks, report["totals"]["total_tokens"])
+    managed = None
+    if workspace is not None and notion_status.get("connected"):
+        try:
+            cached_projects = workspace.cached_projects()
+            if cached_projects:
+                managed = management_projects(cached_projects, all_tasks, notion_status.get("bindings", {}), today_known=today_known)
+        except (OSError, ValueError, RuntimeError, NotionError):
+            # Presentation failure cannot alter the token ledger or its denominator.
+            managed = None
     saved_daily = remember_daily(data / "daily-ledger.sqlite3", daily_rows, registry.dataset_id)
     atomic_json(data / "notion-daily.json", {"dataset_id": registry.dataset_id,
         "statistics_until": report["range"]["until_exclusive"], "rows": saved_daily})
@@ -446,7 +458,9 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
             "period_mode": "calendar_week", "timezone": "Asia/Shanghai", "total_tokens": report["totals"]["total_tokens"],
             "request_records": report["totals"]["request_records"],
             "legacy_updates": report["totals"]["legacy_updates"],
+            "today_tokens": today_tokens,
             "tasks": major, "other_tasks": small,
+            "management_projects": managed,
             "dataset_id": registry.dataset_id, "available_projects": local_projects,
             "notion": notion_status,
             "coverage": {name: report["coverage"][name] for name in

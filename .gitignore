@@ -18,6 +18,7 @@ token*.pages
 # Local review previews contain real snapshot data; publish only the demo
 widget/preview/*
 !widget/preview/demo.html
+!widget/preview/comparison.html
 
 # Local design notes
 widget/brand-spec.md

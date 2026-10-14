@@ -18,6 +18,22 @@ struct TaskRow: Decodable, Identifiable {
     let icon_value: String?
     let notion_url: String?
     let notion_stale: Bool?
+    let notion_icon_missing: Bool?
+    let project_goal: String?
+    let weekly_goal: String?
+    let next_step: String?
+    let project_priority: String?
+    let project_health: String?
+    let target_date: String?
+    let last_reviewed: String?
+    let project_summary: String?
+    let open_tasks: Int?
+    let blocked_tasks: Int?
+    let completed_tasks: Int?
+    let usage_linked: Bool?
+    let development_progress: Double?
+    let progress_source: String?
+    let today_tokens: Int?
 }
 
 struct LocalProject: Decodable, Identifiable {
@@ -86,10 +102,12 @@ extension WeeklyBudget {
 struct Snapshot: Decodable {
     let generated_at: String
     let total_tokens: Int
+    let today_tokens: Int?
     let request_records: Int
     let legacy_updates: Int
     let tasks: [TaskRow]
     let other_tasks: [TaskRow]
+    let management_projects: [TaskRow]?
     let quota: Quota?
     let quota_error: String?
     let weekly_budget: WeeklyBudget?
@@ -118,8 +136,12 @@ func compactTokens(_ value: Int) -> String {
 }
 
 func pointInCapsule(_ point: CGPoint, rect: CGRect) -> Bool {
+    pointInRoundedRectangle(point, rect: rect, radius: min(rect.width, rect.height) / 2)
+}
+
+func pointInRoundedRectangle(_ point: CGPoint, rect: CGRect, radius requestedRadius: CGFloat) -> Bool {
     guard rect.contains(point) else { return false }
-    let radius = min(rect.width, rect.height) / 2
+    let radius = max(0, min(requestedRadius, min(rect.width, rect.height) / 2))
     let nearest = CGPoint(x: min(rect.maxX - radius, max(rect.minX + radius, point.x)),
                           y: min(rect.maxY - radius, max(rect.minY + radius, point.y)))
     let dx = point.x - nearest.x, dy = point.y - nearest.y
@@ -157,6 +179,7 @@ final class UsageModel: ObservableObject {
     @Published var notionSyncing = false
     @Published var notionSyncMessage: String?
     @Published private(set) var notionEnabled = false
+    @Published private(set) var widgetStyle: WidgetStyle = .glass
     @Published var enabledWidgets: Set<WidgetKind> = [.horizontal]
     var onVisibility: (() -> Void)?
     var onUpdated: (() -> Void)?
@@ -171,7 +194,9 @@ final class UsageModel: ObservableObject {
     init(root: URL) {
         self.root = root
         python = root.appendingPathComponent(".venv/bin/python3")
-        notionEnabled = WidgetPreferences.notionEnabled(in: (try? WidgetPreferences.read(root: root)) ?? [:])
+        let settings = (try? WidgetPreferences.read(root: root)) ?? [:]
+        notionEnabled = WidgetPreferences.notionEnabled(in: settings)
+        widgetStyle = WidgetStyle(rawValue: settings["widget_style"] as? String ?? "") ?? .glass
     }
 
     func start() {
@@ -249,6 +274,14 @@ final class UsageModel: ObservableObject {
             notionSyncMessage = enabled ? "已开启；连接完成后每 5 分钟同步摘要。" : "本机模式；Notion 同步已关闭。"
             onUpdated?()
         } catch { notionSyncMessage = "运行方式未保存，保留原设置。" }
+    }
+
+    func setWidgetStyle(_ style: WidgetStyle) {
+        do {
+            try WidgetPreferences.update(root: root, values: ["widget_style": style.rawValue])
+            widgetStyle = style
+            onUpdated?()
+        } catch { self.error = "外观未保存，保留当前设置。" }
     }
 
     func toggleWidget(_ kind: WidgetKind) {
@@ -525,6 +558,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var pointerTimer: Timer?
     var pointerZones: [WidgetKind: String] = [:]
     var positions: [String: [String: Double]] = [:]
+    var headerOffsets: [WidgetKind: CGFloat] = [:]
+    var resizingStrips = false
     let root: URL
     let diagnosticsQueue = DispatchQueue(label: "local.codex.widget-diagnostics", qos: .utility)
 
@@ -574,6 +609,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.representedObject = kind.rawValue
         }
         menu.addItem(.separator())
+        let themeItem = NSMenuItem(title: "外观", action: nil, keyEquivalent: "")
+        themeItem.submenu = NSMenu(title: "外观")
+        for style in WidgetStyle.allCases {
+            let item = themeItem.submenu!.addItem(withTitle: style.title, action: #selector(selectStyle(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = "theme:" + style.rawValue
+        }
+        menu.addItem(themeItem)
         menu.addItem(withTitle: "项目与 Notion 设置…", action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(withTitle: "同步 Notion 摘要", action: #selector(syncNotion), keyEquivalent: "")
         menu.addItem(withTitle: "刷新", action: #selector(refresh), keyEquivalent: "")
@@ -644,27 +687,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func resizeStrip(_ kind: WidgetKind, initial: Bool = false) {
         guard let window = strips[kind], let state = interactions[kind] else { return }
+        resizingStrips = true
+        defer { resizingStrips = false }
         let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric)
         let vertical = kind == .vertical
-        let natural = UsageStrip.naturalSize(itemCount: items.count, vertical: vertical)
-        let width = natural.width
+        let natural = UsageStrip.canvasSize(itemCount: items.count, vertical: vertical)
         // Reserve a fixed overlay budget so hover never moves its anchor.
-        let naturalHeight = natural.height + UsageStrip.maxDetailHeight
-        let bounds = (window.screen ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let height = min(naturalHeight, bounds.height - 64)
+        let savedScreen = positions[kind.rawValue]?["screen"]
+        let screen = initial ? (NSScreen.screens.first { Double(($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0) == savedScreen } ?? NSScreen.main) : (window.screen ?? NSScreen.main)
+        let bounds = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let width = min(natural.width, bounds.width - 16)
+        let height = min(natural.height, max(200, bounds.height - 64))
         var x = window.frame.minX
-        var top = window.frame.maxY
+        var anchorTop = window.frame.maxY - (headerOffsets[kind] ?? 0)
         if initial {
             x = vertical ? bounds.maxX - width - 24 : bounds.midX - width / 2
-            top = bounds.maxY - (vertical ? 96 : 32)
-        } else if window.frame.width != width && !vertical { x = window.frame.midX - width / 2 }
-        top = min(bounds.maxY, max(top, bounds.minY + height))
-        x = max(bounds.minX, min(x, bounds.maxX - width))
-        let view = UsageStrip(model: model, interaction: state, vertical: vertical, height: height)
+            anchorTop = bounds.maxY - (vertical ? 96 : 32)
+            if let saved = positions[kind.rawValue] {
+                x = bounds.minX + min(1, max(0, saved["x"] ?? 0.5)) * max(0, bounds.width - width)
+                if let normalized = saved["anchor_top"] {
+                    anchorTop = bounds.maxY - min(1, max(0, normalized)) * max(0, bounds.height - UsageStrip.naturalSize(itemCount: items.count, vertical: vertical).height)
+                } else if let normalized = saved["top"] {
+                    anchorTop = bounds.maxY - min(1, max(0, normalized)) * max(0, bounds.height - height)
+                }
+            }
+        } else if window.frame.width != width { x = vertical ? window.frame.maxX - width : window.frame.midX - width / 2 }
+        let headerHeight = min(height, UsageStrip.naturalSize(itemCount: items.count, vertical: vertical).height)
+        let placement = UsageStrip.placement(anchor: CGPoint(x: x, y: anchorTop), size: CGSize(width: width, height: height), headerHeight: headerHeight, bounds: bounds)
+        let offset = placement.headerOffset
+        headerOffsets[kind] = offset
+        window.appearance = model.widgetStyle.appearance
+        let view = UsageStrip(model: model, interaction: state, vertical: vertical, height: height, canvasWidth: width, headerOffset: offset)
         if let host = window.contentView as? NSHostingView<UsageStrip> { host.rootView = view }
         else { window.contentView = NSHostingView(rootView: view) }
-        window.setFrame(NSRect(x: x, y: top - height, width: width, height: height), display: true)
-        if initial { restorePosition(window, kind: kind) }
+        window.setFrame(placement.frame, display: true)
         updatePointerPassthrough()
         recordWindowState()
     }
@@ -676,32 +732,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric)
             let x = mouse.x - window.frame.minX
             let y = window.frame.maxY - mouse.y
+            let point = CGPoint(x: x, y: y)
+            let canvas = window.frame.size
+            let vertical = kind == .vertical
+            let offset = headerOffsets[kind] ?? 0
+            let header = UsageStrip.headerFrame(itemCount: items.count, vertical: vertical, canvas: canvas, headerOffset: offset).insetBy(dx: UsageStrip.inset, dy: UsageStrip.inset)
             var hovered: String?
-            if kind == .horizontal {
-                if pointInCapsule(CGPoint(x: x, y: y), rect: CGRect(x: UsageStrip.inset, y: UsageStrip.inset,
-                        width: window.frame.width - 2 * UsageStrip.inset, height: UsageStrip.headerHeight)) {
-                    let index = Int((x - UsageStrip.inset) / UsageStrip.moduleWidth)
+            if pointInCapsule(point, rect: header) {
+                if !vertical {
+                    let index = Int((x - header.minX) / UsageStrip.moduleWidth)
                     if items.indices.contains(index) { hovered = items[index].id }
-                } else if let selected = state.expanded, let index = items.firstIndex(where: { $0.id == selected }) {
-                    let left = UsageStrip.inset + CGFloat(index) * UsageStrip.moduleWidth + UsageStrip.rowInset
-                    if pointInCapsule(CGPoint(x: x, y: y), rect: CGRect(x: left, y: UsageStrip.inset,
-                        width: UsageStrip.diameter, height: UsageStrip.headerHeight + UsageStrip.detailHeight(for: items[index]))) { hovered = selected }
-                }
-            } else {
-                let total = UsageStrip.naturalSize(itemCount: items.count, vertical: true).height
-                    + (items.first(where: { $0.id == state.expanded }).map { UsageStrip.detailHeight(for: $0) } ?? 0)
-                if pointInCapsule(CGPoint(x: x, y: y), rect: CGRect(x: UsageStrip.inset, y: UsageStrip.inset,
-                        width: UsageStrip.diameter, height: min(total, window.frame.height) - 2 * UsageStrip.inset)) {
-                    // SwiftUI knows the scrolled item geometry. Sampling only
-                    // determines pass-through for this vertical viewport.
-                    hovered = "__vertical_surface__"
-                }
+                } else { hovered = "__vertical_surface__" }
+            }
+            if hovered == nil, let selected = state.expanded, let index = items.firstIndex(where: { $0.id == selected }) {
+                let card = UsageStrip.detailFrame(for: items[index], index: index, itemCount: items.count, vertical: vertical, canvas: canvas, headerOffset: offset)
+                let bridge = UsageStrip.connectorFrame(index: index, itemCount: items.count, vertical: vertical, canvas: canvas, detail: card, headerOffset: offset)
+                if pointInRoundedRectangle(point, rect: card, radius: UsageStrip.detailRadius) || bridge.contains(point) { hovered = selected }
             }
             window.ignoresMouseEvents = hovered == nil
             if pointerZones[kind] != hovered {
                 if hovered == nil { state.leaveAllHoverZones() }
                 else if let previous = pointerZones[kind] { state.hover(previous, inside: false, zone: "native-pointer") }
-                if let hovered, kind == .horizontal { state.hover(hovered, inside: true, zone: "native-pointer") }
+                if let hovered, hovered != "__vertical_surface__" { state.hover(hovered, inside: true, zone: "native-pointer") }
                 pointerZones[kind] = hovered
             }
         }
@@ -717,15 +769,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func windowMoved(_ notification: Notification) {
+        guard !resizingStrips else { return }
         guard let window = notification.object as? NSWindow, let screen = window.screen else { return }
         let kind: WidgetKind?
         if window === panel { kind = .box }
         else { kind = strips.first(where: { $0.value === window })?.key }
         guard let kind else { return }
         let bounds = screen.visibleFrame
-        positions[kind.rawValue] = ["screen": Double((screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0),
+        var saved = ["screen": Double((screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0),
             "x": (window.frame.minX - bounds.minX) / max(1, bounds.width - window.frame.width),
             "top": (bounds.maxY - window.frame.maxY) / max(1, bounds.height - window.frame.height)]
+        if kind != .box {
+            let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: interactions[kind]?.quotaMetric ?? .weeklyUsed)
+            let anchorTop = window.frame.maxY - (headerOffsets[kind] ?? 0)
+            saved["anchor_top"] = (bounds.maxY - anchorTop) / max(1, bounds.height - UsageStrip.naturalSize(itemCount: items.count, vertical: kind == .vertical).height)
+        }
+        positions[kind.rawValue] = saved
         if let data = try? JSONEncoder().encode(positions) {
             try? data.write(to: root.appendingPathComponent("widget/data/positions.json"), options: .atomic)
         }
@@ -756,7 +815,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "x": window.frame.minX, "y": window.frame.minY, "width": window.frame.width, "height": window.frame.height,
                 "expanded": interactions[kind]?.expanded ?? "", "locked": interactions[kind]?.locked ?? false])
         }
-        let value: [String: Any] = ["recorded_at": ISO8601DateFormatter().string(from: Date()),
+        let value: [String: Any] = ["recorded_at": ISO8601DateFormatter().string(from: Date()), "widget_style": model.widgetStyle.rawValue,
             "desktop_level": desktopLevel().rawValue, "pinned": model.pinned,
             "enabled": model.enabledWidgets.map(\.rawValue).sorted(), "windows": windows]
         let destination = root.appendingPathComponent("widget/data/window-state.json")
@@ -786,6 +845,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func updateStatus() {
+        for parent in statusItem.menu?.items ?? [] {
+            for item in parent.submenu?.items ?? [] {
+                if let raw = item.representedObject as? String, raw.hasPrefix("theme:") {
+                    item.state = raw == "theme:" + model.widgetStyle.rawValue ? .on : .off
+                }
+            }
+        }
         if let syncItem = statusItem.menu?.items.first(where: { $0.action == #selector(syncNotion) }) {
             syncItem.isEnabled = model.notionEnabled && !model.notionSyncing
         }
@@ -801,6 +867,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleDisplay(_ item: NSMenuItem) {
         guard let raw = item.representedObject as? String, let kind = WidgetKind(rawValue: raw) else { return }
         model.toggleWidget(kind)
+    }
+    @objc func selectStyle(_ item: NSMenuItem) {
+        guard let raw = item.representedObject as? String, let style = WidgetStyle(rawValue: String(raw.dropFirst(6))) else { return }
+        model.setWidgetStyle(style)
     }
     @objc func refresh() { model.refresh() }
     @objc func openSettings() { model.openSettings() }

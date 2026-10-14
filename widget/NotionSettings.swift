@@ -117,6 +117,7 @@ func runWidgetProcess(python: URL, root: URL, arguments: [String], input: Data? 
 struct NotionChoice: Identifiable {
     let id: String
     let name: String
+    let iconMissing: Bool
 }
 
 @MainActor
@@ -133,6 +134,10 @@ final class ProjectSettingsModel: ObservableObject {
     @Published var statusText = "尚未连接 Notion"
     @Published var projectsURL: String?
     @Published var usageURL: String?
+    @Published var tasksURL: String?
+    @Published var createIconMode = "emoji"
+    @Published var createEmoji = ""
+    @Published var createLogoURL = ""
     weak var usage: UsageModel?
     let root: URL
     let python: URL
@@ -148,6 +153,24 @@ final class ProjectSettingsModel: ObservableObject {
            let parent = config["parent_page_id"] as? String { parentPage = "https://www.notion.so/" + parent.replacingOccurrences(of: "-", with: "") }
     }
     var tasks: [LocalProject] { usage?.snapshot?.available_projects ?? [] }
+    var newProjectIcon: [String: Any]? {
+        if createIconMode == "emoji" {
+            let value = createEmoji.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard value.count == 1, value.utf16.count <= 32,
+                  value.unicodeScalars.contains(where: {
+                    $0.properties.isEmojiPresentation || ($0.properties.isEmoji && $0.value > 0x7F) || $0.value == 0x20E3
+                  }) else { return nil }
+            return ["type": "emoji", "emoji": value]
+        }
+        let value = createLogoURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.count <= 4096,
+              value.rangeOfCharacter(from: .whitespacesAndNewlines.union(.controlCharacters)) == nil,
+              let components = URLComponents(string: value), components.scheme == "https",
+              components.host?.isEmpty == false, components.user == nil, components.password == nil,
+              components.port.map({ 1...65535 ~= $0 }) ?? true else { return nil }
+        return ["type": "external", "external": ["url": value]]
+    }
+    var selectedPageNeedsIcon: Bool { choices.first(where: { $0.id == selectedPage })?.iconMissing == true }
 
     func saveRoot() {
         let path = (taskRoot as NSString).expandingTildeInPath
@@ -185,11 +208,13 @@ final class ProjectSettingsModel: ObservableObject {
         statusText = status["message"] as? String ?? "尚未连接 Notion"
         projectsURL = status["projects_url"] as? String
         usageURL = status["usage_url"] as? String
+        tasksURL = status["tasks_url"] as? String
         choices = (status["projects"] as? [[String: Any]] ?? [])
             .filter { $0["available"] as? Bool != false }
             .compactMap { item in
                 guard let id = item["page_id"] as? String, let name = item["display_name"] as? String else { return nil }
-                return NotionChoice(id: id, name: name)
+                let missing = item["icon_missing"] as? Bool ?? ((item["icon_value"] as? String)?.isEmpty != false)
+                return NotionChoice(id: id, name: name, iconMissing: missing)
             }.sorted { $0.name < $1.name }
         if selectedTask.isEmpty { selectedTask = tasks.first?.task_id ?? "" }
         if selectedPage.isEmpty { selectedPage = choices.first?.id ?? "" }
@@ -251,10 +276,15 @@ final class ProjectSettingsModel: ObservableObject {
     }
     func create() {
         guard let task = tasks.first(where: { $0.task_id == selectedTask }) else { return }
-        perform(["command": "create_project", "task_id": task.task_id, "name": task.name])
+        guard let icon = newProjectIcon else { message = "请先选择一个 emoji 头像或填写有效 HTTPS Logo 地址。"; return }
+        perform(["command": "create_project", "task_id": task.task_id, "name": task.name, "icon": icon])
     }
     func bind() {
         guard !selectedTask.isEmpty, !selectedPage.isEmpty else { return }
+        guard !selectedPageNeedsIcon else {
+            message = "这个项目还没有头像。请先在 Notion 设置头像，再刷新并绑定；此处不会替你修改云端项目。"
+            return
+        }
         perform(["command": "bind", "task_id": selectedTask, "page_id": selectedPage])
     }
 }
@@ -298,9 +328,10 @@ struct ProjectSettingsView: View {
                     }
                     TextField("已分享给 Integration 的父页面链接", text: $model.parentPage)
                     HStack {
-                        Button("连接并创建两个数据库") { model.connect() }
+                        Button("初始化项目工作台") { model.connect() }
                         Button("刷新项目状态") { model.perform(["command": "projects", "force": true]) }
                         if let url = model.projectsURL { Button("打开项目库") { usage.openProject(url) } }
+                        if let url = model.tasksURL { Button("打开任务库") { usage.openProject(url) } }
                         if let url = model.usageURL { Button("打开用量库") { usage.openProject(url) } }
                     }.disabled(model.busy)
                     Text("在 Notion 中创建内部 Integration，授予读取、插入和更新内容权限，再把父页面分享给它。首次同步从本周开始。")
@@ -313,14 +344,32 @@ struct ProjectSettingsView: View {
                     }.disabled(model.busy)
                     Picker("Notion 项目", selection: $model.selectedPage) {
                         Text("请选择").tag("")
-                        ForEach(model.choices) { page in Text(page.name).tag(page.id) }
+                        ForEach(model.choices) { page in Text(page.name + (page.iconMissing ? " · 需设置头像" : "")).tag(page.id) }
                     }.disabled(model.busy)
+                    Picker("新项目头像", selection: $model.createIconMode) {
+                        Text("emoji").tag("emoji")
+                        Text("HTTPS Logo").tag("external")
+                    }.pickerStyle(.segmented).disabled(model.busy)
+                    if model.createIconMode == "emoji" {
+                        HStack {
+                            TextField("输入一个项目 emoji", text: $model.createEmoji)
+                            Menu("选择头像") {
+                                ForEach(["📦", "🎙️", "🛠️", "📝", "🌱", "🚀"], id: \.self) { value in
+                                    Button(value) { model.createEmoji = value }
+                                }
+                            }
+                        }.disabled(model.busy)
+                    } else {
+                        TextField("项目 Logo 的 HTTPS 地址", text: $model.createLogoURL).disabled(model.busy)
+                    }
                     HStack {
-                        Button("绑定所选项目") { model.bind() }.disabled(model.selectedTask.isEmpty || model.selectedPage.isEmpty)
-                        Button("按任务名新建并绑定") { model.create() }.disabled(model.selectedTask.isEmpty)
+                        Button("绑定所选项目") { model.bind() }.disabled(model.selectedTask.isEmpty || model.selectedPage.isEmpty || model.selectedPageNeedsIcon)
+                        Button("按任务名新建并绑定") { model.create() }.disabled(model.selectedTask.isEmpty || model.newProjectIcon == nil)
                         Button("解除绑定") { model.perform(["command": "unbind", "task_id": model.selectedTask]) }.disabled(model.selectedTask.isEmpty)
                     }.disabled(model.busy)
                     Text("改名后绑定仍然保留。文件夹移动后可以把新位置绑定到同一个 Notion 项目；不会自动创建项目。")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text("项目头像会用于桌面胶囊。新建时必须选择头像；已有项目没有头像时，请在 Notion 设置后再绑定。")
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 Section("摘要同步") {
@@ -333,12 +382,17 @@ struct ProjectSettingsView: View {
                 }
             }
             Section("桌面显示") {
+                Picker("外观", selection: Binding(get: { usage.widgetStyle }, set: { usage.setWidgetStyle($0) })) {
+                    ForEach(WidgetStyle.allCases) { style in Text(style.title).tag(style) }
+                }.pickerStyle(.segmented)
                 HStack {
                     ForEach(WidgetKind.allCases, id: \.self) { kind in
                         Toggle(kind.title, isOn: Binding(get: { usage.enabledWidgets.contains(kind) }, set: { _ in usage.toggleWidget(kind) }))
                     }
                 }
                 Text("横条和竖条保持桌面层；普通窗口可以盖住它们。显示选择和位置会自动保存。")
+                    .font(.callout).foregroundStyle(.secondary)
+                Text("液态玻璃使用系统材质；macOS 26 启用系统玻璃效果，较早系统使用原生透明材质。悬停展开项目看板。")
                     .font(.callout).foregroundStyle(.secondary)
             }
             if model.busy { ProgressView().controlSize(.small) }

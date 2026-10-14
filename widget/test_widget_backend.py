@@ -154,6 +154,58 @@ class SnapshotIntegrationTests(unittest.TestCase):
             self.assertEqual(snapshot["total_tokens"], 100)
             self.assertEqual(snapshot["notion"]["state"], "error")
 
+    def test_cached_management_projects_with_zero_usage_keep_ledger_unchanged(self):
+        from notion_sync import NotionWorkspace
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()), \
+             patch("notion_sync.keychain_token", side_effect=AssertionError("credential accessed")), \
+             patch("notion_sync.urllib_transport", side_effect=AssertionError("network accessed")):
+            data = Path(temporary)
+            initial = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+            task = initial["available_projects"][0]["task_id"]
+            workspace = NotionWorkspace(data, clock=lambda: self.NOW)
+            with workspace._locked():
+                workspace.config.update({"projects_data_source_id": "00000000-0000-0000-0000-000000000010",
+                    "usage_data_source_id": "00000000-0000-0000-0000-000000000011",
+                    "bindings": {task: "used", "unseen-local": "zero"}})
+                workspace.state["credential_available"] = True
+                workspace.state["projects"] = {
+                    "used": {"page_id": "used", "display_name": "有用量项目", "status": "开发中", "project_priority": "中", "available": True, "fetched_at": self.NOW.isoformat()},
+                    "zero": {"page_id": "zero", "display_name": "优先项目", "status": "开发中", "project_priority": "高", "available": True, "fetched_at": self.NOW.isoformat()},
+                    "unbound": {"page_id": "unbound", "display_name": "云端项目", "status": "计划中", "available": True, "fetched_at": self.NOW.isoformat()}}
+            managed = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+            self.assertEqual(managed["total_tokens"], initial["total_tokens"])
+            self.assertEqual(managed["tasks"][0]["total_tokens"], initial["tasks"][0]["total_tokens"])
+            self.assertEqual(managed["tasks"][0]["percent"], 100)
+            rows = managed["management_projects"]
+            self.assertEqual([row["task_id"] for row in rows], ["notion:zero", "notion:used", "notion:unbound"])
+            self.assertEqual([row["usage_linked"] for row in rows], [True, True, False])
+            self.assertEqual([row["total_tokens"] for row in rows], [0, 100, 0])
+            saved = json.loads((data / "notion-daily.json").read_text())["rows"]
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0]["total_tokens"], 100)
+            self.assertNotIn("project_goal", saved[0])
+
+    def test_management_cache_failure_falls_back_without_dropping_usage(self):
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()), \
+             patch("notion_sync.NotionWorkspace.cached_projects", side_effect=ValueError("private cache")), \
+             patch("notion_sync.NotionWorkspace.status", return_value={"connected": True}):
+            snapshot = build_snapshot(Path(temporary), Path("/tmp/widget-root"), Path(temporary), False, self.NOW)
+            self.assertIsNone(snapshot["management_projects"])
+            self.assertEqual(snapshot["total_tokens"], 100)
+            self.assertEqual(snapshot["tasks"][0]["percent"], 100)
+
+    def test_today_snapshot_selects_shanghai_day_and_keeps_total_denominator(self):
+        payload = self.report()
+        payload["project_daily"] = [dict(payload["project_daily"][0], day="2026-10-13", total_tokens=40), dict(payload["project_daily"][0], day="2026-10-14", total_tokens=60)]
+        end = datetime(2026,10,13,16,5,tzinfo=timezone.utc)
+        payload["range"]["until_exclusive"] = end.isoformat()
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=payload):
+            snapshot = build_snapshot(Path(temporary), Path('/tmp/widget-root'), Path(temporary), False, end)
+            self.assertEqual(snapshot["today_tokens"], 60)
+            self.assertEqual(snapshot["total_tokens"], 100)
+            self.assertEqual(snapshot["tasks"][0]["today_tokens"], 60)
+            self.assertEqual(snapshot["tasks"][0]["percent"], 100)
+
     def test_official_cache_staleness_uses_fixed_snapshot_clock(self):
         import json
         with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()):

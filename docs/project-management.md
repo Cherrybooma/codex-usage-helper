@@ -1,0 +1,93 @@
+# 项目管理工作台
+
+用量小助手的桌面胶囊是项目管理入口。Notion 保存项目目标、下一步、任务和成果，本机账本记录 Token 投入。看板让人快速判断现在在推进什么、哪里受阻、下一步做什么；Token 不代表完成进度、收益或执行时间。
+
+## 首页的五部分
+
+保留用户指定的五部分顺序；愿景始终在首位。首页使用 Notion 原生页面图标、标题和筛选后的关联视图，完整字段留在数据库和项目详情中。
+
+| 区域 | 人在这里看什么 | 推荐视图 |
+| --- | --- | --- |
+| 愿景 | 为谁解决什么问题，预期得到什么结果 | 原生页面标题与简短愿景，关联项目目标 |
+| 待人工确认 | 待验收成果、具体选择和需人的行动 | 主 Tasks 视图只筛选待确认，需人的阻塞形成明确确认项 |
+| 当前进展与下一步 | 当前阶段、实际完成结果、剩余未知和 AI 下一项具体行动 | 进展摘要与未完成 Tasks 看板／列表 |
+| 历史开发事件 | 什么时间做了什么、得到什么结果、依据是什么 | 日期排序的 Events 列表与可展开的原生时间线，关联 Project 与 Tasks |
+| 每项目 Token 投入 | 各项目的已记录投入与计量质量 | Usage Daily 关联视图，筛选 Included 为 true |
+
+项目页可进一步放目标与验收标准、关联任务、成果链接、最近复盘、用量视图。使用少量一致的颜色表达状态与风险，不为每个字段加大段说明；原始摘要键、绑定字段和匿名数据集只留在审计视图。
+
+单项目工作台不再放同名 Project 卡重复页面标题，直接展示阶段、完成事实和 AI 下一行动。多项目入口才使用项目卡浏览各项目。首页结构以这五部分为准，不用其他管理方法替换。
+
+Notion 官方专门的 Dashboard view 目前要求 Business 或 Enterprise。当前结构可使用普通页面、分栏与关联数据库视图，不依赖付费 Dashboard view。布局参考与使用条件见 [官方 Dashboard 说明](https://www.notion.com/help/dashboards)。
+
+## 项目、任务、用量分别记事实
+
+Projects 是管理总入口，Tasks 是具体行动项，每个任务应只归属一个项目；Events 保留开发历史，Usage Daily 是关联投入。项目名称变更不会改变页面身份或本地绑定。
+
+- **项目**：图标、目标、状态、本周目标、下一步、优先级、健康度、交付日期、最近复盘、摘要和成果。
+- **任务**：所属项目、状态、优先级、日期、管理者、验收标准和结果依据。
+- **事件**：时间、实际动作与结果、证据、项目和任务关系。每次实际推进追加，重复操作按 Event Key 去重。
+- **用量**：日期、Codex、计数、统计质量、来源和精确截止时间。当前计入的投入使用 Counted Tokens，不能把旧分配的审计数再加一次。
+
+任务的待办数包含受阻任务，因此待办与受阻不能相加。不将“用了多少 Token”换算成“完成多少项目”。未配置任务源或查询不完整时不编造完成率。
+
+已完成 Tasks 行保留，可由当前行动视图筛掉；开发历史独立追加到 Events。修正结果、重开任务或状态回退，都追加说明事件，不能覆盖旧事实。旧证据的原完成时间未核实时，记录此次回填时间并明确说明，不能填一个看起来合理的历史日期。
+
+阻塞不一定需要人：AI 能自行解决的问题留在当前行动或风险。只有确实需要人的选择、验收或行动，才形成待确认项。无需为这个分类强增数据库字段。
+
+Events 由同项目单写者顺序维护，创建后按 Event Key 复查。该富文本键没有唯一约束，先查后建不保证并发唯一；出现多条同键记录或结果不确定时暂停同键追加并标为待核实，保留历史，不自行删除或合并。
+
+属性约定、图标校验、任务源兼容性与同步方法见 [Notion 连接说明](notion.md)。
+
+## AI 协助维护
+
+目前 Codex 通过 [notion-project-workbench 技能](../skills/notion-project-workbench/SKILL.md)在用户安排的任务中更新项目、Tasks 和 Events；人也可以在 Notion 手动编辑。技能先读取父页面和现有数据源，再复用相关页面与库，不重新初始化成另一套工作台。桌面后台只读取管理信息、更新本地缓存和同步用量摘要，不会自动生成新的项目计划、修改目标或完成任务。
+
+尚未配置持续定时执行的 Notion Custom Agent。普通 Notion Agent 是按需使用，Custom Agents 才支持触发与定时后台运行；是否启用属于后续独立配置。[官方区别说明](https://www.notion.com/help/category/custom-agents)。
+
+AI 更新项目时应遵循这些约定：
+
+1. 从用户目标、实际执行结果和可核查依据创建行动项，避免只有模糊的“继续优化”。
+2. 填写明确的下一步；日期和负责人未知时留空，不自行作出承诺。
+3. 需要验收的任务先标待确认；已完成应有测试、交付物或其他可核查依据。Token 增长不能作为完成证据。
+4. 阻塞应写明问题和所需行动；用 Health 表达项目风险，保留项目本身的生命周期状态。
+5. 复盘时写当前状态、行动项、阻塞与下一里程碑，保留结果链接和复盘日期。
+6. 每次实际推进必须追加开发事件，带实际时间、结果、证据与 Tasks 关系；任务当前状态的更新不能代替事件历史。
+
+这套结构参考 [Notion 官方 AI 项目更新示例](https://www.notion.com/help/guides/automate-project-updates-and-reporting-with-custom-agents)。未来启用后台 Agent 时需要配置权限、触发条件与活动检查；当前不宣称这些已启用。
+
+## 桌面胶囊
+
+常态只显示图标：Codex、账本以及项目头像。所有名称、百分比、Token 与管理信息在鼠标悬停或点击后显示；点击固定详情，Esc 或外部点击收起。
+
+视觉样式提供液态玻璃、Pulse 暗色、经典白色；详情使用项目卡。项目外环显示本周 Token 占比；内环优先使用 Notion 中明确维护的开发进度，否则在完整任务计数可用时显示“行动完成率”。无数据只有轨道，不假装零进度。这些视觉信息不改变用户指定的五部分 Notion 首页。
+
+项目头像使用 Notion 页面自身的 icon。应用新建项目时要求 emoji 或 HTTPS Logo；绑定已有项目时验证图标。Notion 自身没有“项目 icon 必填”约束，其他客户端仍能创建无图标页面。图标之后被删除时显示文件夹符号和补充提示，保留计量与绑定。
+
+项目详情按管理信息优先：名称和状态、本周目标、下一步、项目目标、日期、优先级与健康度、可用的任务计数和最近摘要。Token、占比、会话与响应数放在下方。
+
+有项目缓存时按管理状态、优先级和名称排列项目；项目本周没有用量也能出现在看板中。没有关联本机记录的项目明确显示未关联，而非真实零消耗。管理列表独立于计量列表，不改变本地总数、占比分母或每日同步账本。
+
+## Notion 的 Mac 组件可以学什么
+
+本次官方资料核查于 2026-10-13 完成。Notion 文档确认的是 iOS／Android 组件：Page、Favorites、Recents 和 AI shortcuts。Page 组件使用页面图标与封面，作为打开页面的入口；官方指出自定义 emoji 不会在移动组件渲染。[Notion 移动组件说明](https://www.notion.com/help/mobile-widgets)。
+
+Apple 支持在 Mac 桌面显示 iPhone 组件。要求 iPhone 使用 iOS 17 或更新版本、设备使用相同 Apple Account，且 iPhone 在附近或同一 Wi-Fi。普通窗口可以遮住桌面组件；部分交互需要回到 iPhone。[Apple Mac 组件说明](https://support.apple.com/guide/mac-help/add-and-customize-widgets-mchl52be5da5/mac)。
+
+本次未找到 Notion 官方确认的独立原生 macOS WidgetKit 项目看板组件，因此不能把手机接力组件说成已有原生 Mac 项目胶囊。Notion Calendar 的官方组件说明同样针对移动系统。[Notion Calendar 应用与组件](https://www.notion.com/help/notion-calendar-apps)。
+
+Notion Mac 应用另有菜单栏 Command Search／AI 入口，以及标签页 hover 预览。可以借鉴图标入口、需要时展开和跳转回完整页面的组织方式；它们不是桌面项目看板。[Notion 桌面应用说明](https://www.notion.com/help/notion-for-desktop)。
+
+本项目的悬停详情由自己的桌面应用提供；默认在桌面层，保留普通窗口可以覆盖的行为，不宣称它是 Apple 官方 WidgetKit 扩展。
+
+## 官方设计参考
+
+- [Notion Projects & Tasks 模板](https://www.notion.com/templates/notion-projects-and-tasks)：项目与任务分别建库、关联管理。
+- [Projects & Tasks 使用指南](https://www.notion.com/help/guides/getting-started-with-projects-and-tasks)：项目为总入口，任务视图服务具体日常行动。
+- [Connected project management](https://www.notion.com/help/guides/accomplish-more-with-connected-project-management)：目标、文档、任务与阻塞保持关联。
+- [Basecamp Hill Charts](https://basecamp.com/hill-charts)：区分尚在解决未知问题与已经明确方案的执行，并保留状态历史。
+- [Shape Up — Show Progress](https://basecamp.com/shapeup/3.4-chapter-13)：任务数无法完整表达未知问题，历史状态能显示工作如何推进。
+
+采用的轻量路径是 Notion 项目／任务关系、明确的下一行动、独立 Events 历史与投入摘要。仅借鉴 Basecamp 对未知和历史的处理；不导入整套 Shape Up、不强制六周循环，也不凭 Token 绘制项目完成度。
+
+首页区域、胶囊排序和 AI 维护约定是本项目的设计选择；官方参考不能代替本项目的真实功能验收。

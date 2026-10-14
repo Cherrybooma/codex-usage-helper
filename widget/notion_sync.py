@@ -28,8 +28,10 @@ from zoneinfo import ZoneInfo
 
 if __package__:
     from .notion_credentials import configured_token
+    from .project_store import project_progress
 else:
     from notion_credentials import configured_token
+    from project_store import project_progress
 
 API_VERSION = "2026-03-11"
 API_BASE = "https://api.notion.com/v1"
@@ -44,6 +46,15 @@ NUMBER_PROPERTIES = dict(zip(COUNTERS, (
     "Reasoning Output Tokens", "Response Records", "Legacy Updates")))
 QUALITY = {"response_records_verified": "按响应记录", "legacy_estimated": "含旧累计估算",
            "partial_unreadable": "部分记录未读取", "unknown": "未核实"}
+PROJECT_TEXT_PROPERTIES = {"project_goal": "Goal", "weekly_goal": "Weekly Goal",
+                           "next_step": "Next Step", "project_summary": "Summary"}
+PROJECT_SELECT_PROPERTIES = {"project_priority": "Priority", "project_health": "Health"}
+PROJECT_DATE_PROPERTIES = {"target_date": "Target Date", "last_reviewed": "Last Reviewed"}
+OPTIONAL_PROJECT_PROPERTIES = set(PROJECT_TEXT_PROPERTIES.values()) | set(PROJECT_SELECT_PROPERTIES.values()) | set(PROJECT_DATE_PROPERTIES.values()) | {"Development Progress"}
+OPTIONAL_TASK_PROPERTIES = {"Priority", "Managed By", "Due", "Evidence", "Acceptance"}
+TASK_COUNT_FIELDS = ("open_tasks", "blocked_tasks", "completed_tasks")
+TASK_OPEN_STATUSES = {"待处理", "进行中", "待确认", "阻塞"}
+TASK_KNOWN_STATUSES = TASK_OPEN_STATUSES | {"已完成", "取消"}
 MESSAGES = {
     "not_connected": "尚未连接 Notion；本地统计继续可用。",
     "not_configured": "请先选择父页面并建立项目库和每日用量库。",
@@ -57,6 +68,7 @@ MESSAGES = {
     "write_uncertain": "写入结果尚未确认，先重新查询，避免创建副本。",
     "duplicate_summary": "Notion 已存在重复摘要，暂停写入以免覆盖错误记录。",
     "invalid_input": "输入字段或统计时间无效。",
+    "icon_required": "项目必须设置头像：请选择 emoji 或 HTTPS Logo；已有项目请先在 Notion 设置头像，再绑定。",
     "schema_mismatch": "Notion 数据库结构与本版本不兼容。",
     "invalid_response": "Notion 返回的数据无法识别。",
     "api_error": "Notion 请求失败，已保留本地数据。",
@@ -158,15 +170,51 @@ def _text(value: str) -> list[dict]:
 def _plain(value) -> str:
     if not isinstance(value, list):
         return ""
-    return "".join(item.get("plain_text", item.get("text", {}).get("content", ""))
-                   for item in value if isinstance(item, dict))[:2000]
+    parts = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("plain_text")
+        if not isinstance(text, str):
+            source = item.get("text")
+            text = source.get("content") if isinstance(source, dict) else None
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)[:2000]
 
 
 def _safe_https(value) -> str | None:
-    if not isinstance(value, str) or len(value) > 4096:
+    if not isinstance(value, str) or len(value) > 4096 or any(ord(char) <= 32 for char in value):
         return None
-    url = parse.urlparse(value)
-    return value if url.scheme == "https" and url.hostname and not url.username and not url.password else None
+    try:
+        url = parse.urlparse(value)
+        valid_port = url.port is None or 1 <= url.port <= 65535
+        return value if url.scheme == "https" and url.hostname and valid_port and not url.username and not url.password else None
+    except ValueError:
+        return None
+
+
+def project_icon(value) -> dict:
+    """Validate the page icon before any credential/network access or create.
+
+    Creation must assign it atomically; binding never fixes an icon remotely.
+    A single emoji may include variation selectors, skin tones or ZWJ parts.
+    """
+    if not isinstance(value, dict):
+        raise NotionError("icon_required")
+    if value.get("type") == "external":
+        external = value.get("external")
+        url = _safe_https(external.get("url")) if isinstance(external, dict) else None
+        if url:
+            return {"type": "external", "external": {"url": url}}
+    if value.get("type") == "emoji":
+        emoji = value.get("emoji")
+        base = r"[\u00a9\u00ae\u203c\u2049\u2122\u2139\u2194-\u21ff\u2300-\u23ff\u25a0-\u27ff\u2934\u2935\u2b00-\u2bff\u3030\u303d\u3297\u3299\U0001f000-\U0001faff]"
+        part = base + r"\ufe0f?[\U0001f3fb-\U0001f3ff]?"
+        pattern = r"(?:[\U0001f1e6-\U0001f1ff]{2}|[0-9#*]\ufe0f?\u20e3|" + part + r"(?:\u200d" + part + r")*)"
+        if isinstance(emoji, str) and len(emoji) <= 32 and re.fullmatch(pattern, emoji):
+            return {"type": "emoji", "emoji": emoji}
+    raise NotionError("icon_required")
 
 
 class NotionWorkspace:
@@ -352,10 +400,25 @@ class NotionWorkspace:
             statuses = [("计划中", "gray", "To-do"), ("开发中", "blue", "In progress"),
                         ("已发布", "green", "Complete"), ("暂停", "yellow", "To-do"),
                         ("归档", "gray", "Complete")]
-            return {"Name": {"title": {}}, "Status": {"status": {"options": [
+            schema = {"Name": {"title": {}}, "Status": {"status": {"options": [
                 {"name": name, "color": color, "group": group} for name, color, group in statuses]}},
                 "Weekly Goal": {"rich_text": {}}, "Next Step": {"rich_text": {}},
                 "Outcome": {"url": {}}, "Binding Key": {"rich_text": {}}}
+            schema.update({name: {"rich_text": {}} for name in PROJECT_TEXT_PROPERTIES.values()})
+            schema.update({name: {"date": {}} for name in PROJECT_DATE_PROPERTIES.values()})
+            schema["Priority"] = {"select": {"options": [{"name": value} for value in ("高", "中", "低")]}}
+            schema["Health"] = {"select": {"options": [{"name": value} for value in ("正常", "有风险", "受阻")]}}
+            schema["Development Progress"] = {"number": {"format": "number"}}
+            return schema
+        if kind == "tasks":
+            return {"Name": {"title": {}}, "Project": {"relation": {
+                "data_source_id": self.config["projects_data_source_id"],
+                "type": "single_property", "single_property": {}}},
+                "Status": {"select": {"options": [{"name": name} for name in (
+                    "待处理", "进行中", "待确认", "阻塞", "已完成", "取消")]}},
+                "Priority": {"select": {"options": [{"name": value} for value in ("高", "中", "低")]}},
+                "Managed By": {"select": {"options": [{"name": value} for value in ("AI", "人类确认")]}},
+                "Due": {"date": {}}, "Evidence": {"url": {}}, "Acceptance": {"rich_text": {}}}
         result = {"Name": {"title": {}}, "Project": {"relation": {
             "data_source_id": self.config["projects_data_source_id"],
             "type": "single_property", "single_property": {}}},
@@ -403,7 +466,8 @@ class NotionWorkspace:
                 try:
                     database = self._request("POST", "/databases", {
                         "parent": {"type": "page_id", "page_id": parent},
-                        "title": _text("项目 Projects" if kind == "projects" else "每日用量 Usage Daily"),
+                        "title": _text({"projects": "项目 Projects", "tasks": "任务 Tasks",
+                                        "usage": "每日用量 Usage Daily"}[kind]),
                         "description": _text(marker), "is_inline": True,
                         "initial_data_source": {"properties": self._db_schema(kind)}})
                 except NotionError as exc:
@@ -427,6 +491,12 @@ class NotionWorkspace:
         properties = source.get("properties", {})
         expected = self._db_schema(kind)
         for name, definition in expected.items():
+            # Management fields are additive. Existing databases are readable
+            # without migration; setup never overwrites a user's schema.
+            if kind == "projects" and name in OPTIONAL_PROJECT_PROPERTIES and name not in properties:
+                continue
+            if kind == "tasks" and name in OPTIONAL_TASK_PROPERTIES and name not in properties:
+                continue
             actual = properties.get(name, {})
             actual_type = actual.get("type") or next((key for key in definition if key in actual), None)
             required_type = next(iter(definition))
@@ -452,6 +522,11 @@ class NotionWorkspace:
                 today = self._now(now).astimezone(SHANGHAI).date()
                 self.config.setdefault("sync_since", (today - timedelta(days=today.weekday())).isoformat())
                 self._ensure_database("projects", parent)
+                # A selected Tasks data source is retained as-is. App-created
+                # Tasks databases are resumed by stable marker/ID like the
+                # other databases, including after an uncertain creation.
+                if self.config.get("tasks_database_id") or not self.config.get("tasks_data_source_id"):
+                    self._ensure_database("tasks", parent)
                 self._ensure_database("usage", parent)
                 self.state.pop("error", None)
                 self.state.pop("automatic_sync_paused", None)
@@ -461,25 +536,107 @@ class NotionWorkspace:
             return self._status()
 
     def _project(self, page, *, stale=False):
+        if not isinstance(page, dict) or not isinstance(page.get("properties", {}), dict):
+            raise NotionError("invalid_response")
         properties = page.get("properties") or {}
+        if any(not isinstance(prop, dict) for prop in properties.values()):
+            raise NotionError("invalid_response")
         title = next((prop for prop in properties.values() if prop.get("type") == "title" or "title" in prop), {})
         status = properties.get("Status") or next(
             (prop for prop in properties.values() if prop.get("type") == "status"), {})
         status_value = status.get("status") or status.get("select") or {}
-        icon = page.get("icon") or {}
+        status_value = status_value if isinstance(status_value, dict) else {}
+        icon = page.get("icon") if isinstance(page.get("icon"), dict) else {}
         icon_type, icon_value = icon.get("type"), None
         if icon_type == "emoji":
-            icon_value = str(icon.get("emoji", ""))[:32]
+            try:
+                icon_value = project_icon(icon)["emoji"]
+            except NotionError:
+                pass
         elif icon_type in ("external", "file"):
-            icon_value = _safe_https((icon.get(icon_type) or {}).get("url"))
+            asset = icon.get(icon_type)
+            icon_value = _safe_https(asset.get("url")) if isinstance(asset, dict) else None
         elif icon_type == "custom_emoji":
-            icon_value = _safe_https((icon.get("custom_emoji") or {}).get("url"))
-        return {"page_id": notion_id(page.get("id")), "display_name": _plain(title.get("title")) or "未命名项目",
+            asset = icon.get("custom_emoji")
+            icon_value = _safe_https(asset.get("url")) if isinstance(asset, dict) else None
+        metadata = {"page_id": notion_id(page.get("id")), "display_name": _plain(title.get("title")) or "未命名项目",
                 "status": str(status_value.get("name", ""))[:100],
                 "icon_type": icon_type if icon_value else None, "icon_value": icon_value,
+                "icon_missing": not bool(icon_value),
                 "url": _safe_https(page.get("url")), "updated_at": page.get("last_edited_time"),
                 "fetched_at": self._now().isoformat(), "stale": stale,
                 "available": not (page.get("archived") or page.get("in_trash"))}
+        for field, name in PROJECT_TEXT_PROPERTIES.items():
+            prop = properties.get(name) or {}
+            metadata[field] = _plain(prop.get("rich_text")) or None
+        for field, name in PROJECT_SELECT_PROPERTIES.items():
+            prop = properties.get(name) or {}
+            selected = prop.get("select") or {}
+            value = selected.get("name") if isinstance(selected, dict) else None
+            metadata[field] = value[:100] if isinstance(value, str) and value else None
+        for field, name in PROJECT_DATE_PROPERTIES.items():
+            prop = properties.get(name) or {}
+            date_value = prop.get("date") or {}
+            start = date_value.get("start") if isinstance(date_value, dict) else None
+            metadata[field] = start[:64] if isinstance(start, str) and start else None
+        metadata.update({field: None for field in TASK_COUNT_FIELDS})
+        progress = (properties.get("Development Progress") or {}).get("number")
+        metadata.update(project_progress({"development_progress": progress, "progress_source": "manual"}))
+        return metadata
+
+    def _task_counts(self, project_ids):
+        """Read a separate Tasks source; never write tasks or infer absent zeroes."""
+        source = self.config.get("tasks_data_source_id")
+        if not source:
+            return None
+        schema = self._request("GET", f"/data_sources/{notion_id(source)}", idempotent=True)
+        properties = schema.get("properties") or {}
+        if not isinstance(properties, dict):
+            raise NotionError("schema_mismatch")
+        relation_schema = properties.get("Project") or {}
+        status_schema = properties.get("Status") or {}
+        relation_config = relation_schema.get("relation") if isinstance(relation_schema, dict) else None
+        if (not isinstance(relation_schema, dict) or not isinstance(status_schema, dict)
+                or relation_schema.get("type") != "relation"
+                or not isinstance(relation_config, dict)
+                or relation_config.get("data_source_id") != self.config["projects_data_source_id"]
+                or status_schema.get("type") != "select"):
+            raise NotionError("schema_mismatch")
+        counts = {page_id: {field: 0 for field in TASK_COUNT_FIELDS} for page_id in project_ids}
+        seen = set()
+        for task in self._query(source):
+            if not isinstance(task, dict):
+                raise NotionError("invalid_response")
+            if task.get("archived") or task.get("in_trash"):
+                continue
+            task_id = notion_id(task.get("id"))
+            if task_id in seen:
+                continue
+            seen.add(task_id)
+            properties = task.get("properties") or {}
+            if not isinstance(properties, dict):
+                raise NotionError("invalid_response")
+            relation = properties.get("Project") or {}
+            if not isinstance(relation, dict) or not isinstance(relation.get("relation"), list) or relation.get("has_more"):
+                # A truncated relation is not evidence that a project has no tasks.
+                raise NotionError("schema_mismatch")
+            project_ids = {notion_id(item.get("id")) for item in relation["relation"] if isinstance(item, dict)}
+            relevant = project_ids & counts.keys()
+            if not relevant:
+                continue
+            status_property = properties.get("Status") or {}
+            selected = status_property.get("select") if isinstance(status_property, dict) else None
+            status = selected.get("name") if isinstance(selected, dict) else None
+            if status not in TASK_KNOWN_STATUSES:
+                raise NotionError("schema_mismatch")
+            for project_id in relevant:
+                if status in TASK_OPEN_STATUSES:
+                    counts[project_id]["open_tasks"] += 1
+                if status == "阻塞":
+                    counts[project_id]["blocked_tasks"] += 1
+                if status == "已完成":
+                    counts[project_id]["completed_tasks"] += 1
+        return counts
 
     def _projects(self, force=False):
         cached = self.state["projects"]
@@ -490,20 +647,43 @@ class NotionWorkspace:
                 pages = self._query(self.config["projects_data_source_id"])
                 fresh = {meta["page_id"]: meta for page in pages if not (page.get("archived") or page.get("in_trash"))
                          for meta in [self._project(page)]}
+                try:
+                    counts = self._task_counts(fresh.keys())
+                    if counts is not None:
+                        for page_id, value in counts.items():
+                            fresh[page_id].update(value)
+                    self.state.pop("tasks_error", None)
+                except NotionError as exc:
+                    self.state["tasks_error"] = exc.public()
+                    if exc.code in ("not_connected", "unauthorized"):
+                        self._remember_error(exc)
+                    elif exc.retry_after:
+                        self.state["next_retry"] = (self._now() + timedelta(seconds=exc.retry_after)).isoformat()
+                    if exc.code == "api_access_blocked":
+                        self.state["automatic_sync_paused"] = True
                 for old_id, old in cached.items():
                     if old_id not in fresh:
                         fresh[old_id] = {**old, "available": False, "stale": True}
+                for meta in fresh.values():
+                    meta.update(project_progress(meta))
                 self.state["projects"] = cached = fresh
                 self.state["projects_fetched_at"] = self._now().isoformat()
                 self.state.pop("projects_error", None)
-                self.state.pop("automatic_sync_paused", None)
+                if (self.state.get("tasks_error") or {}).get("code") != "api_access_blocked":
+                    self.state.pop("automatic_sync_paused", None)
             except NotionError as exc:
                 self.state["projects_error"] = exc.public()
                 self._remember_error(exc)
         fetched = self.state.get("projects_fetched_at")
         stale = not fetched or (self._now() - _utc(fetched)).total_seconds() >= 600
-        return [{**meta, "stale": meta.get("stale", False) or stale or bool(self.state.get("projects_error"))}
-                for meta in sorted(cached.values(), key=lambda item: (item["display_name"], item["page_id"]))]
+        result = []
+        for meta in sorted(cached.values(), key=lambda item: (item["display_name"], item["page_id"])):
+            is_stale = meta.get("stale", False) or stale or bool(self.state.get("projects_error"))
+            item = {**meta, "stale": is_stale,
+                    **({field: None for field in TASK_COUNT_FIELDS} if is_stale else {})}
+            item.update(project_progress(item))
+            result.append(item)
+        return result
 
     def projects(self, force=False) -> list[dict]:
         with self._locked():
@@ -515,7 +695,22 @@ class NotionWorkspace:
             raise NotionError("object_not_found")
         if (page.get("parent") or {}).get("data_source_id") != self.config.get("projects_data_source_id"):
             raise NotionError("schema_mismatch")
-        return self._project(page)
+        meta = self._project(page)
+        cached = self.state["projects"].get(meta["page_id"])
+        if cached and cached.get("page_id") == meta["page_id"]:
+            # Access verification reads only the project page, not Tasks. Keep
+            # the full management observation's timestamp so repeated daily
+            # writes/binds cannot renew the task counters' ten-minute TTL.
+            fetched = cached.get("fetched_at")
+            meta["fetched_at"] = fetched
+            fresh = bool(fetched) and 0 <= (self._now() - _utc(fetched)).total_seconds() < 600
+            complete = all(isinstance(cached.get(field), int) and not isinstance(cached[field], bool)
+                           and cached[field] >= 0 for field in TASK_COUNT_FIELDS)
+            if (fresh and complete and cached.get("available", True) and not cached.get("stale")
+                    and not self.state.get("projects_error") and not self.state.get("tasks_error")):
+                meta.update({field: cached[field] for field in TASK_COUNT_FIELDS})
+            meta.update(project_progress(meta))
+        return meta
 
     def _task_id(self, task_id):
         if not isinstance(task_id, str) or not task_id or len(task_id) > 512:
@@ -529,6 +724,8 @@ class NotionWorkspace:
                     raise NotionError("not_configured")
                 task_id = self._task_id(task_id)
                 meta = self._verify_project(page_id)
+                if meta["icon_missing"]:
+                    raise NotionError("icon_required")
                 self.config["bindings"][task_id] = meta["page_id"]
                 self.state["projects"][meta["page_id"]] = meta
                 self.state.pop("error", None)
@@ -544,16 +741,20 @@ class NotionWorkspace:
             # task are removed by the next full sync's binding validation.
             return self._status()
 
-    def create_project(self, task_id: str, name: str) -> dict:
+    def create_project(self, task_id: str, name: str, icon: dict | None = None) -> dict:
         with self._locked():
             try:
+                validated_icon = project_icon(icon)
                 if not self._ready():
                     raise NotionError("not_configured")
                 task_id = self._task_id(task_id)
                 if not isinstance(name, str) or not name.strip() or len(name) > 200:
                     raise NotionError("invalid_input")
                 if task_id in self.config["bindings"]:
-                    return self._verify_project(self.config["bindings"][task_id])
+                    existing = self._verify_project(self.config["bindings"][task_id])
+                    if existing["icon_missing"]:
+                        raise NotionError("icon_required")
+                    return existing
                 key = hashlib.sha256((self.config["dataset_id"] + ":" + task_id).encode()).hexdigest()
                 matches = self._query(self.config["projects_data_source_id"], filter={
                     "property": "Binding Key", "rich_text": {"equals": key}})
@@ -570,6 +771,7 @@ class NotionWorkspace:
                     try:
                         page = self._request("POST", "/pages", {
                             "parent": {"type": "data_source_id", "data_source_id": self.config["projects_data_source_id"]},
+                            "icon": validated_icon,
                             "properties": {"Name": {"title": _text(name.strip())},
                                            "Status": {"select" if self.config.get("status_property_type") == "select" else "status": {"name": "计划中"}},
                                            "Binding Key": {"rich_text": _text(key)}}})
@@ -586,6 +788,8 @@ class NotionWorkspace:
                             self.state["uncertain_creates"].pop(operation, None)
                             raise
                 meta = self._project(page)
+                if meta["icon_missing"]:
+                    raise NotionError("icon_required")
                 self.state["uncertain_creates"].pop(operation, None)
                 self.state["projects"][meta["page_id"]] = meta
                 self.config["bindings"][task_id] = meta["page_id"]
@@ -858,6 +1062,7 @@ class NotionWorkspace:
                 "state": current_state, "message": current_error.get("message") if current_error else
                     "Notion 已连接。" if current_state == "ready" else MESSAGES["not_connected"],
                 "projects_url": self.config.get("projects_url"), "usage_url": self.config.get("usage_url"),
+                "tasks_url": self.config.get("tasks_url"),
                 "last_synced_at": self.state.get("last_sync"),
                 "automatic_sync_paused": bool(self.state.get("automatic_sync_paused")),
                 "ready": self._ready(), "api_version": API_VERSION,
@@ -867,6 +1072,7 @@ class NotionWorkspace:
                 "uncertain_count": len(self.state["uncertain_creates"]),
                 "last_sync": self.state.get("last_sync"), "next_retry": self.state.get("next_retry"),
                 "error": self.state.get("error"), "projects_error": self.state.get("projects_error"),
+                "tasks_error": self.state.get("tasks_error"),
                 "projects": list(self.state["projects"].values())}
 
     def status(self) -> dict:
@@ -883,13 +1089,31 @@ class NotionWorkspace:
             return None
         fetched = meta.get("fetched_at")
         stale = not fetched or (self._now() - _utc(fetched)).total_seconds() >= 600
-        return {**meta, "stale": meta.get("stale", False) or stale or bool(state.get("projects_error"))}
+        is_stale = meta.get("stale", False) or stale or bool(state.get("projects_error"))
+        item = {**meta, "stale": is_stale,
+                **({field: None for field in TASK_COUNT_FIELDS} if is_stale or state.get("tasks_error") else {})}
+        item.update(project_progress(item))
+        return item
 
     def cached_status(self) -> dict:
         """Non-network snapshot for the 60-second scanner/native renderer."""
         self.config = self._load(self.config_path, {"dataset_id": "", "bindings": {}})
         self.state = self._load(self.state_path, {"projects": {}, "pending": {}, "uncertain_creates": {}})
         return self._status()
+
+    def cached_projects(self) -> list[dict]:
+        """Read only the local management cache; no network or credentials."""
+        state = self._load(self.state_path, {"projects": {}})
+        result = []
+        for meta in state["projects"].values():
+            fetched = meta.get("fetched_at")
+            stale = not fetched or (self._now() - _utc(fetched)).total_seconds() >= 600
+            stale = stale or meta.get("stale", False) or bool(state.get("projects_error"))
+            item = {**meta, "stale": stale,
+                    **({field: None for field in TASK_COUNT_FIELDS} if stale or state.get("tasks_error") else {})}
+            item.update(project_progress(item))
+            result.append(item)
+        return result
 
 
 def main(argv=None):
@@ -914,7 +1138,7 @@ def main(argv=None):
         elif name == "unbind":
             result = workspace.unbind(command.get("task_id"))
         elif name == "create_project":
-            result = workspace.create_project(command.get("task_id"), command.get("name"))
+            result = workspace.create_project(command.get("task_id"), command.get("name"), command.get("icon"))
         elif name == "sync":
             result = workspace.sync(command.get("rows", []), force=bool(command.get("force", True)),
                                     complete_dataset_ids=command.get("complete_dataset_ids"), complete_until=command.get("complete_until"))

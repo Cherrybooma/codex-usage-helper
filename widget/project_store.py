@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -11,6 +14,71 @@ import uuid
 COUNTS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
           "output_tokens", "reasoning_output_tokens", "total_tokens",
           "request_records", "legacy_updates")
+PROJECT_MANAGEMENT_FIELDS = ("project_goal", "weekly_goal", "next_step", "project_priority",
+                             "project_health", "target_date", "last_reviewed", "project_summary",
+                             "open_tasks", "blocked_tasks", "completed_tasks")
+
+
+def project_progress(meta: dict) -> dict:
+    value = meta.get("development_progress")
+    if (meta.get("progress_source") == "manual" and isinstance(value, (int, float))
+            and not isinstance(value, bool) and 0 <= value <= 100 and math.isfinite(value)):
+        return {"development_progress": float(value), "progress_source": "manual"}
+    opened, completed = meta.get("open_tasks"), meta.get("completed_tasks")
+    if (all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in (opened, completed))
+            and opened + completed > 0):
+        return {"development_progress": completed * 100 / (opened + completed), "progress_source": "tasks"}
+    return {"development_progress": None, "progress_source": None}
+
+
+def management_metadata(meta: dict) -> dict:
+    values = {}
+    for field in PROJECT_MANAGEMENT_FIELDS:
+        value = meta.get(field)
+        if field.endswith("_tasks"):
+            values[field] = value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+        else:
+            values[field] = value if isinstance(value, str) and value else None
+    return {**values, **project_progress(meta),
+            "notion_icon_missing": meta.get("icon_missing"),
+            "project_status": meta.get("status"),
+            "icon_type": meta.get("icon_type"), "icon_value": meta.get("icon_value"),
+            "notion_url": meta.get("url"), "notion_stale": bool(meta.get("stale", False))}
+
+
+def management_projects(projects: list[dict], usage_rows: list[dict], bindings: dict, *, today_known=True) -> list[dict]:
+    """Presentation only: include managed projects even without weekly usage.
+
+    The caller must never add this array to token totals or send it to the daily
+    outbox. Missing local attribution remains explicit, even though numeric
+    fields keep the native TaskRow schema compatible.
+    """
+    by_page = {row["task_id"][7:]: row for row in usage_rows
+               if row.get("task_id", "").startswith("notion:")}
+    available = [meta for meta in projects if meta.get("available", True)
+                 and meta.get("status") not in ("归档", "已归档")]
+    if any(meta.get("status") in ("开发中", "计划中") for meta in available):
+        available = [meta for meta in available if meta.get("status") != "暂停"]
+    status_order = {"开发中": 0, "计划中": 0, "已发布": 1, "暂停": 2}
+    priority_order = {"高": 0, "中": 1, "低": 2}
+    result = []
+    for meta in available:
+        page_id = meta["page_id"]
+        linked = sorted(task_id for task_id, page in bindings.items() if page == page_id)
+        row = dict(by_page.get(page_id) or {
+            "task_id": "notion:" + page_id, "name": meta.get("display_name") or "未命名项目",
+            **{field: 0 for field in COUNTS}, "percent": 0,
+            "sessions_count": 0 if linked else None, "task_ids": linked,
+            "today_tokens": 0 if linked and today_known else None})
+        row.update(management_metadata(meta))
+        row["display_name"] = meta.get("display_name") or row["name"]
+        row["usage_linked"] = bool(linked)
+        if not linked:
+            row["today_tokens"] = None
+        result.append(row)
+    return sorted(result, key=lambda row: (status_order.get(row.get("project_status"), 4),
+                  priority_order.get(row.get("project_priority"), 3),
+                  row.get("display_name") or row["name"], row["task_id"]))
 
 
 def atomic_write(path: Path, value: dict) -> None:
@@ -81,6 +149,9 @@ class ProjectRegistry:
 def aggregate(report: dict, task_root: Path, registry: ProjectRegistry,
               metadata: dict[str, dict] | None = None) -> tuple[list[dict], list[dict], list[dict]]:
     metadata = metadata or {}
+    cutoff = datetime.fromisoformat(report["range"]["until_exclusive"].replace("Z", "+00:00"))
+    today = cutoff.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    today_known = isinstance(report.get("project_daily"), list)
     weekly: dict[str, dict] = {}
     identities: dict[str, tuple[str, str]] = {}
     sources: dict[str, dict] = {}
@@ -102,9 +173,12 @@ def aggregate(report: dict, task_root: Path, registry: ProjectRegistry,
                 "project_status": meta.get("status"),
                 "icon_type": meta.get("icon_type"), "icon_value": meta.get("icon_value"),
                 "notion_url": meta.get("url"), "notion_stale": bool(meta.get("stale", False)),
+                **management_metadata(meta),
                 **{field: 0 for field in COUNTS}, "_sessions": set(), "task_ids": [],
+                "today_tokens": 0 if today_known else None,
             }
         row = weekly[display_key]
+        row["usage_linked"] = True
         if task_id not in row["task_ids"]:
             row["task_ids"].append(task_id)
         sources[task_id] = {"task_id": task_id, "name": name,
@@ -122,6 +196,8 @@ def aggregate(report: dict, task_root: Path, registry: ProjectRegistry,
     daily: dict[tuple[str, str], dict] = {}
     for project in report.get("project_daily", []):
         task_id, name = resolve(project["project"])
+        if project["day"] == today:
+            row_for(task_id, name)["today_tokens"] += project.get("total_tokens", 0)
         key = task_id, project["day"]
         row = daily.setdefault(key, {"task_id": task_id, "day": project["day"],
                                     "dataset_id": registry.dataset_id, "provider": "codex",
@@ -158,6 +234,7 @@ def split_small(rows: list[dict], total: int) -> tuple[list[dict], list[dict]]:
     if small:
         counts = {field: sum(row.get(field, 0) for row in small) for field in COUNTS}
         major.append({"name": "其他", **counts, "percent": counts["total_tokens"] * 100 / total if total else 0,
+                      "today_tokens": sum(row["today_tokens"] for row in small) if all(row.get("today_tokens") is not None for row in small) else None,
                       "members_count": len(small), "is_other": True})
     return major, small
 

@@ -18,6 +18,7 @@ import notion_sync as ns
 
 NOW = datetime(2026, 10, 13, 8, tzinfo=timezone.utc)
 PARENT = str(uuid.UUID(int=1))
+PROJECT_ICON = {"type": "emoji", "emoji": "📦"}
 
 
 class FakeNotion:
@@ -146,7 +147,7 @@ class NotionTests(unittest.TestCase):
         self.connect()
         dataset = self.ws.config["dataset_id"]
         self.ws.sync([self.row()], force=True)
-        second = self.ws.create_project("other-task", "新项目")
+        second = self.ws.create_project("other-task", "新项目", icon=PROJECT_ICON)
         self.ws.bind("task-a", second["page_id"])
         with self.ws._locked():
             self.ws.state["synced"] = {}
@@ -156,7 +157,7 @@ class NotionTests(unittest.TestCase):
 
     def test_rebinding_moves_allocation_without_counting_old_project_twice(self):
         first = self.connect()
-        second = self.ws.create_project("other-task", "另一个项目")
+        second = self.ws.create_project("other-task", "另一个项目", icon=PROJECT_ICON)
         dataset = self.ws.config["dataset_id"]
         scope = {"force": True, "complete_dataset_ids": [dataset], "complete_until": self.time.isoformat()}
         self.ws.sync([self.row()], **scope)
@@ -201,7 +202,7 @@ class NotionTests(unittest.TestCase):
 
     def test_rebinding_one_of_merged_tasks_preserves_other_task_allocation(self):
         first = self.connect()
-        second = self.ws.create_project("other-project", "另一个项目")
+        second = self.ws.create_project("other-project", "另一个项目", icon=PROJECT_ICON)
         self.ws.bind("task-b", first["page_id"])
         rows = [self.row(session_keys=["a"]), self.row(task_id="task-b", total_tokens=50, session_keys=["b"])]
         self.ws.sync(rows, force=True, complete_dataset_ids=[self.ws.config["dataset_id"]])
@@ -214,7 +215,7 @@ class NotionTests(unittest.TestCase):
         database = self.api.databases[self.ws.config["projects_database_id"]]
         database["properties"]["Status"] = {"select": {"options": [{"name": "计划中"}]}}
         self.ws.setup(PARENT)
-        project = self.ws.create_project("select-task", "选择状态项目")
+        project = self.ws.create_project("select-task", "选择状态项目", icon=PROJECT_ICON)
         self.assertEqual(self.ws.config["status_property_type"], "select")
         self.assertEqual(self.api.pages[project["page_id"]]["properties"]["Status"], {"select": {"name": "计划中"}})
 
@@ -246,7 +247,7 @@ class NotionTests(unittest.TestCase):
 
     def connect(self):
         self.ws.setup(PARENT)
-        return self.ws.create_project("task-a", "用量小助手")
+        return self.ws.create_project("task-a", "用量小助手", icon=PROJECT_ICON)
 
     def row(self, **changes):
         result = {"task_id": "task-a", "day": "2026-10-13", "total_tokens": 100,
@@ -266,10 +267,10 @@ class NotionTests(unittest.TestCase):
         self.assertEqual(self.token_reads, 0)
         self.assertEqual(self.api.calls, [])
 
-    def test_two_database_setup_uses_current_schema_and_shanghai_week(self):
+    def test_three_database_setup_uses_current_schema_and_shanghai_week(self):
         self.ws.setup(PARENT)
         self.assertEqual(self.ws.status()["sync_since"], "2026-10-12")
-        self.assertEqual(len(self.api.databases), 2)
+        self.assertEqual(len(self.api.databases), 3)
         schemas = [d["properties"] for d in self.api.databases.values()]
         project = next(s for s in schemas if "Status" in s)
         self.assertEqual([o["name"] for o in project["Status"]["status"]["options"]],
@@ -283,7 +284,7 @@ class NotionTests(unittest.TestCase):
         self.ws.setup(PARENT)
         dataset = self.ws.status()["dataset_id"]
         self.new_workspace().setup(PARENT)
-        self.assertEqual(len(self.api.databases), 2)
+        self.assertEqual(len(self.api.databases), 3)
         self.assertEqual(self.new_workspace().status()["dataset_id"], dataset)
 
     def test_status_and_metadata_reads_do_not_query_credentials_or_network(self):
@@ -377,7 +378,7 @@ class NotionTests(unittest.TestCase):
     def test_project_query_paginates(self):
         self.ws.setup(PARENT)
         for n in range(5):
-            self.ws.create_project(f"task-{n}", f"项目{n}")
+            self.ws.create_project(f"task-{n}", f"项目{n}", icon=PROJECT_ICON)
         self.api.page_size = 2
         self.assertEqual(len(self.ws.projects(force=True)), 5)
         query_calls = [call for call in self.api.calls if call[2] and call[2].get("start_cursor")]
@@ -503,14 +504,14 @@ class NotionTests(unittest.TestCase):
         self.api.schedule(lambda m, p, b: p == "/databases", TimeoutError("secret"), after=True)
         self.ws.setup(PARENT)
         self.new_workspace().setup(PARENT)
-        self.assertEqual(len(self.api.databases), 2)
+        self.assertEqual(len(self.api.databases), 3)
 
     def test_project_create_timeout_recovers_stable_binding(self):
         self.ws.setup(PARENT)
         self.api.schedule(lambda m, p, b: p == "/pages", TimeoutError("secret"), after=True)
-        meta = self.ws.create_project("task-a", "A")
+        meta = self.ws.create_project("task-a", "A", icon=PROJECT_ICON)
         self.assertEqual(self.ws.status()["bindings"]["task-a"], meta["page_id"])
-        self.assertEqual(self.new_workspace().create_project("task-a", "Renamed")["page_id"], meta["page_id"])
+        self.assertEqual(self.new_workspace().create_project("task-a", "Renamed", icon=PROJECT_ICON)["page_id"], meta["page_id"])
 
     def test_duplicate_remote_key_stops_instead_of_overwriting_arbitrary_page(self):
         self.connect()
@@ -650,6 +651,394 @@ class NotionTests(unittest.TestCase):
         self.assertTrue(self.ws.project_for_task("task-a")["stale"])
         self.assertEqual(len(self.api.calls), calls)
 
+    def task_source(self):
+        if self.ws.config.get("tasks_data_source_id"):
+            return self.ws.config["tasks_data_source_id"]
+        database, source = self.api.uid(), self.api.uid()
+        self.api.databases[database] = {"id": database, "data_sources": [{"id": source}], "properties": {
+            "Project": {"relation": {"data_source_id": self.ws.config["projects_data_source_id"]}},
+            "Status": {"select": {"options": [{"name": value} for value in ns.TASK_KNOWN_STATUSES]}}}}
+        with self.ws._locked():
+            self.ws.config["tasks_data_source_id"] = source
+        return source
+
+    def add_task(self, source, project_id, status, **changes):
+        page_id = self.api.uid()
+        page = {"id": page_id, "parent": {"data_source_id": source}, "properties": {
+            "Project": {"type": "relation", "relation": [{"id": project_id}]},
+            "Status": {"type": "select", "select": {"name": status}}}}
+        page.update(changes)
+        self.api.pages[page_id] = page
+        return page
+
+    def test_project_management_fields_preserve_rich_text_select_and_dates(self):
+        project = self.connect()
+        props = self.api.pages[project["page_id"]]["properties"]
+        props.update({"Goal": {"rich_text": [{"plain_text": "项目"}, {"text": {"content": "目标"}}]},
+            "Weekly Goal": {"rich_text": ns._text("完成第一版")}, "Next Step": {"rich_text": ns._text("验证同步")},
+            "Priority": {"select": {"name": "高"}}, "Health": {"select": {"name": "受阻"}},
+            "Target Date": {"date": {"start": "2026-10-20"}}, "Last Reviewed": {"date": {"start": "2026-10-13T08:00:00Z"}},
+            "Summary": {"rich_text": ns._text("已完成本地实现")}})
+        meta = self.ws.projects(force=True)[0]
+        expected = {"project_goal": "项目目标", "weekly_goal": "完成第一版", "next_step": "验证同步",
+            "project_priority": "高", "project_health": "受阻", "target_date": "2026-10-20",
+            "last_reviewed": "2026-10-13T08:00:00Z", "project_summary": "已完成本地实现"}
+        self.assertEqual({key: meta[key] for key in expected}, expected)
+        self.assertEqual(self.ws.project_for_task("task-a")["project_goal"], "项目目标")
+        self.assertFalse(meta["icon_missing"])
+
+    def test_absent_management_fields_and_tasks_remain_unknown_not_fake_zero(self):
+        self.connect()
+        with self.ws._locked():
+            self.ws.config.pop("tasks_data_source_id", None)
+        meta = self.ws.projects(force=True)[0]
+        self.assertTrue(all(meta[field] is None for field in ns.PROJECT_TEXT_PROPERTIES))
+        self.assertTrue(all(meta[field] is None for field in ns.PROJECT_SELECT_PROPERTIES))
+        self.assertTrue(all(meta[field] is None for field in ns.PROJECT_DATE_PROPERTIES))
+        self.assertTrue(all(meta[field] is None for field in ns.TASK_COUNT_FIELDS))
+
+    def test_existing_project_schema_without_additive_fields_needs_no_cloud_migration(self):
+        self.ws.setup(PARENT)
+        properties = self.api.databases[self.ws.config["projects_database_id"]]["properties"]
+        for name in ns.OPTIONAL_PROJECT_PROPERTIES:
+            properties.pop(name, None)
+        calls = len(self.api.calls)
+        self.ws.setup(PARENT)
+        self.assertTrue(self.ws.status()["ready"])
+        self.assertFalse(any(method == "PATCH" for method, _, _ in self.api.calls[calls:]))
+        self.assertEqual(len(self.api.databases), 3)
+
+    def test_create_requires_valid_icon_before_credentials_or_requests(self):
+        self.ws.setup(PARENT)
+        calls, reads = len(self.api.calls), self.token_reads
+        cases = [None, {}, {"type": "emoji", "emoji": ""}, {"type": "emoji", "emoji": "hello"},
+                 {"type": "emoji", "emoji": "📦📦"}, {"type": "external", "external": {"url": "http://example.com/a.png"}},
+                 {"type": "external", "external": {"url": "https://user:secret@example.com/a.png"}},
+                 {"type": "external", "external": {"url": "https://example.com:bad/a.png"}},
+                 {"type": "external", "external": {"url": "https://example.com/a\n.png"}}]
+        for icon in cases:
+            with self.subTest(icon=icon), self.assertRaises(ns.NotionError) as error:
+                self.ws.create_project("new-task", "新项目", icon=icon)
+            self.assertEqual(error.exception.code, "icon_required")
+        self.assertEqual(len(self.api.calls), calls)
+        self.assertEqual(self.token_reads, reads)
+        self.assertEqual(self.ws.config["bindings"], {})
+
+    def test_project_icon_is_atomic_with_creation_and_not_a_followup_patch(self):
+        self.ws.setup(PARENT)
+        for task, icon in [("emoji", {"type": "emoji", "emoji": "🧑‍💻"}),
+                           ("logo", {"type": "external", "external": {"url": "https://example.com/logo.png"}})]:
+            meta = self.ws.create_project(task, "项目", icon=icon)
+            self.assertEqual(self.api.pages[meta["page_id"]]["icon"], icon)
+            creates = [body for method, url, body in self.api.calls if method == "POST" and url.endswith("/pages")]
+            self.assertEqual(creates[-1]["icon"], icon)
+            self.assertFalse(meta["icon_missing"])
+        self.assertFalse(any(method == "PATCH" for method, _, _ in self.api.calls))
+
+    def test_iconless_bind_refuses_without_mutating_cloud_or_local_binding(self):
+        project = self.connect()
+        page = self.api.pages[project["page_id"]]
+        page["icon"] = None
+        remote = deepcopy(self.api.pages)
+        bindings = deepcopy(self.ws.config["bindings"])
+        calls = len(self.api.calls)
+        with self.assertRaises(ns.NotionError) as error:
+            self.ws.bind("task-b", project["page_id"])
+        self.assertEqual(error.exception.code, "icon_required")
+        self.assertEqual(self.ws.config["bindings"], bindings)
+        self.assertEqual(self.api.pages, remote)
+        self.assertTrue(all(method == "GET" for method, _, _ in self.api.calls[calls:]))
+        self.assertTrue(self.ws.projects(force=True)[0]["icon_missing"])
+
+    def test_optional_tasks_counts_use_project_relations_and_statuses(self):
+        project = self.connect()
+        source = self.task_source()
+        for status in ["待处理", "进行中", "待确认", "阻塞", "已完成", "已完成", "取消"]:
+            self.add_task(source, project["page_id"], status)
+        self.add_task(source, project["page_id"], "阻塞", archived=True)
+        self.add_task(source, str(uuid.UUID(int=900)), "待处理")
+        self.api.page_size = 2
+        calls = len(self.api.calls)
+        meta = self.ws.projects(force=True)[0]
+        self.assertEqual(tuple(meta[field] for field in ns.TASK_COUNT_FIELDS), (4, 1, 2))
+        self.assertTrue(all(not (method == "PATCH" or (method == "POST" and url.endswith("/pages")))
+                            for method, url, _ in self.api.calls[calls:]))
+        self.assertEqual(self.ws.project_for_task("task-a")["open_tasks"], 4)
+
+    def test_successful_empty_tasks_source_is_the_only_way_to_assert_zero_counts(self):
+        self.connect()
+        self.task_source()
+        meta = self.ws.projects(force=True)[0]
+        self.assertEqual(tuple(meta[field] for field in ns.TASK_COUNT_FIELDS), (0, 0, 0))
+
+    def test_tasks_failure_keeps_project_metadata_but_clears_counts_and_explains(self):
+        project = self.connect()
+        source = self.task_source()
+        self.add_task(source, project["page_id"], "阻塞")
+        self.assertEqual(self.ws.projects(force=True)[0]["open_tasks"], 1)
+        for _ in range(3):
+            self.api.schedule(lambda method, path, body: path == f"/data_sources/{source}/query", TimeoutError("private"))
+        meta = self.ws.projects(force=True)[0]
+        self.assertFalse(meta["stale"])
+        self.assertEqual(meta["display_name"], "用量小助手")
+        self.assertTrue(all(meta[field] is None for field in ns.TASK_COUNT_FIELDS))
+        self.assertEqual(self.ws.status()["tasks_error"]["code"], "network_error")
+        self.assertIsNone(self.ws.project_for_task("task-a")["open_tasks"])
+        self.assertEqual(self.ws.projects(force=True)[0]["open_tasks"], 1)
+        self.assertIsNone(self.ws.status()["tasks_error"])
+
+    def test_unknown_or_truncated_task_shape_never_claims_complete_counts(self):
+        project = self.connect()
+        source = self.task_source()
+        page = self.add_task(source, project["page_id"], "不认识的状态")
+        meta = self.ws.projects(force=True)[0]
+        self.assertIsNone(meta["open_tasks"])
+        self.assertEqual(self.ws.status()["tasks_error"]["code"], "schema_mismatch")
+        page["properties"]["Status"]["select"]["name"] = "进行中"
+        page["properties"]["Project"]["has_more"] = True
+        self.assertIsNone(self.ws.projects(force=True)[0]["open_tasks"])
+
+    def test_management_cache_is_read_only_and_expiration_clears_task_counts(self):
+        project = self.connect()
+        source = self.task_source()
+        self.add_task(source, project["page_id"], "进行中")
+        self.ws.projects(force=True)
+        calls, reads = len(self.api.calls), self.token_reads
+        fresh = self.ws.cached_projects()[0]
+        self.assertEqual(fresh["open_tasks"], 1)
+        self.time += timedelta(minutes=11)
+        stale = self.ws.cached_projects()[0]
+        self.assertTrue(stale["stale"])
+        self.assertIsNone(stale["open_tasks"])
+        self.assertEqual(len(self.api.calls), calls)
+        self.assertEqual(self.token_reads, reads)
+
+    def test_empty_wrong_tasks_source_schema_cannot_report_zero(self):
+        self.connect()
+        source = self.task_source()
+        database = next(db for db in self.api.databases.values() if db["data_sources"][0]["id"] == source)
+        database["properties"]["Project"]["relation"]["data_source_id"] = str(uuid.UUID(int=999))
+        meta = self.ws.projects(force=True)[0]
+        self.assertTrue(all(meta[field] is None for field in ns.TASK_COUNT_FIELDS))
+        self.assertEqual(self.ws.status()["tasks_error"]["code"], "schema_mismatch")
+
+    def test_task_rate_limit_defers_subsequent_requests_without_marking_false_zero(self):
+        self.connect()
+        source = self.task_source()
+        self.api.schedule(lambda method, path, body: path == f"/data_sources/{source}/query",
+                          (429, {"Retry-After": "120"}, {}))
+        meta = self.ws.projects(force=True)[0]
+        self.assertIsNone(meta["open_tasks"])
+        self.assertEqual(self.ws.status()["tasks_error"]["code"], "rate_limited")
+        calls = len(self.api.calls)
+        self.ws.projects(force=True)
+        self.assertEqual(len(self.api.calls), calls)
+        self.assertEqual(self.sleeps, [])
+
+    def test_blocked_task_request_pauses_background_without_cloud_writes(self):
+        self.connect()
+        source = self.task_source()
+        self.api.schedule(lambda method, path, body: path == f"/data_sources/{source}/query",
+                          (429, {}, {"additional_data": {"rate_limit_reason": "public_api_request_blocked"}}))
+        meta = self.ws.projects(force=True)[0]
+        self.assertIsNone(meta["open_tasks"])
+        self.assertTrue(self.ws.status()["automatic_sync_paused"])
+        calls = len(self.api.calls)
+        self.time += timedelta(minutes=6)
+        self.ws.projects()
+        self.assertEqual(len(self.api.calls), calls)
+
+    def test_invalid_rich_text_parts_are_ignored_without_breaking_project_metadata(self):
+        project = self.connect()
+        self.api.pages[project["page_id"]]["properties"]["Goal"] = {"rich_text": [
+            {"plain_text": None, "text": {"content": "有效目标"}}, {"plain_text": 12}, {"text": "invalid"}, None]}
+        self.assertEqual(self.ws.projects(force=True)[0]["project_goal"], "有效目标")
+
+    def test_fresh_bootstrap_builds_management_tasks_schema_and_reports_urls(self):
+        self.ws.setup(PARENT)
+        tasks = self.api.databases[self.ws.config["tasks_database_id"]]["properties"]
+        self.assertEqual(set(tasks), {"Name", "Project", "Status", "Priority", "Managed By", "Due", "Evidence", "Acceptance"})
+        self.assertEqual([value["name"] for value in tasks["Status"]["select"]["options"]],
+                         ["待处理", "进行中", "待确认", "阻塞", "已完成", "取消"])
+        self.assertEqual(tasks["Project"]["relation"]["data_source_id"], self.ws.config["projects_data_source_id"])
+        self.assertEqual([value["name"] for value in tasks["Priority"]["select"]["options"]], ["高", "中", "低"])
+        self.assertEqual([value["name"] for value in tasks["Managed By"]["select"]["options"]], ["AI", "人类确认"])
+        self.assertTrue(self.ws.status()["tasks_url"].startswith("https://"))
+        project = self.api.databases[self.ws.config["projects_database_id"]]["properties"]
+        self.assertTrue(ns.OPTIONAL_PROJECT_PROPERTIES <= project.keys())
+
+    def test_tasks_create_timeout_recovers_without_a_fourth_database(self):
+        self.api.schedule(lambda method, path, body: method == "POST" and path == "/databases"
+                          and ns._plain(body["title"]) == "任务 Tasks", TimeoutError("private"), after=True)
+        self.ws.setup(PARENT)
+        source = self.ws.config["tasks_data_source_id"]
+        self.new_workspace().setup(PARENT)
+        self.assertEqual(len(self.api.databases), 3)
+        self.assertEqual(self.ws.config["tasks_data_source_id"], source)
+        creates = [body for method, url, body in self.api.calls if method == "POST" and url.endswith("/databases")
+                   and ns._plain(body["title"]) == "任务 Tasks"]
+        self.assertEqual(len(creates), 1)
+
+    def test_manually_selected_legacy_tasks_source_is_preserved_by_setup(self):
+        self.ws.setup(PARENT)
+        original = self.ws.config["tasks_data_source_id"]
+        with self.ws._locked():
+            self.ws.config.pop("tasks_database_id")
+        calls = len(self.api.calls)
+        self.ws.setup(PARENT)
+        self.assertEqual(self.ws.config["tasks_data_source_id"], original)
+        self.assertEqual(len(self.api.databases), 3)
+        self.assertFalse(any(method == "POST" and url.endswith("/databases") for method, url, _ in self.api.calls[calls:]))
+
+    def test_legacy_tasks_schema_extra_fields_optional_and_relation_checked(self):
+        self.ws.setup(PARENT)
+        database = self.api.databases[self.ws.config["tasks_database_id"]]
+        for name in ns.OPTIONAL_TASK_PROPERTIES:
+            database["properties"].pop(name, None)
+        calls = len(self.api.calls)
+        self.ws.setup(PARENT)
+        self.assertTrue(self.ws.status()["ready"])
+        self.assertFalse(any(method == "PATCH" for method, _, _ in self.api.calls[calls:]))
+        database["properties"]["Project"]["relation"]["data_source_id"] = str(uuid.UUID(int=999))
+        with self.assertRaises(ns.NotionError) as error:
+            self.ws.setup(PARENT)
+        self.assertEqual(error.exception.code, "schema_mismatch")
+
+    def test_old_two_database_workspace_adds_only_tasks_and_preserves_old_ids(self):
+        self.ws.setup(PARENT)
+        project_id = self.ws.config["projects_database_id"]
+        usage_id = self.ws.config["usage_database_id"]
+        task_id = self.ws.config["tasks_database_id"]
+        self.api.databases.pop(task_id)
+        with self.ws._locked():
+            for key in ("tasks_database_id", "tasks_data_source_id", "tasks_url"):
+                self.ws.config.pop(key, None)
+        for name in ns.OPTIONAL_PROJECT_PROPERTIES:
+            self.api.databases[project_id]["properties"].pop(name, None)
+        calls = len(self.api.calls)
+        self.ws.setup(PARENT)
+        self.assertEqual((self.ws.config["projects_database_id"], self.ws.config["usage_database_id"]), (project_id, usage_id))
+        self.assertEqual(len(self.api.databases), 3)
+        creates = [body for method, url, body in self.api.calls[calls:] if method == "POST" and url.endswith("/databases")]
+        self.assertEqual([ns._plain(body["title"]) for body in creates], ["任务 Tasks"])
+        self.assertFalse(any(method == "PATCH" for method, _, _ in self.api.calls[calls:]))
+
+    def test_uncertain_tasks_create_without_visible_commit_stays_frozen_on_restart(self):
+        self.api.schedule(lambda method, path, body: method == "POST" and path == "/databases"
+                          and ns._plain(body["title"]) == "任务 Tasks", TimeoutError("private"))
+        with self.assertRaises(ns.NotionError) as error:
+            self.ws.setup(PARENT)
+        self.assertEqual(error.exception.code, "write_uncertain")
+        with self.assertRaises(ns.NotionError) as retry:
+            self.new_workspace().setup(PARENT)
+        self.assertEqual(retry.exception.code, "write_uncertain")
+        creates = [body for method, url, body in self.api.calls if method == "POST" and url.endswith("/databases")
+                   and ns._plain(body["title"]) == "任务 Tasks"]
+        self.assertEqual(len(creates), 1)
+
+    def test_manual_progress_priority_and_tasks_fallback_have_explicit_source(self):
+        project = self.connect(); source = self.task_source()
+        for _ in range(6): self.add_task(source, project["page_id"], "已完成")
+        self.add_task(source, project["page_id"], "待确认")
+        page = self.api.pages[project["page_id"]]
+        page["properties"]["Development Progress"] = {"number": 35}
+        manual = self.ws.projects(force=True)[0]
+        self.assertEqual((manual["development_progress"], manual["progress_source"]), (35, "manual"))
+        for invalid in [None, -1, 101, True, float('nan')]:
+            page["properties"]["Development Progress"] = {"number": invalid}
+            result = self.ws.projects(force=True)[0]
+            self.assertEqual(result["progress_source"], "tasks")
+            self.assertAlmostEqual(result["development_progress"], 600/7)
+
+    def test_stale_task_progress_clears_while_manual_last_known_progress_is_marked_stale(self):
+        project = self.connect(); source = self.task_source()
+        self.add_task(source, project["page_id"], "已完成")
+        self.ws.projects(force=True)
+        self.time += timedelta(minutes=11)
+        stale = self.ws.project_for_task("task-a")
+        self.assertTrue(stale["stale"])
+        self.assertIsNone(stale["development_progress"])
+        self.assertIsNone(stale["progress_source"])
+        self.api.pages[project["page_id"]]["properties"]["Development Progress"] = {"number": 50}
+        self.ws.projects(force=True)
+        self.time += timedelta(minutes=11)
+        manual = self.ws.cached_projects()[0]
+        self.assertTrue(manual["stale"])
+        self.assertEqual((manual["development_progress"], manual["progress_source"]), (50, "manual"))
+
+    def test_daily_sync_verification_preserves_fresh_task_counts_and_observation_time(self):
+        project = self.connect(); source = self.task_source()
+        for _ in range(8): self.add_task(source, project["page_id"], "已完成")
+        for _ in range(3): self.add_task(source, project["page_id"], "待确认")
+        observed = self.ws.projects(force=True)[0]["fetched_at"]
+        self.time += timedelta(seconds=47)
+        self.api.pages[project["page_id"]]["properties"]["Next Step"] = {"rich_text": ns._text("审阅同步结果")}
+        calls = len(self.api.calls)
+        result = self.ws.sync([self.row()], force=False)
+        self.assertEqual(result["changed"], 1)
+        self.assertIsNone(result["error"])
+        cached = self.ws.project_for_task("task-a")
+        self.assertEqual([cached[field] for field in ns.TASK_COUNT_FIELDS], [3, 0, 8])
+        self.assertEqual(cached["fetched_at"], observed)
+        self.assertEqual(cached["next_step"], "审阅同步结果")
+        self.assertEqual(cached["progress_source"], "tasks")
+        self.assertAlmostEqual(cached["development_progress"], 800/11)
+        self.assertFalse(any(url.endswith(f"/data_sources/{source}/query")
+                             for _, url, _ in self.api.calls[calls:]))
+        self.assertEqual(self.ws.cached_projects()[0]["completed_tasks"], 8)
+
+    def test_bind_verification_does_not_extend_task_count_ttl(self):
+        project = self.connect(); source = self.task_source()
+        self.add_task(source, project["page_id"], "已完成")
+        self.add_task(source, project["page_id"], "待确认")
+        observed = self.ws.projects(force=True)[0]["fetched_at"]
+        for seconds in (300, 590):
+            self.time = NOW + timedelta(seconds=seconds)
+            bound = self.ws.bind("task-b", project["page_id"])
+            self.assertEqual(bound["fetched_at"], observed)
+            self.assertEqual(bound["development_progress"], 50)
+            self.assertFalse(self.ws.project_for_task("task-b")["stale"])
+        self.time = NOW + timedelta(seconds=600)
+        expired = self.ws.bind("task-b", project["page_id"])
+        self.assertEqual(expired["fetched_at"], observed)
+        self.assertTrue(all(expired[field] is None for field in ns.TASK_COUNT_FIELDS))
+        self.assertIsNone(expired["development_progress"])
+        self.assertTrue(self.ws.project_for_task("task-b")["stale"])
+        refreshed = self.ws.projects(force=True)[0]
+        self.assertEqual(refreshed["fetched_at"], self.time.isoformat())
+        self.assertEqual(refreshed["development_progress"], 50)
+
+    def test_project_verification_rejects_partial_error_stale_or_different_page_task_cache(self):
+        project = self.connect(); source = self.task_source()
+        self.add_task(source, project["page_id"], "已完成")
+        self.add_task(source, project["page_id"], "进行中")
+        fresh = self.ws.projects(force=True)[0]
+        cases = [({"open_tasks": None}, {}), ({"blocked_tasks": True}, {}),
+                 ({"completed_tasks": -1}, {}), ({"stale": True}, {}),
+                 ({"available": False}, {}), ({"fetched_at": None}, {}),
+                 ({"page_id": str(uuid.UUID(int=9999))}, {}),
+                 ({}, {"projects_error": {"code": "network_error"}}),
+                 ({}, {"tasks_error": {"code": "network_error"}})]
+        for fields, errors in cases:
+            with self.subTest(fields=fields, errors=errors):
+                with self.ws._locked():
+                    self.ws.state["projects"][project["page_id"]] = {**fresh, **fields}
+                    self.ws.state.pop("projects_error", None)
+                    self.ws.state.pop("tasks_error", None)
+                    self.ws.state.update(errors)
+                    result = self.ws._verify_project(project["page_id"])
+                self.assertTrue(all(result[field] is None for field in ns.TASK_COUNT_FIELDS))
+                self.assertIsNone(result["development_progress"])
+
+    def test_project_verification_uses_current_manual_progress_over_preserved_task_counts(self):
+        project = self.connect(); source = self.task_source()
+        self.add_task(source, project["page_id"], "已完成")
+        self.ws.projects(force=True)
+        self.api.pages[project["page_id"]]["properties"]["Development Progress"] = {"number": 0}
+        bound = self.ws.bind("task-b", project["page_id"])
+        self.assertEqual(bound["completed_tasks"], 1)
+        self.assertEqual((bound["development_progress"], bound["progress_source"]), (0, "manual"))
+
     def test_keychain_lookup_is_scoped_to_only_this_application_item(self):
         from types import SimpleNamespace
         with patch.object(sys, "platform", "darwin"), patch.object(ns.subprocess, "run", return_value=
@@ -663,7 +1052,7 @@ class NotionTests(unittest.TestCase):
         self.ws.setup(PARENT)
         self.assertEqual(self.token_reads, 1)
         self.assertIsNone(self.ws._active_token)
-        self.ws.create_project("task-a", "A")
+        self.ws.create_project("task-a", "A", icon=PROJECT_ICON)
         self.assertEqual(self.token_reads, 2)
         self.ws.sync([self.row()], force=True)
         self.assertEqual(self.token_reads, 3)

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from project_store import ProjectRegistry, aggregate, project_location, remember_daily, split_small
+from project_store import ProjectRegistry, aggregate, project_location, remember_daily, split_small, management_projects, PROJECT_MANAGEMENT_FIELDS, project_progress
 
 
 COUNT_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
@@ -274,6 +274,121 @@ class ProjectStoreTests(unittest.TestCase):
         self.assertEqual(stored_two[0]["total_tokens"], 40)
         with sqlite3.connect(path) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM summaries").fetchone()[0], 2)
+
+    def test_management_metadata_is_additive_and_never_enters_daily_payload(self):
+        path = self.tasks / "alpha"
+        task_id = self.registry.identify("folder:" + str(path), "alpha")
+        meta = {"page_id": "page-one", "display_name": "管理项目", "status": "开发中", "icon_missing": False,
+                "project_goal": "完成产品", "weekly_goal": "验证第一版", "next_step": "验收",
+                "project_priority": "高", "project_health": "正常", "target_date": "2026-10-20",
+                "last_reviewed": "2026-10-13", "project_summary": "本周已推进", "open_tasks": 4,
+                "blocked_tasks": 1, "completed_tasks": 2}
+        source = fact(path, 100, ["session"])
+        weekly, daily, _ = aggregate(report([source], [{**source, "day": "2026-10-13"}]),
+                                     self.tasks, self.registry, {task_id: meta})
+        for field in PROJECT_MANAGEMENT_FIELDS:
+            self.assertEqual(weekly[0][field], meta[field])
+            self.assertNotIn(field, daily[0])
+        self.assertEqual(weekly[0]["total_tokens"], 100)
+        self.assertEqual(weekly[0]["percent"], 100)
+
+    def test_management_project_without_usage_is_not_added_to_accounting_totals(self):
+        usage = [{"task_id": "notion:used", "name": "used", "total_tokens": 100, "percent": 100,
+                  "sessions_count": 2, "request_records": 1, "task_ids": ["local-used"]}]
+        before = json.dumps(usage, sort_keys=True)
+        pages = [{"page_id": "used", "display_name": "有用量", "status": "开发中", "project_priority": "中"},
+                 {"page_id": "zero", "display_name": "本周没用", "status": "开发中", "project_priority": "高"},
+                 {"page_id": "unbound", "display_name": "云端项目", "status": "计划中"}]
+        rows = management_projects(pages, usage, {"local-used": "used", "local-zero": "zero"})
+        self.assertEqual([row["task_id"] for row in rows], ["notion:zero", "notion:used", "notion:unbound"])
+        zero = rows[0]
+        self.assertTrue(zero["usage_linked"])
+        self.assertEqual((zero["total_tokens"], zero["sessions_count"]), (0, 0))
+        unbound = rows[2]
+        self.assertFalse(unbound["usage_linked"])
+        self.assertIsNone(unbound["sessions_count"])
+        self.assertEqual(json.dumps(usage, sort_keys=True), before)
+        self.assertEqual(sum(row["total_tokens"] for row in usage), 100)
+        self.assertEqual(usage[0]["percent"], 100)
+
+    def test_management_sort_uses_status_priority_and_stable_identity_not_token_rank(self):
+        pages = [{"page_id": "z", "display_name": "发布", "status": "已发布", "project_priority": "高"},
+                 {"page_id": "b", "display_name": "同名", "status": "开发中", "project_priority": "低"},
+                 {"page_id": "a", "display_name": "同名", "status": "开发中", "project_priority": "低"},
+                 {"page_id": "p", "display_name": "计划", "status": "计划中", "project_priority": "高"},
+                 {"page_id": "h", "display_name": "重点", "status": "开发中", "project_priority": "高"}]
+        rows = management_projects(pages, [], {})
+        self.assertEqual([row["task_id"] for row in rows], ["notion:p", "notion:h", "notion:a", "notion:b", "notion:z"])
+        self.assertTrue(all(row["total_tokens"] == 0 for row in rows))
+
+    def test_archived_missing_and_paused_management_projects_do_not_appear_with_active_work(self):
+        pages = [{"page_id": "active", "display_name": "开发", "status": "开发中"},
+                 {"page_id": "paused", "display_name": "暂停", "status": "暂停"},
+                 {"page_id": "archive", "display_name": "归档", "status": "归档"},
+                 {"page_id": "missing", "display_name": "已删除", "status": "开发中", "available": False}]
+        self.assertEqual([row["task_id"] for row in management_projects(pages, [], {})], ["notion:active"])
+        self.assertEqual([row["task_id"] for row in management_projects(pages[1:], [], {})], ["notion:paused"])
+
+    def test_multiple_bound_folders_do_not_duplicate_management_page_or_usage(self):
+        usage = [{"task_id": "notion:shared", "name": "local-a", "display_name": "管理项目",
+                  "total_tokens": 100, "percent": 100, "request_records": 2, "sessions_count": 3,
+                  "task_ids": ["local-a", "local-b"]}]
+        rows = management_projects([{"page_id": "shared", "display_name": "改名后项目", "status": "开发中"}],
+                                   usage, {"local-a": "shared", "local-b": "shared"})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["display_name"], "改名后项目")
+        self.assertEqual((rows[0]["total_tokens"], rows[0]["sessions_count"]), (100, 3))
+        self.assertTrue(rows[0]["usage_linked"])
+
+    def test_invalid_cached_management_field_types_do_not_break_usage_decoding(self):
+        path = self.tasks / "alpha"
+        task_id = self.registry.identify("folder:" + str(path), "alpha")
+        metadata = {task_id: {"page_id": "page", "project_goal": {"unexpected": "shape"},
+                             "open_tasks": True, "blocked_tasks": -1, "completed_tasks": "2"}}
+        weekly, _, _ = aggregate(report([fact(path, 100, ["s"])]), self.tasks, self.registry, metadata)
+        self.assertEqual(weekly[0]["total_tokens"], 100)
+        self.assertEqual(weekly[0]["percent"], 100)
+        self.assertTrue(all(weekly[0][field] is None for field in ("project_goal", "open_tasks", "blocked_tasks", "completed_tasks")))
+
+    def test_today_uses_shanghai_cutoff_and_internal_daily_date_without_changing_week(self):
+        path = self.tasks / "alpha"
+        payload = report([fact(path, 100, ["s"])], [fact(path, 40, ["s"], day="2026-10-13"), fact(path, 60, ["s"], day="2026-10-14")])
+        payload["range"]["until_exclusive"] = "2026-10-13T16:05:00Z"
+        weekly, daily, _ = aggregate(payload, self.tasks, self.registry)
+        self.assertEqual((weekly[0]["total_tokens"], weekly[0]["today_tokens"], weekly[0]["percent"]), (100, 60, 100))
+        self.assertEqual(sum(row["total_tokens"] for row in daily), 100)
+        self.assertTrue(all("today_tokens" not in row for row in daily))
+
+    def test_today_merges_multiple_folders_of_same_notion_project_once(self):
+        a, b = self.tasks / "a", self.tasks / "b"
+        metadata = {self.registry.identify("folder:" + str(path), path.name): {"page_id": "shared", "display_name": "项目"} for path in (a, b)}
+        payload = report([fact(a, 60, ["a"]), fact(b, 40, ["b"])], [fact(a, 20, ["a"], day="2026-10-13"), fact(b, 40, ["b"], day="2026-10-13")])
+        weekly, _, _ = aggregate(payload, self.tasks, self.registry, metadata)
+        self.assertEqual(len(weekly), 1)
+        self.assertEqual((weekly[0]["total_tokens"], weekly[0]["today_tokens"]), (100, 60))
+
+    def test_absent_daily_coverage_keeps_today_unknown_and_managed_unbound_unknown(self):
+        payload = report([fact(self.tasks / "a", 100, ["s"])])
+        payload.pop("project_daily")
+        weekly, _, _ = aggregate(payload, self.tasks, self.registry)
+        self.assertIsNone(weekly[0]["today_tokens"])
+        rows = management_projects([{"page_id": "bound", "display_name": "绑定"}, {"page_id": "unbound", "display_name": "未绑定"}], [], {"local": "bound"})
+        mapped = {row["task_id"]: row for row in rows}
+        self.assertEqual(mapped["notion:bound"]["today_tokens"], 0)
+        self.assertIsNone(mapped["notion:unbound"]["today_tokens"])
+        unavailable = management_projects([{"page_id": "bound", "display_name": "绑定"}], [], {"local": "bound"}, today_known=False)
+        self.assertIsNone(unavailable[0]["today_tokens"])
+
+    def test_manual_progress_wins_and_action_progress_never_double_counts_blocked(self):
+        self.assertEqual(project_progress({"development_progress": 0, "progress_source": "manual", "open_tasks": 1, "completed_tasks": 6}), {"development_progress": 0.0, "progress_source": "manual"})
+        derived = project_progress({"open_tasks": 1, "blocked_tasks": 1, "completed_tasks": 6})
+        self.assertAlmostEqual(derived["development_progress"], 600/7)
+        self.assertEqual(derived["progress_source"], "tasks")
+        for value in [None, True, -1, 101, float('nan'), float('inf'), 10**400]:
+            with self.subTest(value=str(value)):
+                self.assertEqual(project_progress({"development_progress": value, "progress_source": "manual"}), {"development_progress": None, "progress_source": None})
+        for counts in [{}, {"open_tasks": 0, "completed_tasks": 0}, {"open_tasks": None, "completed_tasks": 6}]:
+            self.assertIsNone(project_progress(counts)["development_progress"])
 
     def test_empty_report_keeps_zero_and_does_not_invent_notion_projects(self):
         weekly, daily, sources = aggregate(report([]), self.tasks, self.registry)
