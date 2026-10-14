@@ -119,6 +119,52 @@ class UsageScannerTests(unittest.TestCase):
     def project_rows(self, report):
         return {row["project"]: row for row in report["projects"]}
 
+    def test_accepted_event_sink_shares_exact_counting_path_and_whitelist(self):
+        rows = [
+            session("s", self.project_a), turn("t", self.project_a),
+            legacy("2026-10-01T01:00:00Z", usage(100, 10, total=120)),
+            legacy("2026-10-02T01:00:00Z", usage(140, 20, total=175)),
+            request("2026-10-02T02:00:00Z", "s", "t", "r", usage(10, 5, total=18)),
+            legacy("2026-10-02T03:00:00Z", usage(150, 25, total=193)),
+            event("2026-10-02T03:01:00Z", "thread_token_usage", {"usage": usage(999)}),
+            event("2026-10-02T03:02:00Z", "response_item", {"content": "PRIVATE LOG TEXT"}),
+        ]
+        self.write_log("original.jsonl", rows)
+        self.write_log("archive.jsonl", rows, archived=True)
+        bounds = {"since": datetime(2026, 10, 2, tzinfo=timezone.utc),
+                  "until": datetime(2026, 10, 3, tzinfo=timezone.utc)}
+        observed = []
+        with_sink = self.scan(**bounds, accepted_event_sink=observed.append)
+        without_sink = self.scan(**bounds)
+        with_sink.pop("generated_at")
+        without_sink.pop("generated_at")
+        self.assertEqual(with_sink, without_sink)
+        self.assertEqual([row["kind"] for row in observed], ["legacy", "response"])
+        self.assertEqual([row["counts"]["total_tokens"] for row in observed], [55, 18])
+        allowed = {"timestamp", "thread_id", "cwd", "project", "model",
+                   "response_id", "kind", "counts", "missing_fields"}
+        for row in observed:
+            self.assertEqual(set(row), allowed)
+        for field in TOKEN_FIELDS + ("request_records", "legacy_updates"):
+            self.assertEqual(sum(row["counts"][field] for row in observed),
+                             with_sink["totals"][field], field)
+        self.assertNotIn("PRIVATE LOG TEXT", json.dumps(observed))
+
+    def test_accepted_event_sink_cannot_mutate_scanner_counts(self):
+        self.write_log("response.jsonl", [
+            session("s", self.project_a), turn("t", self.project_a),
+            request("2026-10-01T01:00:00Z", "s", "t", "r", usage(10, 5, total=18)),
+        ])
+        def mutate(fact):
+            fact["counts"]["total_tokens"] = 99999
+            fact["missing_fields"].append("total_tokens")
+            fact["cwd"] = "changed"
+        report = self.scan(accepted_event_sink=mutate)
+        self.assertEqual(report["totals"]["total_tokens"], 18)
+        self.assertEqual(report["projects"][0]["total_tokens"], 18)
+        self.assertEqual(report["coverage"]["missing_fields"], {})
+        self.assertEqual(report["projects"][0]["project"], str(self.project_a.resolve()))
+
     def assert_project_daily_consistent(self, report):
         rows = report["project_daily"]
         fields = TOKEN_FIELDS + ("request_records", "legacy_updates")

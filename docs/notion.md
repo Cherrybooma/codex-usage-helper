@@ -94,7 +94,7 @@ Events 按同项目单写者顺序维护，创建后按 Event Key 复查。该�
 | 属性 | 含义 |
 | --- | --- |
 | Name / Project / Day / Provider | 日期、项目关系与固定来源 Codex |
-| Included / Counted Tokens | 当前绑定是否有效，以及当前可汇总的 Token；周／月统计使用此列 |
+| Included / Counted Tokens | 当前绑定是否有效，以及当前可汇总的 Token；项目日摘要汇总使用此列 |
 | Total Tokens | 原始记录的总数规则；不再把缓存输入和推理输出加一次 |
 | Input Tokens / Output Tokens | 输入、输出细分 |
 | Cached Input Tokens / Cache Write Input Tokens / Reasoning Output Tokens | 原始计量中的细分项，不额外加入总数 |
@@ -105,9 +105,9 @@ Events 按同项目单写者顺序维护，创建后按 Event Key 复查。该�
 | Statistics Until / Statistics Until ISO / Synced At | 统计截止日期、精确 UTC 文本与最后一次实际写入时间；日期属性在部分连接中只有分钟精度 |
 | Dataset / Summary Key / Schema Version | 匿名来源数据集、唯一摘要键与结构版本 |
 
-周／月汇总使用 `Counted Tokens`，或过滤 `Included = true`。`Total Tokens` 保留该条观测的原数值。改绑到另一项目后，完整来源快照还会核对服务端已存在记录，本地同步状态丢失或通过插件创建的初始记录也能正确处理。旧分配会取消 Included 并将 Counted Tokens 置零，原数值保留审计；新分配使用同样的单次用量。重新绑定回原页面可以恢复该分配，不能把两边都当成新的消耗。远端更新没有跨行事务，同步失败时云端可能暂时不完整；本地统计和队列保留。
+项目日摘要汇总使用 `Counted Tokens`，或过滤 `Included = true`；精确到续费时刻的月账期使用下文的独立周期账本，不能从日摘要猜边界。`Total Tokens` 保留该条观测的原数值。改绑到另一项目后，完整来源快照还会核对服务端已存在记录，本地同步状态丢失或通过插件创建的初始记录也能正确处理。旧分配会取消 Included 并将 Counted Tokens 置零，原数值保留审计；新分配使用同样的单次用量。重新绑定回原页面可以恢复该分配，不能把两边都当成新的消耗。远端更新没有跨行事务，同步失败时云端可能暂时不完整；本地统计和队列保留。
 
-“按周记录、按月核算”是已提出的需求，周期边界尚未确定。现有桌面本周继续使用上海自然周，官方额度仍按返回的当前窗口独立显示。自然周与额度重置周期、自然月与订阅账期的选择仍待讨论，月核算尚未实现；不能擅自更改历史分组、把一个月当四周、从重置日猜充值日，或假设每周固定发放多少 Token。候选方案见 [周期讨论](project-management.md#周记录与月核算待确认周期)。
+已确认采用上海自然周记录、按实际官方窗口记录额度、按经确认的会员续费账期核算月投入。周与月重分组同一份已接受事件，不相加；月度需填写实际续费锚点，未知时保持待配置。周期规则、日期精度与历史推算范围见 [周期核算说明](period-proposal.md)。
 
 一条摘要的身份为“匿名来源数据集 × Notion 项目页面 ID × 上海日期 × Codex”。同一项目当天再次扫描时替换原有绝对数值，不将前后两次扫描值相加。不同 Codex home/来源数据集的摘要不会互相覆盖；后续多设备汇总仍需解决重复日志问题，当前不宣称已完成跨设备去重。
 
@@ -120,7 +120,41 @@ Events 按同项目单写者顺序维护，创建后按 Event Key 复查。该�
 - “本机当前保留记录；不代表完整账户用量或最终账单”。
 - “包含此前已观测摘要；部分历史本次未重新复算，不是当前保留记录的全量统计”。
 
-原始日志、代码、对话、工具输出、线程 ID、响应 ID 和绝对本地路径都不上传。上传项目名称仅发生在用户明确创建项目时。Notion 官方额度不写入每日 Token 摘要，不能从本地 Token 倒推出订阅剩余百分比。
+原始日志、代码、对话、工具输出、线程 ID、响应 ID 和绝对本地路径都不上传。创建项目会上传已确认名称；配置独立周期页后，还会同步简短的项目／模型汇总名称。官方额度单独写入额度窗口，不写入每日 Token 摘要，不能从本地 Token 倒推出订阅剩余百分比。
+
+## 独立周期与额度页面
+
+周期核算使用单独的「周期与额度」页面，作为独立入口，不放入某个具体项目工作台。页面包含两个数据库，均没有 `Project` 关系；具体项目首页继续只展示自身投入与管理信息。
+
+| 数据库 | 记录内容 |
+| --- | --- |
+| 周期账本 | 自然周、会员月度，起止时刻与统计截止、Token 细分、去重会话数、项目／模型摘要、质量与覆盖范围 |
+| 额度窗口 | 5 小时或周额度的实际窗口，末次已用／剩余、观测时间与数量、重置分类、观测缺口与估算说明 |
+
+两库共用 `State`（进行中／已结束）、`Included`、`Period Key`、匿名 `Dataset`、`Quality`、`Coverage` 和 `Data Scope`。日期属性另存精确 `Start ISO`、`End ISO` 与 `Statistics Until ISO`；不依赖可能只有分钟精度的 Notion 日期显示。周期库的 `Schedule` 区分月账期方案；正常汇总使用 `Counted Tokens`，并分别筛选自然周或会员月，不能跨类型相加。额度百分比保留末次观测含义，不跨窗口求和为余额。
+
+修改续费锚点后，新方案重新核算，旧方案保留审计，取消 `Included` 并将 `Counted Tokens` 归零。未配置锚点不会补造月记录，也不会删除此前历史。默认同步当前及此前共 12 个自然周／会员月，额度为当前与最近 30 个结束窗口；这是有限视图，未出现在本次列表中的更早云端记录继续保留。
+
+在 Notion 新建独立页面并共享给当前 Integration 后，可以显式建立／复用两库。此开发接口会连接 Notion，复用已有凭据配置，不在代码中填写 Token：
+
+```python
+from pathlib import Path
+from widget.period_notion import PeriodNotionWorkspace
+
+periods = PeriodNotionWorkspace(Path("widget/data"))
+periods.setup("自己新建的周期与额度页面链接")
+```
+
+周期页面与数据源保持固定，避免重新连接时在其他位置误建另一套账本。配置保存 `accounting_page_url`，应用菜单「周期核算…」可打开页面；`PeriodNotionWorkspace.cached_status()` 只读本机，返回 `accounting_url` 和周期同步状态。只做本地核算不需要 Notion 连接：
+
+```sh
+mkdir -p validation
+python3 widget/widget_backend.py --accounting-summary --output validation/accounting.json
+# 已启用同步并完成页面配置后，同步项目日摘要与独立周期摘要：
+python3 widget/widget_backend.py --sync-notion --force-sync
+```
+
+周期写入使用绝对快照替换和稳定周期键。较旧扫描不能覆盖较新记录；已结束周期仅重放截止时间变化时不重复写入，进行中周期的统计截止推进或新的额度观测会更新摘要。周期错误独立于项目日摘要处理。局部历史列表不作为完整账户历史声明，不能因为某条历史退出列表就停计；月锚点切换的旧方案停计则单独处理。重试、待确认创建与本机同步开关沿用下文规则。
 
 ## 离线、重试和写入不确定
 
@@ -199,7 +233,7 @@ stdin 命令为 `status`、`projects`、`setup`、`bind`、`unbind`、`create_pr
 测试命令：
 
 ```sh
-python3 -m unittest -v widget/test_notion_sync.py widget/test_notion_credentials.py
+python3 -m unittest -v widget/test_notion_sync.py widget/test_notion_credentials.py widget/test_period_notion.py
 ```
 
 ## 官方 API 依据

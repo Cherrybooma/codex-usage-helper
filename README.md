@@ -18,9 +18,10 @@
 - **三种展示方式**：顶部横条、右侧竖条、桌面小框分别开关，也可以同时开启。默认在桌面层，普通窗口可以盖住它。
 - **额度详情**：通过官方 Codex app-server 的只读接口读取当前窗口剩余百分比及重置时间；保存观测后显示本周已记录累计和超额情况。
 - **关联的项目与账本**：Notion 项目作为管理入口；本机把绑定项目的每日用量摘要写入关联账本，离线保留项目缓存和本地统计。
+- **独立周期核算**：按上海自然周记录、按确认的会员续费账期核算月投入；Notion「周期与额度」页面单独保存周期账本与真实额度窗口，不放进具体项目管理。
 - **终端与导出**：按项目、会话、模型、日期汇总，并输出完整 JSON。
 
-日志扫描和计量在本机进行。启用 Notion 后，只有绑定项目的日期、计数、关系和统计质量摘要会发送到指定工作区；原始日志不会上传。组件读取官方额度时会使用官方客户端的账户连接，但不会把会话日志、项目目录或统计报告发送给它。
+日志扫描和计量在本机进行。启用 Notion 后，绑定项目的每日摘要和已配置独立周期页的计数、项目／模型汇总、额度观测与统计质量会发送到指定工作区；原始日志不会上传。组件读取官方额度时会使用官方客户端的账户连接，但不会把会话日志、项目目录或统计报告发送给它。
 
 AI 管理通过 [notion-project-workbench 技能](skills/notion-project-workbench/SKILL.md)在获授权的任务中维护项目与行动项，每次实际推进追加带时间、结果、证据和任务关系的 Events。尚未配置持续运行的 Notion Custom Agent。桌面后台只刷新管理信息缓存、计量并同步用量，不根据 Token 自动判断项目进度或完成情况。首页结构、管理约定及官方参考见 [项目管理说明](docs/project-management.md)。
 
@@ -89,6 +90,7 @@ Windows 可将 `python3` 替换为 `py -3`。优先使用 `CODEX_HOME`，否则�
 | 项目归属 | 采用请求当时的工作目录/模型上下文，识别 Git 根目录；未知目录保留分类 |
 | 日期 | 使用记录内部时间，不能用文件夹日期代替 |
 | 桌面“本周” | 北京时间周一 00:00 至下周一 00:00；刷新时只统计当前时刻之前 |
+| 会员月核算 | 按已确认续费日期／时间逐月划分；未知时待配置，日期精度标为估算 |
 | 命令行默认窗口 | 最近滚动 7×24 小时，与桌面自然周不同 |
 
 同一仓库的多个 worktree 默认合并；归档副本、重复响应、fork 继承和新旧格式混合均有去重/基线处理。不能确认的旧历史会标为估算、跳过并警告，而不会为了凑总数补算。
@@ -98,6 +100,8 @@ Windows 可将 `python3` 替换为 `py -3`。优先使用 `CODEX_HOME`，否则�
 本机模式按用量展示前三个真实任务，即使第二、第三名低于 5%；桌面小框保留“低于 5% 合并到其他”的分类。占比均以全部本机已记录 Token 为分母，管理项目列表不参与总数求和。
 
 完整口径与异常处理见 [统计说明](docs/statistics.md)。
+
+菜单「周期核算…」可保存续费锚点、刷新核算并打开独立 Notion 页面。周／月从同一批计量事件按时间重分组，不能相加，也不能把一个月当四周。默认导出当前及此前共 12 个周／会员月；保存新的月锚点后旧云端方案保留审计，不重复计入。完整规则与命令见 [周期核算说明](docs/period-proposal.md)。
 
 ## 额度与“本周超额”
 
@@ -128,7 +132,10 @@ Windows 可将 `python3` 替换为 `py -3`。优先使用 `CODEX_HOME`，否则�
 Python 测试使用临时模拟日志与临时 Git 仓库，不读取用户真实会话：
 
 ```sh
-.venv/bin/python3 -m unittest -v test_codex_usage.py widget/test_widget_backend.py widget/test_project_store.py widget/test_notion_sync.py widget/test_notion_credentials.py
+.venv/bin/python3 -m unittest -v test_codex_usage.py widget/test_widget_backend.py \
+  widget/test_project_store.py widget/test_notion_sync.py widget/test_notion_credentials.py \
+  widget/test_period_accounting.py widget/test_period_backend.py \
+  widget/test_quota_accounting.py widget/test_period_notion.py
 ```
 
 Swift 数据与交互检查：
@@ -140,6 +147,13 @@ xcrun swiftc -parse-as-library -swift-version 5 -D WIDGET_CHECKS \
   -o widget/build/strip-checks -framework AppKit -framework SwiftUI -framework Security \
   -module-cache-path widget/build/module-cache
 widget/build/strip-checks
+
+# 周期设置、续费精度和未知数据检查
+xcrun swiftc -parse-as-library -swift-version 5 -D WIDGET_CHECKS \
+  widget/UsageWidget.swift widget/UsageStrip.swift widget/NotionSettings.swift widget/test_period_settings.swift \
+  -o widget/build/period-settings-checks -framework AppKit -framework SwiftUI -framework Security \
+  -module-cache-path widget/build/module-cache
+widget/build/period-settings-checks
 ```
 
 已在 macOS 15、Python 3.12、Swift 6.2.4 / macOS 26.2 SDK 上完成本机检查。具体测试结果以当前版本实际执行为准；模拟测试通过不等于其他机器的真实用量已验证。
@@ -152,6 +166,9 @@ test_codex_usage.py           扫描器测试
 widget/UsageWidget.swift      macOS 应用与桌面小框
 widget/UsageStrip.swift       条形组件与交互
 widget/widget_backend.py     本周归集、官方额度读取和历史估算
+widget/period_accounting.py   自然周与会员月的事件时间核算
+widget/quota_accounting.py    已保存官方窗口与观测质量
+widget/period_notion.py       独立 Notion 周期账本与额度窗口同步
 widget/project_store.py      稳定项目身份和项目每日事实
 widget/notion_sync.py         Notion 元数据、绑定与摘要同步
 widget/notion_credentials.py  用户选定的 Pages 密钥来源
@@ -163,6 +180,7 @@ widget/preview/demo.html     使用演示数据的交互预览
 docs/statistics.md            详细统计口径
 docs/notion.md                连接、项目图标、任务读取和摘要同步
 docs/project-management.md    项目管理首页、AI 维护约定和官方参考
+docs/period-proposal.md        已确认的周期核算规则与续费设置
 skills/notion-project-workbench/ 可发布的 Codex 项目管理技能
 ```
 

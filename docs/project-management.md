@@ -86,40 +86,10 @@ AI 更新项目时应遵循这些约定：
 
 有项目缓存时按管理状态、优先级和名称排列项目；项目本周没有用量也能出现在看板中。没有关联本机记录的项目明确显示未关联，而非真实零消耗。管理列表独立于计量列表，不改变本地总数、占比分母或每日同步账本。
 
-## 周记录与月核算：待确认周期
+## 周记录、月核算与独立额度页
 
-用户已提出两种用途：按周回顾使用，按月核算会员投入。具体边界仍在讨论，现有程序和历史摘要继续使用原来的口径，不因此改写历史或宣称月核算已完成。
+用户已确认三种边界：项目周报使用上海自然周；会员月核算使用经确认的续费锚点；官方额度使用服务返回的真实窗口。周、月直接对同一批已接受用量分组，不把整周加成月份，也不将 Token 换算成官方额度。
 
-| 用途 | 现有口径／待讨论方案 |
-| --- | --- |
-| 本地 Token 的“本周” | 当前为上海时间自然周：周一 00:00 至下周一 00:00 |
-| 官方额度 | 当前官方窗口的剩余／已用百分比与重置时间，独立于本地 Token |
-| 按周记录的候选 | 保留自然周便于稳定对比，或按可核实的额度重置窗口记录；尚未选定 |
-| 按月核算的候选 | 自然月便于项目月报，或经用户确认的订阅充值账期；尚未选定 |
+周期核算与额度观测放在与项目工作台并列的独立页面和两个数据库，不新增 Projects 关系。项目工作台仍以目标、行动、成果和附属每日投入为主。月核算引擎已经接入；没有真实续费锚点时保持待配置，不生成假月份。配置日期精度时标明日粒度边界估算；历史账期按同一锚点推算，不证明历史订阅规则。
 
-建议把项目投入的固定日历窗口与官方额度窗口分开保存，再在核算视图对照，但这仍是建议。订阅账期需要明确起止日期，不能从某次额度重置推断充值日；一个月不等于固定四周，也不代表四份固定 Token 额度。项目计划采用的工作周期同样不必等于额度周期。
-
-## Notion 的 Mac 组件可以学什么
-
-本次官方资料核查于 2026-10-13 完成。Notion 文档确认的是 iOS／Android 组件：Page、Favorites、Recents 和 AI shortcuts。Page 组件使用页面图标与封面，作为打开页面的入口；官方指出自定义 emoji 不会在移动组件渲染。[Notion 移动组件说明](https://www.notion.com/help/mobile-widgets)。
-
-Apple 支持在 Mac 桌面显示 iPhone 组件。要求 iPhone 使用 iOS 17 或更新版本、设备使用相同 Apple Account，且 iPhone 在附近或同一 Wi-Fi。普通窗口可以遮住桌面组件；部分交互需要回到 iPhone。[Apple Mac 组件说明](https://support.apple.com/guide/mac-help/add-and-customize-widgets-mchl52be5da5/mac)。
-
-本次未找到 Notion 官方确认的独立原生 macOS WidgetKit 项目看板组件，因此不能把手机接力组件说成已有原生 Mac 项目胶囊。Notion Calendar 的官方组件说明同样针对移动系统。[Notion Calendar 应用与组件](https://www.notion.com/help/notion-calendar-apps)。
-
-Notion Mac 应用另有菜单栏 Command Search／AI 入口，以及标签页 hover 预览。可以借鉴图标入口、需要时展开和跳转回完整页面的组织方式；它们不是桌面项目看板。[Notion 桌面应用说明](https://www.notion.com/help/notion-for-desktop)。
-
-本项目的悬停详情由自己的桌面应用提供；默认在桌面层，保留普通窗口可以覆盖的行为，不宣称它是 Apple 官方 WidgetKit 扩展。
-
-## 官方设计参考
-
-- [Linear Method](https://linear.app/method/introduction)：简短项目说明、小而明确的行动、以实际成果展示进展，是当前主要方法。
-- [Notion Projects & Tasks 模板](https://www.notion.com/templates/notion-projects-and-tasks)：项目与任务分别建库、关联管理。
-- [Projects & Tasks 使用指南](https://www.notion.com/help/guides/getting-started-with-projects-and-tasks)：项目为总入口，任务视图服务具体日常行动。
-- [Connected project management](https://www.notion.com/help/guides/accomplish-more-with-connected-project-management)：目标、文档、任务与阻塞保持关联。
-- [Basecamp Hill Charts](https://basecamp.com/hill-charts)：区分尚在解决未知问题与已经明确方案的执行，并保留状态历史。
-- [Shape Up — Show Progress](https://basecamp.com/shapeup/3.4-chapter-13)：任务数无法完整表达未知问题，历史状态能显示工作如何推进。
-
-采用 Linear 的轻量原则，用 Notion 项目／任务关系、可打开的阶段产出、明确下一行动与独立 Events 历史组织工作。Basecamp 的未知与历史处理只作为辅助参考；不导入整套 Shape Up，不默认强制两周或六周周期，也不凭 Token 绘制项目完成度。
-
-首页区域、胶囊排序和 AI 维护约定是本项目的设计选择；官方参考不能代替本项目的真实功能验收。
+具体边界、月底规则、同步审计与历史覆盖见 [周期核算机制](period-proposal.md)。

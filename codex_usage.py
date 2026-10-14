@@ -22,7 +22,7 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone as dt_timezone, tzinfo
-from typing import Iterator, TextIO
+from typing import Callable, Iterator, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -411,7 +411,16 @@ def scan_usage(
     until: datetime | None = None,
     timezone: tzinfo | None = None,
     group_worktrees: bool = True,
+    *,
+    accepted_event_sink: Callable[[dict], None] | None = None,
 ) -> dict:
+    """Scan retained logs; optionally stream the same accepted counting facts.
+
+    The sink receives metadata and already-deduplicated response usage or
+    legacy deltas, after timestamp filtering. It never receives log text,
+    source lines, conversations or tool output. Default report output is
+    unchanged. Sink dictionaries are copies, so callers cannot change counts.
+    """
     home = Path(codex_home).expanduser().resolve()
     if not home.is_dir():
         raise ValueError(f"Codex home does not exist: {home}")
@@ -545,6 +554,16 @@ def scan_usage(
         for name in event.missing_fields:
             missing = coverage["missing_fields"]
             missing[name] = missing.get(name, 0) + 1
+        if accepted_event_sink is not None:
+            accepted_event_sink({
+                "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+                "thread_id": event.thread_id, "cwd": event.cwd,
+                "project": project, "model": model_name,
+                "response_id": event.response_id, "kind": kind,
+                "counts": {**values, "request_records": int(kind == "response"),
+                           "legacy_updates": int(kind == "legacy")},
+                "missing_fields": list(event.missing_fields),
+            })
 
     # Scan every event, including events outside the reporting window, so legacy
     # cumulative counters retain their baseline across days.

@@ -12,6 +12,9 @@ from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
+import fcntl
+import os
+import hashlib
 from pathlib import Path
 import queue
 import shutil
@@ -373,6 +376,68 @@ def atomic_json(path: Path, value: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def accounting_snapshot(home: Path, task_root: Path, data: Path,
+                        now: datetime | None = None, *, force: bool = False) -> dict:
+    """Refresh independent period views without credentials or cloud writes.
+
+    A short cache avoids an all-history replay on every UI tick. The key also
+    includes the confirmed billing setting, so editing it never shows an old
+    month as though it belonged to the new schedule.
+    """
+    from period_accounting import build_period_report
+    from quota_accounting import quota_window_report
+    end = now or datetime.now(UTC)
+    if end.tzinfo is None:
+        raise ValueError("Accounting cutoff requires a timezone")
+    data.mkdir(parents=True, exist_ok=True)
+    with (data / "accounting.lock").open("a+") as lock:
+        os.chmod(lock.name, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            settings_file = data / "app-settings.json"
+            settings = json.loads(settings_file.read_text()) if settings_file.is_file() else {}
+            if not isinstance(settings, dict):
+                raise ValueError("Invalid settings")
+            precision = settings.get("billing_anchor_precision")
+            if precision is None:
+                precision = "datetime"
+            source_key = hashlib.sha256(str(home.expanduser().resolve()).encode()).hexdigest()
+            registry_file = data / "project-registry.json"
+            identities = json.loads(registry_file.read_text()) if registry_file.is_file() else {}
+            stored_dataset = identities.get("datasets", {}).get(source_key) if isinstance(identities, dict) else None
+            registry = ProjectRegistry(data, home) if stored_dataset else None
+            cache_key = {"home": str(home.expanduser().resolve()),
+                         "task_root": str(task_root.expanduser().resolve()),
+                         "dataset_id": stored_dataset or "local:" + source_key,
+                         "billing_anchor": settings.get("billing_anchor"),
+                         "billing_anchor_precision": precision}
+            cache_file = data / "accounting.json"
+            try:
+                cached = json.loads(cache_file.read_text()) if cache_file.is_file() else {}
+            except (OSError, ValueError):
+                cached = {}
+            if not isinstance(cached, dict):
+                cached = {}
+            report = cached.get("accounting") if isinstance(cached, dict) else None
+            if not force and cached.get("cache_key") == cache_key and isinstance(report, dict):
+                try:
+                    age = (end - datetime.fromisoformat(report["generated_at"])).total_seconds()
+                except (ValueError, KeyError, TypeError):
+                    age = -1
+                if 0 <= age < 300:
+                    # Quota observations are cheap to read and can advance even
+                    # while the expensive token replay stays cached.
+                    return {**report, "quota": quota_window_report(data / "quota-history.sqlite3", end)}
+            report = build_period_report(home, data, end,
+                billing_anchor=settings.get("billing_anchor"), task_root=task_root,
+                registry=registry, billing_anchor_precision=precision)
+            report["quota"] = quota_window_report(data / "quota-history.sqlite3", end)
+            atomic_json(cache_file, {"cache_key": cache_key, "accounting": report})
+            return report
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bool = True,
                    now: datetime | None = None) -> dict:
     end = now or datetime.now(UTC)
@@ -454,6 +519,10 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
         age = max(0, (end - datetime.fromisoformat(quota["observed_at"])).total_seconds())
         quota = {**quota, "age_seconds": round(age), "stale": age > 180 or
                  any(window["resets_at"] <= end.timestamp() for window in quota["windows"])}
+    try:
+        accounting = accounting_snapshot(home, task_root, data, end)
+    except (ValueError, OSError, sqlite3.Error):
+        accounting = {"status": "unavailable", "message": "周期核算读取失败，保留原本的项目用量。"}
     return {"generated_at": datetime.now(UTC).isoformat(), "range": report["range"],
             "period_mode": "calendar_week", "timezone": "Asia/Shanghai", "total_tokens": report["totals"]["total_tokens"],
             "request_records": report["totals"]["request_records"],
@@ -467,11 +536,10 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
                          ("files_found", "files_scanned", "files_skipped", "malformed_lines")},
             "warnings_count": len(report["warnings"]),
             "quota": quota, "quota_error": quota_error, "cycles": history,
-            "weekly_budget": budget}
+            "weekly_budget": budget, "accounting": accounting}
 
 
 def main():
-    import os
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex-home", type=Path,
                         default=Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser())
@@ -479,10 +547,32 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=DATA)
     parser.add_argument("--offline", action="store_true", help="Use only saved official snapshot")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--sync-notion", action="store_true", help="Sync saved summaries independently of local scanning")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--sync-notion", action="store_true", help="Sync project and independent period summaries")
+    action.add_argument("--accounting-summary", action="store_true", help="Recompute natural-week and confirmed billing-month summaries locally")
     parser.add_argument("--force-sync", action="store_true", help="Bypass the Notion sync interval")
     args = parser.parse_args()
     try:
+        settings_file = args.data_dir / "app-settings.json"
+        try:
+            settings = json.loads(settings_file.read_text(encoding="utf-8")) if settings_file.is_file() else {}
+        except (ValueError, OSError):
+            if not args.sync_notion:
+                raise
+            settings = {}
+        if not isinstance(settings, dict):
+            if not args.sync_notion:
+                raise ValueError("Invalid settings")
+            settings = {}
+        args.task_root = args.task_root or Path(settings.get("task_root") or Path.home() / "Documents")
+        if args.accounting_summary:
+            report = accounting_snapshot(args.codex_home, args.task_root, args.data_dir, force=True)
+            result = {"ok": True, "accounting": report}
+            if args.output:
+                atomic_json(args.output, result)
+            else:
+                print(json.dumps(result, ensure_ascii=False))
+            return 0
         if args.sync_notion:
             # Opt-in is persisted independently of any cached connection or
             # database configuration. Even a manual retry cannot bypass local
@@ -512,12 +602,24 @@ def main():
             except NotionError as error:
                 print(json.dumps({"ok": False, "error": error.public()}, ensure_ascii=False))
                 return 1
-            okay = not result.get("error") and not result.get("projects_error")
-            print(json.dumps({"ok": okay, "result": result, "error": result.get("error") or result.get("projects_error")}, ensure_ascii=False))
+            period_result = None
+            try:
+                from period_notion import PeriodNotionWorkspace, report_rows
+                periods = PeriodNotionWorkspace(args.data_dir)
+                if periods.status().get("ready"):
+                    accounting = accounting_snapshot(args.codex_home, args.task_root, args.data_dir)
+                    ledger_rows, window_rows = report_rows(accounting, accounting["dataset_id"])
+                    period_result = periods.sync(ledger_rows, window_rows,
+                        now=datetime.now(UTC), force=args.force_sync,
+                        billing_configured=accounting["monthly"]["status"] == "configured",
+                        active_monthly_schedule=accounting["monthly"].get("schedule_id"))
+            except (NotionError, ValueError, OSError, sqlite3.Error) as exc:
+                period_result = {"error": exc.public() if isinstance(exc, NotionError) else
+                                 {"message": "周期摘要同步失败，项目摘要已独立处理。"}}
+            okay = not result.get("error") and not result.get("projects_error") and not (period_result or {}).get("error")
+            error = result.get("error") or result.get("projects_error") or (period_result or {}).get("error")
+            print(json.dumps({"ok": okay, "result": result, "period_result": period_result, "error": error}, ensure_ascii=False))
             return 0 if okay else 1
-        settings_file = args.data_dir / "app-settings.json"
-        settings = json.loads(settings_file.read_text(encoding="utf-8")) if settings_file.is_file() else {}
-        args.task_root = args.task_root or Path(settings.get("task_root") or Path.home() / "Documents")
         result = build_snapshot(args.codex_home, args.task_root, args.data_dir, not args.offline)
         atomic_json(args.data_dir / "latest.json", result)
         if args.output:

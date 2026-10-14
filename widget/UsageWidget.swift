@@ -618,6 +618,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(themeItem)
         menu.addItem(withTitle: "项目与 Notion 设置…", action: #selector(openSettings), keyEquivalent: ",")
+        menu.addItem(withTitle: "周期核算…", action: #selector(openSettings), keyEquivalent: "")
         menu.addItem(withTitle: "同步 Notion 摘要", action: #selector(syncNotion), keyEquivalent: "")
         menu.addItem(withTitle: "刷新", action: #selector(refresh), keyEquivalent: "")
         menu.addItem(.separator())

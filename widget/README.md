@@ -61,9 +61,24 @@ Tasks 为可选数据源。当前后台只读它的 Project 关系和 Status，�
 
 原生应用可在“项目与 Notion 设置…”选择持久项目根目录。CLI 的 --task-root 对本次执行优先。
 
-只有开启 Notion 同步并完成连接后，才每5分钟在独立进程中同步摘要，不阻塞每分钟本地扫描。未绑定项目留在本机。可以显式绑定已有项目，或创建并绑定一个项目；详细连接、数据与重试口径见 [Notion 说明](../docs/notion.md)。
+只有开启 Notion 同步并完成连接后，才每5分钟在独立进程中同步摘要，不阻塞每分钟本地扫描。项目每日摘要只同步已绑定项目；独立周期页另保存整体投入和项目／模型摘要。可以显式绑定已有项目，或创建并绑定一个项目；详细连接、数据与重试口径见 [Notion 说明](../docs/notion.md)。
 
 项目属性、任务和开发事件由 [notion-project-workbench 技能](../skills/notion-project-workbench/SKILL.md)在用户安排的工作中维护，或由人在 Notion 编辑。每次实际推进追加事件，已完成任务保留。尚未启用定时 Notion Custom Agent；桌面后台不会自行完成任务、生成管理结论或改写项目目标。
+
+## 周记录与会员月核算
+
+菜单「周期核算…」提供自然周、实际额度窗口和会员月账期的独立入口。自然周为上海时间周一 00:00 至下周一 00:00；会员月以手动确认的最近一次续费时间为锚点，逐月按原日期与时间划分。一个月不能按四周相加，周／月两份视图也不能再相加成额外消耗。
+
+未填写续费时间时，月账期显示待配置。只知道续费日期时以上海当天零点为边界，明确标为日粒度估算；其他推算月份不等于每次真实续费均已核对。日期未知、旧格式估算、无法识别记录和窗口无用量分别显示，不使用零值掩盖未知。
+
+周期汇总从扫描器统一接受的计量事件按内部时间重分组，保留窗口前的旧累计基线、响应去重和 fork 继承处理。默认查看当前及此前共 12 个自然周／会员月；本机 Token 周期缓存最多 5 分钟，保存续费锚点会使旧缓存失效。「刷新核算」强制重算，不读取认证文件、不触发 Notion 写入。
+
+```sh
+mkdir -p validation
+python3 widget/widget_backend.py --accounting-summary --output validation/accounting.json
+```
+
+配置独立 Notion「周期与额度」页面后，常规已启用的摘要同步同时更新「周期账本」与「额度窗口」。两个数据库不关联具体项目管理；项目占比和模型摘要只是核算内容。官方窗口记录当前和最近 30 个结束窗口，完整本地观测和更早云端历史继续保留。规则和续费配置见 [周期核算说明](../docs/period-proposal.md)，建立独立入口见 [Notion 说明](../docs/notion.md#独立周期与额度页面)。
 
 ## 官方额度与本周累计
 
@@ -83,11 +98,12 @@ Tasks 为可选数据源。当前后台只读它的 Project 关系和 Status，�
 | `data/official-latest.json` | 最近一次官方额度观测 |
 | `data/quota-history.sqlite3` | 保存的额度观测与周期历史 |
 | `data/display-settings.json` | 三种展示形式开关 |
-| `data/app-settings.json` | 项目根目录、Notion 同步开关、可选密钥来源文件路径（不含 Token） |
+| `data/app-settings.json` | 项目根目录、Notion 同步开关、续费锚点与精度、可选密钥来源文件路径（不含 Token） |
+| `data/accounting.json` | 自然周与会员月汇总的本地缓存 |
 | `data/positions.json` | 归一化的窗口位置 |
 | `data/project-registry.json` | 稳定任务与匿名来源数据集身份 |
 | `data/daily-ledger.sqlite3` | 已观测项目每日摘要 |
-| `data/notion-config.json` | 数据库、同步起点和绑定，不含凭据 |
+| `data/notion-config.json` | 项目与周期数据库、周期页入口、同步起点和绑定，不含凭据 |
 | `data/notion-state.json` | 项目缓存、待同步摘要与幂等指纹 |
 | `data/window-state.json` | 本组件的层级、尺寸、位置与展开状态 |
 

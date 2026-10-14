@@ -31,6 +31,45 @@ enum WidgetPreferences {
     }
 }
 
+enum BillingAnchorPrecision: String, CaseIterable, Identifiable {
+    case date, datetime
+    var id: String { rawValue }
+    var title: String { self == .date ? "只知道日期" : "知道具体时间" }
+}
+
+enum BillingAnchorSettings {
+    static let timezone = TimeZone(identifier: "Asia/Shanghai")!
+
+    static func decode(_ value: String?) -> Date? {
+        guard let value else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
+
+    static func values(anchor: Date?, precision: BillingAnchorPrecision,
+                       now: Date = Date()) throws -> [String: Any] {
+        guard let anchor else {
+            return ["billing_anchor": NSNull(), "billing_anchor_precision": NSNull(),
+                    "billing_timezone": "Asia/Shanghai"]
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timezone
+        let normalized = precision == .date ? calendar.startOfDay(for: anchor) : anchor
+        guard normalized <= now else {
+            throw NSError(domain: "UsageWidget", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "请填写最近一次已经发生的续费时间。"])
+        }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return ["billing_anchor": formatter.string(from: normalized),
+                "billing_anchor_precision": precision.rawValue,
+                "billing_timezone": "Asia/Shanghai"]
+    }
+}
+
 @MainActor
 enum WidgetApplicationMenu {
     static func make(settingsTarget: NSObject? = nil) -> NSMenu {
@@ -40,6 +79,9 @@ enum WidgetApplicationMenu {
         let settings = application.submenu!.addItem(withTitle: "项目与 Notion 设置…",
             action: #selector(AppDelegate.openSettings), keyEquivalent: ",")
         settings.target = settingsTarget
+        let accounting = application.submenu!.addItem(withTitle: "周期核算…",
+            action: #selector(AppDelegate.openSettings), keyEquivalent: "")
+        accounting.target = settingsTarget
         application.submenu!.addItem(.separator())
         application.submenu!.addItem(withTitle: "退出用量小助手",
             action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -135,6 +177,13 @@ final class ProjectSettingsModel: ObservableObject {
     @Published var projectsURL: String?
     @Published var usageURL: String?
     @Published var tasksURL: String?
+    @Published var accountingURL: String?
+    @Published var hasBillingAnchor = false
+    @Published var billingAnchorDate = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970 / 60) * 60)
+    @Published var billingAnchorPrecision: BillingAnchorPrecision = .date
+    @Published var accountingBusy = false
+    @Published var accountingMessage = ""
+    @Published var accountingReport: [String: Any]?
     @Published var createIconMode = "emoji"
     @Published var createEmoji = ""
     @Published var createLogoURL = ""
@@ -147,10 +196,17 @@ final class ProjectSettingsModel: ObservableObject {
         let settings = try? WidgetPreferences.read(root: root)
         taskRoot = settings?["task_root"] as? String ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents").path
         tokenSourceFile = settings?["notion_token_source_file"] as? String ?? ""
+        if let anchor = BillingAnchorSettings.decode(settings?["billing_anchor"] as? String) {
+            hasBillingAnchor = true
+            billingAnchorDate = anchor
+            billingAnchorPrecision = BillingAnchorPrecision(rawValue: settings?["billing_anchor_precision"] as? String ?? "") ?? .datetime
+        }
         let configFile = root.appendingPathComponent("widget/data/notion-config.json")
         if let data = try? Data(contentsOf: configFile),
-           let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let parent = config["parent_page_id"] as? String { parentPage = "https://www.notion.so/" + parent.replacingOccurrences(of: "-", with: "") }
+           let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let parent = config["parent_page_id"] as? String { parentPage = "https://www.notion.so/" + parent.replacingOccurrences(of: "-", with: "") }
+            accountingURL = config["accounting_page_url"] as? String
+        }
     }
     var tasks: [LocalProject] { usage?.snapshot?.available_projects ?? [] }
     var newProjectIcon: [String: Any]? {
@@ -171,6 +227,81 @@ final class ProjectSettingsModel: ObservableObject {
         return ["type": "external", "external": ["url": value]]
     }
     var selectedPageNeedsIcon: Bool { choices.first(where: { $0.id == selectedPage })?.iconMissing == true }
+    var accountingWeek: [String: Any]? { (accountingReport?["weekly"] as? [String: Any])?["current"] as? [String: Any] }
+    var accountingMonth: [String: Any]? { (accountingReport?["monthly"] as? [String: Any])?["current"] as? [String: Any] }
+    var monthlyNeedsAnchor: Bool { (accountingReport?["monthly"] as? [String: Any])?["status"] as? String == "needs_anchor" }
+
+    func periodTokens(_ period: [String: Any]?) -> String {
+        guard let totals = period?["totals"] as? [String: Any],
+              let total = totals["total_tokens"] as? NSNumber,
+              CFGetTypeID(total) != CFBooleanGetTypeID() else { return "尚未核算" }
+        return compactTokens(total.intValue) + " Token"
+    }
+
+    func periodDates(_ period: [String: Any]?) -> String? {
+        guard let start = BillingAnchorSettings.decode(period?["start"] as? String),
+              let end = BillingAnchorSettings.decode(period?["end"] as? String) else { return nil }
+        let formatter = DateFormatter()
+        formatter.timeZone = BillingAnchorSettings.timezone
+        formatter.dateFormat = "M月d日 HH:mm"
+        return formatter.string(from: start) + " — " + formatter.string(from: end) + "（不含结束时刻）"
+    }
+
+    func periodCoverage(_ period: [String: Any]?) -> String? {
+        guard let coverage = period?["coverage"] as? [String: Any],
+              let quality = coverage["quality"] as? [String] else { return nil }
+        var labels: [String] = []
+        if quality.contains("partial_unreadable") { labels.append("有记录未能识别或读取") }
+        if quality.contains("legacy_estimated") { labels.append("含旧格式估算") }
+        if quality.contains("no_observed_usage") { labels.append("窗口内未记录可用用量") }
+        if labels.isEmpty && quality.contains("response_records_verified") { labels.append("按响应记录统计") }
+        return labels.isEmpty ? nil : labels.joined(separator: " · ")
+    }
+
+    func saveBillingAnchor() {
+        guard !accountingBusy else { return }
+        do {
+            let values = try BillingAnchorSettings.values(anchor: hasBillingAnchor ? billingAnchorDate : nil,
+                precision: billingAnchorPrecision)
+            try WidgetPreferences.update(root: root, values: values)
+            if let value = values["billing_anchor"] as? String,
+               let saved = BillingAnchorSettings.decode(value) { billingAnchorDate = saved }
+            accountingMessage = hasBillingAnchor
+                ? (billingAnchorPrecision == .date ? "续费日期已保存；按上海时间当天零点划分，账期边界为日粒度估算。" : "续费时间已保存；按会员账期核算。")
+                : "续费时间未提供；月账期保持待配置，不会自动猜测。"
+            refreshAccounting()
+        } catch { accountingMessage = error.localizedDescription }
+    }
+
+    func refreshAccounting() {
+        guard !accountingBusy else { return }
+        accountingBusy = true
+        accountingMessage = ""
+        let executable = python, folder = root
+        Task {
+            let result: Result<Data, Error> = await Task.detached(priority: .utility) {
+                do {
+                    return .success(try runWidgetProcess(python: executable, root: folder,
+                        arguments: [folder.appendingPathComponent("widget/widget_backend.py").path,
+                                    "--accounting-summary"], timeout: 180))
+                } catch { return .failure(error) }
+            }.value
+            switch result {
+            case .success(let data):
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   json["ok"] as? Bool == true,
+                   let report = json["accounting"] as? [String: Any] {
+                    accountingReport = report
+                    accountingMessage = monthlyNeedsAnchor ? "核算已刷新；会员月账期待配置续费时间。" : "核算已刷新；统计截至本次扫描。"
+                } else {
+                    accountingMessage = "周期核算未完成，保留已有记录。"
+                }
+            case .failure(let error): accountingMessage = error.localizedDescription
+            }
+            accountingBusy = false
+            usage?.refresh()
+        }
+    }
 
     func saveRoot() {
         let path = (taskRoot as NSString).expandingTildeInPath
@@ -209,6 +340,7 @@ final class ProjectSettingsModel: ObservableObject {
         projectsURL = status["projects_url"] as? String
         usageURL = status["usage_url"] as? String
         tasksURL = status["tasks_url"] as? String
+        accountingURL = status["accounting_url"] as? String ?? accountingURL
         choices = (status["projects"] as? [[String: Any]] ?? [])
             .filter { $0["available"] as? Bool != false }
             .compactMap { item in
@@ -301,6 +433,57 @@ struct ProjectSettingsView: View {
                 Text(usage.notionEnabled ? "本机负责计量，Notion 保存已绑定项目的每日摘要。" : "本机模式：无需 Token。项目统计、历史账本和桌面组件照常运行。")
                     .font(.callout).foregroundStyle(.secondary)
                 if let message = usage.notionSyncMessage { Text(message).font(.callout).foregroundStyle(.secondary) }
+            }
+            Section("周期核算") {
+                LabeledContent("项目周报", value: "自然周 · 周一至周日")
+                LabeledContent("额度窗口", value: "按 Codex 实际重置时间")
+                LabeledContent("会员月核算", value: "按会员续费账期")
+                if let report = model.accountingReport {
+                    LabeledContent("本周记录", value: model.periodTokens(model.accountingWeek))
+                    if let dates = model.periodDates(model.accountingWeek) {
+                        Text(dates).font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let coverage = model.periodCoverage(model.accountingWeek) {
+                        Text(coverage).font(.caption).foregroundStyle(.secondary)
+                    }
+                    LabeledContent("本期会员月", value: model.monthlyNeedsAnchor ? "待配置续费时间" : model.periodTokens(model.accountingMonth))
+                    if let dates = model.periodDates(model.accountingMonth) {
+                        Text(dates).font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let coverage = model.periodCoverage(model.accountingMonth) {
+                        Text(coverage).font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let generated = report["generated_at"] as? String {
+                        Text("更新于 " + timestampLabel(generated) + " · 上海时间").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Toggle("已确认最近一次会员续费时间", isOn: $model.hasBillingAnchor)
+                    .disabled(model.accountingBusy)
+                if model.hasBillingAnchor {
+                    Picker("已知精度", selection: $model.billingAnchorPrecision) {
+                        ForEach(BillingAnchorPrecision.allCases) { precision in Text(precision.title).tag(precision) }
+                    }.pickerStyle(.segmented).disabled(model.accountingBusy)
+                    DatePicker("确认的续费锚点", selection: $model.billingAnchorDate, in: ...Date(),
+                        displayedComponents: model.billingAnchorPrecision == .date ? [.date] : [.date, .hourAndMinute])
+                        .environment(\.timeZone, BillingAnchorSettings.timezone)
+                        .environment(\.locale, Locale(identifier: "zh_CN"))
+                        .disabled(model.accountingBusy)
+                    Text(model.billingAnchorPrecision == .date ? "只知道日期时，以上海时间当天零点为边界，月账期标记为日粒度估算。" : "按这次续费的日期和时间划分会员月账期。")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text("月底续费请使用原续费日的锚点，例如31日。短月份的一次实际扣费日期不能确定原来是30日还是31日。")
+                        .font(.callout).foregroundStyle(.secondary)
+                } else {
+                    Text("续费时间未知时，月账期保持待配置。请从会员付款或续费记录确认；这里不会自动填入今天。")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                HStack {
+                    Button("保存账期") { model.saveBillingAnchor() }.disabled(model.accountingBusy)
+                    Button(model.accountingBusy ? "核算中…" : "刷新核算") { model.refreshAccounting() }.disabled(model.accountingBusy)
+                    if let url = model.accountingURL { Button("打开周期与额度") { usage.openProject(url) } }
+                }
+                Text("周期账本独立于项目管理。Token 来自本机保留日志；额度按实测窗口记录，不把一个月换算成四周。")
+                    .font(.callout).foregroundStyle(.secondary)
+                if !model.accountingMessage.isEmpty { Text(model.accountingMessage).font(.callout).textSelection(.enabled) }
             }
             Section("本地项目") {
                 Text("每个直接子文件夹作为一个任务。未绑定、暂停和归档的项目仍计入用量。")
@@ -398,7 +581,7 @@ struct ProjectSettingsView: View {
             if model.busy { ProgressView().controlSize(.small) }
             if !model.message.isEmpty { Text(model.message).font(.callout).textSelection(.enabled) }
         }.formStyle(.grouped).padding(12).frame(width: 640, height: 620)
-            .onAppear { model.perform(["command": "status"]) }
+            .onAppear { model.perform(["command": "status"]); model.refreshAccounting() }
     }
 }
 
@@ -408,7 +591,7 @@ final class ProjectSettingsController: NSWindowController, NSWindowDelegate {
         let model = ProjectSettingsModel(usage: usage)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 620),
             styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        window.title = "用量小助手 · 项目与 Notion"
+        window.title = "用量小助手 · 项目、周期与 Notion"
         window.contentView = NSHostingView(rootView: ProjectSettingsView(model: model, usage: usage))
         window.isReleasedWhenClosed = false
         window.center()
