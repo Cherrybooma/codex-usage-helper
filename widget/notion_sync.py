@@ -47,12 +47,17 @@ NUMBER_PROPERTIES = dict(zip(COUNTERS, (
 QUALITY = {"response_records_verified": "按响应记录", "legacy_estimated": "含旧累计估算",
            "partial_unreadable": "部分记录未读取", "unknown": "未核实"}
 PROJECT_TEXT_PROPERTIES = {"project_goal": "Goal", "weekly_goal": "Weekly Goal",
-                           "next_step": "Next Step", "project_summary": "Summary"}
+                           "next_step": "Next Step", "project_summary": "Summary",
+                           "current_goal": "Current Goal", "latest_output_title": "Latest Output",
+                           "latest_progress_summary": "Latest Progress", "progress_evidence": "Progress Evidence"}
 PROJECT_SELECT_PROPERTIES = {"project_priority": "Priority", "project_health": "Health"}
-PROJECT_DATE_PROPERTIES = {"target_date": "Target Date", "last_reviewed": "Last Reviewed"}
-OPTIONAL_PROJECT_PROPERTIES = set(PROJECT_TEXT_PROPERTIES.values()) | set(PROJECT_SELECT_PROPERTIES.values()) | set(PROJECT_DATE_PROPERTIES.values()) | {"Development Progress"}
-OPTIONAL_TASK_PROPERTIES = {"Priority", "Managed By", "Due", "Evidence", "Acceptance"}
+PROJECT_DATE_PROPERTIES = {"target_date": "Target Date", "last_reviewed": "Last Reviewed",
+                           "progress_reviewed_at": "Progress Reviewed"}
+OPTIONAL_PROJECT_PROPERTIES = set(PROJECT_TEXT_PROPERTIES.values()) | set(PROJECT_SELECT_PROPERTIES.values()) | set(PROJECT_DATE_PROPERTIES.values()) | {"Development Progress", "Progress Source", "Latest Output URL"}
+OPTIONAL_TASK_PROPERTIES = {"Priority", "Managed By", "Due", "Evidence", "Acceptance", "Decision", "Recommendation", "Impact", "Task Key"}
 TASK_COUNT_FIELDS = ("open_tasks", "blocked_tasks", "completed_tasks")
+HUMAN_TASK_COUNT_FIELDS = ("human_open_tasks", "human_blocked_tasks", "human_completed_tasks")
+ALL_TASK_COUNT_FIELDS = TASK_COUNT_FIELDS + HUMAN_TASK_COUNT_FIELDS
 TASK_OPEN_STATUSES = {"待处理", "进行中", "待确认", "阻塞"}
 TASK_KNOWN_STATUSES = TASK_OPEN_STATUSES | {"已完成", "取消"}
 MESSAGES = {
@@ -409,6 +414,8 @@ class NotionWorkspace:
             schema["Priority"] = {"select": {"options": [{"name": value} for value in ("高", "中", "低")]}}
             schema["Health"] = {"select": {"options": [{"name": value} for value in ("正常", "有风险", "受阻")]}}
             schema["Development Progress"] = {"number": {"format": "number"}}
+            schema["Progress Source"] = {"select": {"options": [{"name": value} for value in ("AI估算", "手动")]}}
+            schema["Latest Output URL"] = {"url": {}}
             return schema
         if kind == "tasks":
             return {"Name": {"title": {}}, "Project": {"relation": {
@@ -418,7 +425,9 @@ class NotionWorkspace:
                     "待处理", "进行中", "待确认", "阻塞", "已完成", "取消")]}},
                 "Priority": {"select": {"options": [{"name": value} for value in ("高", "中", "低")]}},
                 "Managed By": {"select": {"options": [{"name": value} for value in ("AI", "人类确认")]}},
-                "Due": {"date": {}}, "Evidence": {"url": {}}, "Acceptance": {"rich_text": {}}}
+                "Due": {"date": {}}, "Evidence": {"url": {}}, "Acceptance": {"rich_text": {}},
+                "Decision": {"rich_text": {}}, "Recommendation": {"rich_text": {}},
+                "Impact": {"rich_text": {}}, "Task Key": {"rich_text": {}}}
         result = {"Name": {"title": {}}, "Project": {"relation": {
             "data_source_id": self.config["projects_data_source_id"],
             "type": "single_property", "single_property": {}}},
@@ -579,9 +588,15 @@ class NotionWorkspace:
             date_value = prop.get("date") or {}
             start = date_value.get("start") if isinstance(date_value, dict) else None
             metadata[field] = start[:64] if isinstance(start, str) and start else None
-        metadata.update({field: None for field in TASK_COUNT_FIELDS})
+        metadata["current_goal"] = metadata["current_goal"] or metadata["weekly_goal"]
+        metadata["latest_progress_summary"] = metadata["latest_progress_summary"] or metadata["project_summary"]
+        metadata["latest_output_url"] = _safe_https((properties.get("Latest Output URL") or {}).get("url")) or _safe_https((properties.get("Outcome") or {}).get("url"))
+        metadata.update({field: None for field in ALL_TASK_COUNT_FIELDS})
         progress = (properties.get("Development Progress") or {}).get("number")
-        metadata.update(project_progress({"development_progress": progress, "progress_source": "manual"}))
+        source_select = (properties.get("Progress Source") or {}).get("select")
+        source_value = source_select.get("name") if isinstance(source_select, dict) else None
+        source = "ai" if source_value in ("AI估算", "ai") else "manual" if source_value in (None, "手动", "manual") else None
+        metadata.update(project_progress({"development_progress": progress, "progress_source": source}))
         return metadata
 
     def _task_counts(self, project_ids):
@@ -602,7 +617,10 @@ class NotionWorkspace:
                 or relation_config.get("data_source_id") != self.config["projects_data_source_id"]
                 or status_schema.get("type") != "select"):
             raise NotionError("schema_mismatch")
-        counts = {page_id: {field: 0 for field in TASK_COUNT_FIELDS} for page_id in project_ids}
+        owner_schema = properties.get("Managed By") or {}
+        human_known = isinstance(owner_schema, dict) and owner_schema.get("type") == "select"
+        counts = {page_id: {**{field: 0 for field in TASK_COUNT_FIELDS},
+                            **{field: 0 if human_known else None for field in HUMAN_TASK_COUNT_FIELDS}} for page_id in project_ids}
         seen = set()
         for task in self._query(source):
             if not isinstance(task, dict):
@@ -629,6 +647,9 @@ class NotionWorkspace:
             status = selected.get("name") if isinstance(selected, dict) else None
             if status not in TASK_KNOWN_STATUSES:
                 raise NotionError("schema_mismatch")
+            owner_property = properties.get("Managed By") or {}
+            owner_select = owner_property.get("select") if isinstance(owner_property, dict) else None
+            owner = owner_select.get("name") if isinstance(owner_select, dict) else None
             for project_id in relevant:
                 if status in TASK_OPEN_STATUSES:
                     counts[project_id]["open_tasks"] += 1
@@ -636,6 +657,15 @@ class NotionWorkspace:
                     counts[project_id]["blocked_tasks"] += 1
                 if status == "已完成":
                     counts[project_id]["completed_tasks"] += 1
+                if not human_known or owner not in ("AI", "人类确认"):
+                    # Unclassified older tasks are not evidence of zero human work.
+                    counts[project_id].update({field: None for field in HUMAN_TASK_COUNT_FIELDS})
+                elif owner == "人类确认":
+                    for condition, field in ((status in TASK_OPEN_STATUSES, "human_open_tasks"),
+                                             (status == "阻塞", "human_blocked_tasks"),
+                                             (status == "已完成", "human_completed_tasks")):
+                        if condition and counts[project_id][field] is not None:
+                            counts[project_id][field] += 1
         return counts
 
     def _projects(self, force=False):
@@ -680,7 +710,7 @@ class NotionWorkspace:
         for meta in sorted(cached.values(), key=lambda item: (item["display_name"], item["page_id"])):
             is_stale = meta.get("stale", False) or stale or bool(self.state.get("projects_error"))
             item = {**meta, "stale": is_stale,
-                    **({field: None for field in TASK_COUNT_FIELDS} if is_stale else {})}
+                    **({field: None for field in ALL_TASK_COUNT_FIELDS} if is_stale else {})}
             item.update(project_progress(item))
             result.append(item)
         return result
@@ -709,6 +739,9 @@ class NotionWorkspace:
             if (fresh and complete and cached.get("available", True) and not cached.get("stale")
                     and not self.state.get("projects_error") and not self.state.get("tasks_error")):
                 meta.update({field: cached[field] for field in TASK_COUNT_FIELDS})
+                for field in HUMAN_TASK_COUNT_FIELDS:
+                    value = cached.get(field)
+                    meta[field] = value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
             meta.update(project_progress(meta))
         return meta
 
@@ -972,6 +1005,9 @@ class NotionWorkspace:
                         self.state["pending"][key] = row
                     else:
                         self.state["pending"].pop(key, None)
+                        # Preserve the newest accepted scan locally even when its
+                        # counters are unchanged and no cloud write is needed.
+                        self.state["synced"][key]["statistics_until"] = row["statistics_until"]
                 # A binding removed or changed after a failed sync invalidates
                 # its pending cloud write, but never changes local statistics.
                 for key, row in list(self.state["pending"].items()):
@@ -982,20 +1018,35 @@ class NotionWorkspace:
                     raise NotionError("not_configured")
                 if not force and self.state.get("automatic_sync_paused"):
                     return {**self._status(), "changed": 0}
-                self._token()
                 attempt = self.state.get("last_attempt")
                 if not force and attempt and (now - _utc(attempt)).total_seconds() < 300:
                     return {**self._status(), "changed": 0}
+                self._token()
                 self.state["last_attempt"] = now.isoformat()
                 self._projects(force=force)
                 if self.state.get("automatic_sync_paused"):
                     raise NotionError("api_access_blocked")
                 remote_retire = {}
                 remote_seen = set()
+                reconciled = self.state.setdefault("reconciled_datasets", {})
+                audits = {}
                 # Reconcile complete snapshots with server metadata as well as
                 # local state. A lost local sync cache or plugin bootstrap must
                 # not leave an earlier allocation active after rebinding.
                 for dataset in complete:
+                    keys = sorted(self._summary_key(row) for row in normalized if row["dataset_id"] == dataset)
+                    fingerprint = hashlib.sha256(json.dumps(keys).encode()).hexdigest()
+                    prior_audit = reconciled.get(dataset) or {}
+                    audit_due = (force or bool(self.state.get("error"))
+                                 or prior_audit.get("fingerprint") != fingerprint
+                                 or not prior_audit.get("checked_at")
+                                 or any(key not in self.state["synced"] for key in keys))
+                    try:
+                        audit_due = audit_due or (now - _utc(prior_audit.get("checked_at"))).total_seconds() >= 86400
+                    except NotionError:
+                        audit_due = True
+                    if not audit_due:
+                        continue
                     pages = self._query(self.config["usage_data_source_id"], filter={
                         "property": "Dataset", "rich_text": {"equals": dataset}})
                     for page in pages:
@@ -1019,6 +1070,7 @@ class NotionWorkspace:
                         if key in remote_retire:
                             raise NotionError("duplicate_summary")
                         remote_retire[key] = notion_id(page.get("id"))
+                    audits[dataset] = {"fingerprint": fingerprint, "checked_at": now.isoformat()}
                 # A complete dataset snapshot can move a task to another
                 # project. Retire its previous allocation before creating the
                 # new one; keep original counters as an audit, not a second use.
@@ -1044,6 +1096,7 @@ class NotionWorkspace:
                     self._upsert(key, row, now)
                     changed += 1
                 self.state["last_sync"] = now.isoformat()
+                reconciled.update(audits)
                 for dataset in complete:
                     clocks[dataset] = cutoff.isoformat()
                 self.state.pop("error", None)
@@ -1091,7 +1144,7 @@ class NotionWorkspace:
         stale = not fetched or (self._now() - _utc(fetched)).total_seconds() >= 600
         is_stale = meta.get("stale", False) or stale or bool(state.get("projects_error"))
         item = {**meta, "stale": is_stale,
-                **({field: None for field in TASK_COUNT_FIELDS} if is_stale or state.get("tasks_error") else {})}
+                **({field: None for field in ALL_TASK_COUNT_FIELDS} if is_stale or state.get("tasks_error") else {})}
         item.update(project_progress(item))
         return item
 
@@ -1110,7 +1163,7 @@ class NotionWorkspace:
             stale = not fetched or (self._now() - _utc(fetched)).total_seconds() >= 600
             stale = stale or meta.get("stale", False) or bool(state.get("projects_error"))
             item = {**meta, "stale": stale,
-                    **({field: None for field in TASK_COUNT_FIELDS} if stale or state.get("tasks_error") else {})}
+                    **({field: None for field in ALL_TASK_COUNT_FIELDS} if stale or state.get("tasks_error") else {})}
             item.update(project_progress(item))
             result.append(item)
         return result

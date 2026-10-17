@@ -87,6 +87,41 @@ class ProjectStoreTests(unittest.TestCase):
         self.assertNotEqual(reloaded.identify("folder:" + str(self.tasks / "other"), "新项目名称"),
                             original)
 
+    def test_registry_concurrent_disjoint_additions_merge_without_lost_identity(self):
+        self.registry.save()
+        one = ProjectRegistry(self.data, self.root / "codex-one")
+        two = ProjectRegistry(self.data, self.root / "codex-one")
+        first = one.identify("folder:first", "first")
+        second = two.identify("folder:second", "second")
+        one.save(); two.save()
+        current = ProjectRegistry(self.data, self.root / "codex-one")
+        self.assertEqual(current.identify("folder:first", "first"), first)
+        self.assertEqual(current.identify("folder:second", "second"), second)
+
+    def test_registry_concurrent_same_folder_conflict_never_overwrites_identity(self):
+        self.registry.save()
+        one = ProjectRegistry(self.data, self.root / "codex-one")
+        two = ProjectRegistry(self.data, self.root / "codex-one")
+        first = one.identify("folder:same", "same")
+        two.identify("folder:same", "same")
+        one.save()
+        before = self.registry.path.read_bytes()
+        with self.assertRaises(ValueError): two.save()
+        self.assertEqual(self.registry.path.read_bytes(), before)
+        self.assertEqual(ProjectRegistry(self.data, self.root / "codex-one").identify("folder:same", "same"), first)
+
+    def test_registry_retains_root_guard_and_rejects_stale_writer_regrouping(self):
+        self.registry.data.update(task_root="/old/root", future_setting="retain")
+        self.registry.save()
+        one = ProjectRegistry(self.data, self.root / "codex-one")
+        two = ProjectRegistry(self.data, self.root / "codex-one")
+        one.data["task_root"] = "/new/root"
+        one.save()
+        with self.assertRaises(ValueError): two.save()
+        loaded = json.loads(self.registry.path.read_text())
+        self.assertEqual(loaded["task_root"], "/new/root")
+        self.assertEqual(loaded["future_setting"], "retain")
+
     def test_sources_share_task_identity_but_keep_dataset_and_session_keys_distinct(self):
         key = "folder:" + str(self.tasks / "task")
         task_id = self.registry.identify(key, "task")
@@ -287,10 +322,28 @@ class ProjectStoreTests(unittest.TestCase):
         weekly, daily, _ = aggregate(report([source], [{**source, "day": "2026-10-13"}]),
                                      self.tasks, self.registry, {task_id: meta})
         for field in PROJECT_MANAGEMENT_FIELDS:
-            self.assertEqual(weekly[0][field], meta[field])
+            self.assertEqual(weekly[0][field], meta.get(field))
             self.assertNotIn(field, daily[0])
         self.assertEqual(weekly[0]["total_tokens"], 100)
         self.assertEqual(weekly[0]["percent"], 100)
+
+    def test_human_actions_and_output_metadata_do_not_change_token_facts(self):
+        path = self.tasks / "alpha"
+        task_id = self.registry.identify("folder:" + str(path), "alpha")
+        meta = {"page_id": "page-one", "current_goal": "确认实际产出", "human_open_tasks": 2,
+                "human_blocked_tasks": 1, "human_completed_tasks": 15,
+                "latest_output_title": "验收报告", "latest_output_url": "https://example.com/report",
+                "latest_progress_summary": "账期已验证", "open_tasks": 10, "completed_tasks": 100}
+        source = fact(path, 123, ["session"])
+        weekly, daily, _ = aggregate(report([source], [{**source, "day": "2026-10-13"}]),
+                                     self.tasks, self.registry, {task_id: meta})
+        self.assertEqual(weekly[0]["human_open_tasks"], 2)
+        self.assertEqual(weekly[0]["human_blocked_tasks"], 1)
+        self.assertEqual(weekly[0]["human_completed_tasks"], 15)
+        self.assertIsNone(weekly[0]["development_progress"])
+        self.assertEqual(weekly[0]["latest_output_url"], "https://example.com/report")
+        self.assertEqual(daily[0]["total_tokens"], 123)
+        self.assertNotIn("human_open_tasks", daily[0])
 
     def test_management_project_without_usage_is_not_added_to_accounting_totals(self):
         usage = [{"task_id": "notion:used", "name": "used", "total_tokens": 100, "percent": 100,
@@ -379,11 +432,11 @@ class ProjectStoreTests(unittest.TestCase):
         unavailable = management_projects([{"page_id": "bound", "display_name": "绑定"}], [], {"local": "bound"}, today_known=False)
         self.assertIsNone(unavailable[0]["today_tokens"])
 
-    def test_manual_progress_wins_and_action_progress_never_double_counts_blocked(self):
+    def test_explicit_assessment_wins_without_using_action_completion_rate(self):
         self.assertEqual(project_progress({"development_progress": 0, "progress_source": "manual", "open_tasks": 1, "completed_tasks": 6}), {"development_progress": 0.0, "progress_source": "manual"})
-        derived = project_progress({"open_tasks": 1, "blocked_tasks": 1, "completed_tasks": 6})
-        self.assertAlmostEqual(derived["development_progress"], 600/7)
-        self.assertEqual(derived["progress_source"], "tasks")
+        self.assertEqual(project_progress({"development_progress": 65, "progress_source": "ai", "open_tasks": 2, "completed_tasks": 15}), {"development_progress": 65.0, "progress_source": "ai"})
+        self.assertEqual(project_progress({"development_progress": 88, "progress_source": "tasks", "open_tasks": 1, "completed_tasks": 6}), {"development_progress": None, "progress_source": None})
+        self.assertEqual(project_progress({"open_tasks": 1, "blocked_tasks": 1, "completed_tasks": 6}), {"development_progress": None, "progress_source": None})
         for value in [None, True, -1, 101, float('nan'), float('inf'), 10**400]:
             with self.subTest(value=str(value)):
                 self.assertEqual(project_progress({"development_progress": value, "progress_source": "manual"}), {"development_progress": None, "progress_source": None})

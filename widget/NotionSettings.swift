@@ -162,6 +162,34 @@ struct NotionChoice: Identifiable {
     let iconMissing: Bool
 }
 
+enum ProjectImportSelection {
+    static func command(manifestURL: URL, folder: URL, taskRoot: URL,
+                        parentPage: String, existingHome: Bool) throws -> [String: Any] {
+        let root = taskRoot.resolvingSymlinksInPath().standardizedFileURL
+        let selected = folder.resolvingSymlinksInPath().standardizedFileURL
+        var directory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: selected.path, isDirectory: &directory), directory.boolValue,
+              selected.deletingLastPathComponent() == root else {
+            throw NSError(domain: "UsageWidget", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "请选择项目根目录下的直接子文件夹。"])
+        }
+        let data = try Data(contentsOf: manifestURL)
+        guard data.count <= 256 * 1024,
+              let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              manifest["version"] as? Int == 1, manifest["project"] is [String: Any] else {
+            throw NSError(domain: "UsageWidget", code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "请选择 Skill 生成的项目清单 JSON，文件不能超过 256 KB。"])
+        }
+        var command: [String: Any] = ["manifest": manifest, "folder": selected.path, "task_root": root.path]
+        if !parentPage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            command[existingHome ? "management_home" : "parent_page"] = parentPage
+        }
+        command["codex_home"] = ProcessInfo.processInfo.environment["CODEX_HOME"]
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
+        return command
+    }
+}
+
 @MainActor
 final class ProjectSettingsModel: ObservableObject {
     @Published var taskRoot: String
@@ -187,6 +215,9 @@ final class ProjectSettingsModel: ObservableObject {
     @Published var createIconMode = "emoji"
     @Published var createEmoji = ""
     @Published var createLogoURL = ""
+    @Published var importManifestPath = ""
+    @Published var importFolderPath = ""
+    @Published var importParentIsHome = true
     weak var usage: UsageModel?
     let root: URL
     let python: URL
@@ -411,6 +442,68 @@ final class ProjectSettingsModel: ObservableObject {
         guard let icon = newProjectIcon else { message = "请先选择一个 emoji 头像或填写有效 HTTPS Logo 地址。"; return }
         perform(["command": "create_project", "task_id": task.task_id, "name": task.name, "icon": icon])
     }
+    func chooseImportManifest() {
+        let picker = NSOpenPanel()
+        picker.canChooseDirectories = false; picker.canChooseFiles = true
+        picker.allowsMultipleSelection = false; picker.allowedContentTypes = [.json]
+        if picker.runModal() == .OK, let url = picker.url { importManifestPath = url.path }
+    }
+    func chooseImportFolder() {
+        let picker = NSOpenPanel()
+        picker.canChooseDirectories = true; picker.canChooseFiles = false
+        picker.allowsMultipleSelection = false
+        picker.directoryURL = URL(fileURLWithPath: (taskRoot as NSString).expandingTildeInPath)
+        if picker.runModal() == .OK, let url = picker.url { importFolderPath = url.path }
+    }
+    func importProject() {
+        guard !busy, usage?.notionEnabled == true, usage?.notionSyncing != true else { return }
+        let command: [String: Any]
+        do {
+            let saved = try WidgetPreferences.read(root: root)
+            let savedRoot = saved["task_root"] as? String
+                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents").path
+            guard URL(fileURLWithPath: (taskRoot as NSString).expandingTildeInPath).resolvingSymlinksInPath().standardizedFileURL
+                    == URL(fileURLWithPath: savedRoot).resolvingSymlinksInPath().standardizedFileURL else {
+                message = "请先保存项目根目录，再导入项目。"; return
+            }
+            command = try ProjectImportSelection.command(manifestURL: URL(fileURLWithPath: importManifestPath),
+                folder: URL(fileURLWithPath: importFolderPath),
+                taskRoot: URL(fileURLWithPath: (taskRoot as NSString).expandingTildeInPath),
+                parentPage: parentPage, existingHome: importParentIsHome)
+            if tokenSourceFile.isEmpty { try NotionCredential.save(token) }
+            token = ""
+        } catch { message = error.localizedDescription; return }
+        busy = true; message = "正在导入项目…"
+        let executable = python, folder = root
+        Task {
+            let result: Result<Data, Error> = await Task.detached(priority: .utility) {
+                do {
+                    let input = try JSONSerialization.data(withJSONObject: command)
+                    return .success(try runWidgetProcess(python: executable, root: folder,
+                        arguments: [folder.appendingPathComponent("widget/project_import.py").path,
+                                    "--data-dir", folder.appendingPathComponent("widget/data").path],
+                        input: input, timeout: 240))
+                } catch { return .failure(error) }
+            }.value
+            var imported = false
+            switch result {
+            case .success(let data):
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    if let status = json["status"] as? [String: Any] { apply(status) }
+                    if json["ok"] as? Bool == true {
+                        imported = true
+                        message = "项目已导入并绑定；胶囊按本周用量显示前四项，其余归入其他。"
+                    } else {
+                        message = (json["error"] as? [String: Any])?["message"] as? String ?? "导入尚未完成，可以用同一清单重试。"
+                    }
+                } else { message = "导入结果无法确认；保留原记录，使用同一清单重试。" }
+            case .failure(let error): message = error.localizedDescription
+            }
+            busy = false
+            if imported { usage?.syncNotion(force: true) }
+            usage?.refresh()
+        }
+    }
     func bind() {
         guard !selectedTask.isEmpty, !selectedPage.isEmpty else { return }
         guard !selectedPageNeedsIcon else {
@@ -555,6 +648,27 @@ struct ProjectSettingsView: View {
                     Text("项目头像会用于桌面胶囊。新建时必须选择头像；已有项目没有头像时，请在 Notion 设置后再绑定。")
                         .font(.callout).foregroundStyle(.secondary)
                 }
+                Section("一键导入已有项目") {
+                    Text("先让 Codex 调用 notion-project-workbench 整理项目清单，再选择清单和本机文件夹。")
+                        .font(.callout).foregroundStyle(.secondary)
+                    HStack {
+                        Text(model.importManifestPath.isEmpty ? "尚未选择项目清单" : URL(fileURLWithPath: model.importManifestPath).lastPathComponent)
+                            .font(.callout).lineLimit(1)
+                        Spacer()
+                        Button("选择项目清单…") { model.chooseImportManifest() }
+                    }
+                    HStack {
+                        Text(model.importFolderPath.isEmpty ? "尚未选择项目文件夹" : URL(fileURLWithPath: model.importFolderPath).lastPathComponent)
+                            .font(.callout).lineLimit(1)
+                        Spacer()
+                        Button("选择项目文件夹…") { model.chooseImportFolder() }
+                    }
+                    Toggle("上面的父页面是已有项目管理主页面", isOn: $model.importParentIsHome)
+                    Text("已有连接会复用原工作台。首次连接时，关闭此选项会在所选父页面下新建项目管理主页面。")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Button("一键导入项目") { model.importProject() }
+                        .disabled(model.importManifestPath.isEmpty || model.importFolderPath.isEmpty)
+                }.disabled(model.busy || usage.notionSyncing)
                 Section("摘要同步") {
                     HStack {
                         Button(usage.notionSyncing ? "同步中…" : "立即同步摘要") { usage.syncNotion(force: true) }.disabled(usage.notionSyncing)
@@ -573,6 +687,8 @@ struct ProjectSettingsView: View {
                         Toggle(kind.title, isOn: Binding(get: { usage.enabledWidgets.contains(kind) }, set: { _ in usage.toggleWidget(kind) }))
                     }
                 }
+                Text("前两个入口为 Codex 和本期 Token，后面显示本周用量最高的四个管理项目；其余任务放入其他。")
+                    .font(.callout).foregroundStyle(.secondary)
                 Text("横条和竖条保持桌面层；普通窗口可以盖住它们。显示选择和位置会自动保存。")
                     .font(.callout).foregroundStyle(.secondary)
                 Text("液态玻璃使用系统材质；macOS 26 启用系统玻璃效果，较早系统使用原生透明材质。悬停展开项目看板。")

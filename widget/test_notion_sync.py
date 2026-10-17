@@ -857,7 +857,7 @@ class NotionTests(unittest.TestCase):
     def test_fresh_bootstrap_builds_management_tasks_schema_and_reports_urls(self):
         self.ws.setup(PARENT)
         tasks = self.api.databases[self.ws.config["tasks_database_id"]]["properties"]
-        self.assertEqual(set(tasks), {"Name", "Project", "Status", "Priority", "Managed By", "Due", "Evidence", "Acceptance"})
+        self.assertEqual(set(tasks), {"Name", "Project", "Status", "Priority", "Managed By", "Due", "Evidence", "Acceptance", "Decision", "Recommendation", "Impact", "Task Key"})
         self.assertEqual([value["name"] for value in tasks["Status"]["select"]["options"]],
                          ["待处理", "进行中", "待确认", "阻塞", "已完成", "取消"])
         self.assertEqual(tasks["Project"]["relation"]["data_source_id"], self.ws.config["projects_data_source_id"])
@@ -936,7 +936,7 @@ class NotionTests(unittest.TestCase):
                    and ns._plain(body["title"]) == "任务 Tasks"]
         self.assertEqual(len(creates), 1)
 
-    def test_manual_progress_priority_and_tasks_fallback_have_explicit_source(self):
+    def test_invalid_explicit_progress_stays_unknown_despite_completed_tasks(self):
         project = self.connect(); source = self.task_source()
         for _ in range(6): self.add_task(source, project["page_id"], "已完成")
         self.add_task(source, project["page_id"], "待确认")
@@ -947,8 +947,8 @@ class NotionTests(unittest.TestCase):
         for invalid in [None, -1, 101, True, float('nan')]:
             page["properties"]["Development Progress"] = {"number": invalid}
             result = self.ws.projects(force=True)[0]
-            self.assertEqual(result["progress_source"], "tasks")
-            self.assertAlmostEqual(result["development_progress"], 600/7)
+            self.assertIsNone(result["progress_source"])
+            self.assertIsNone(result["development_progress"])
 
     def test_stale_task_progress_clears_while_manual_last_known_progress_is_marked_stale(self):
         project = self.connect(); source = self.task_source()
@@ -981,8 +981,8 @@ class NotionTests(unittest.TestCase):
         self.assertEqual([cached[field] for field in ns.TASK_COUNT_FIELDS], [3, 0, 8])
         self.assertEqual(cached["fetched_at"], observed)
         self.assertEqual(cached["next_step"], "审阅同步结果")
-        self.assertEqual(cached["progress_source"], "tasks")
-        self.assertAlmostEqual(cached["development_progress"], 800/11)
+        self.assertIsNone(cached["progress_source"])
+        self.assertIsNone(cached["development_progress"])
         self.assertFalse(any(url.endswith(f"/data_sources/{source}/query")
                              for _, url, _ in self.api.calls[calls:]))
         self.assertEqual(self.ws.cached_projects()[0]["completed_tasks"], 8)
@@ -996,7 +996,7 @@ class NotionTests(unittest.TestCase):
             self.time = NOW + timedelta(seconds=seconds)
             bound = self.ws.bind("task-b", project["page_id"])
             self.assertEqual(bound["fetched_at"], observed)
-            self.assertEqual(bound["development_progress"], 50)
+            self.assertIsNone(bound["development_progress"])
             self.assertFalse(self.ws.project_for_task("task-b")["stale"])
         self.time = NOW + timedelta(seconds=600)
         expired = self.ws.bind("task-b", project["page_id"])
@@ -1006,7 +1006,7 @@ class NotionTests(unittest.TestCase):
         self.assertTrue(self.ws.project_for_task("task-b")["stale"])
         refreshed = self.ws.projects(force=True)[0]
         self.assertEqual(refreshed["fetched_at"], self.time.isoformat())
-        self.assertEqual(refreshed["development_progress"], 50)
+        self.assertIsNone(refreshed["development_progress"])
 
     def test_project_verification_rejects_partial_error_stale_or_different_page_task_cache(self):
         project = self.connect(); source = self.task_source()
@@ -1029,6 +1029,75 @@ class NotionTests(unittest.TestCase):
                     result = self.ws._verify_project(project["page_id"])
                 self.assertTrue(all(result[field] is None for field in ns.TASK_COUNT_FIELDS))
                 self.assertIsNone(result["development_progress"])
+
+    def test_ai_progress_and_output_fields_are_explicit_not_task_ratio(self):
+        project = self.connect(); source = self.task_source()
+        for _ in range(15): self.add_task(source, project["page_id"], "已完成")
+        props = self.api.pages[project["page_id"]]["properties"]
+        props.update({"Development Progress": {"number": 65},
+            "Progress Source": {"select": {"name": "AI估算"}},
+            "Progress Evidence": {"rich_text": ns._text("已完成桌面核心；导入尚待实测")},
+            "Current Goal": {"rich_text": ns._text("完成项目导入与原生验收")},
+            "Latest Output": {"rich_text": ns._text("交互审阅版")},
+            "Latest Output URL": {"url": "https://example.com/review"},
+            "Latest Progress": {"rich_text": ns._text("三入口设计通过")}})
+        meta = self.ws.projects(force=True)[0]
+        self.assertEqual((meta["development_progress"], meta["progress_source"]), (65, "ai"))
+        self.assertEqual(meta["current_goal"], "完成项目导入与原生验收")
+        self.assertEqual(meta["latest_output_url"], "https://example.com/review")
+        self.assertEqual(meta["latest_progress_summary"], "三入口设计通过")
+        self.assertEqual(meta["latest_output_title"], "交互审阅版")
+
+    def test_human_counts_exclude_ai_and_preserve_unknown_ownership(self):
+        project = self.connect(); source = self.task_source()
+        for owner, status in [("AI", "已完成"), ("AI", "进行中"),
+                              ("人类确认", "待确认"), ("人类确认", "阻塞"), ("人类确认", "已完成")]:
+            task = self.add_task(source, project["page_id"], status)
+            task["properties"]["Managed By"] = {"select": {"name": owner}}
+        meta = self.ws.projects(force=True)[0]
+        self.assertEqual([meta[f] for f in ns.HUMAN_TASK_COUNT_FIELDS], [2, 1, 1])
+        self.assertEqual([meta[f] for f in ns.TASK_COUNT_FIELDS], [3, 1, 2])
+        self.add_task(source, project["page_id"], "待处理")
+        unclassified = self.ws.projects(force=True)[0]
+        self.assertTrue(all(unclassified[f] is None for f in ns.HUMAN_TASK_COUNT_FIELDS))
+        self.assertEqual(unclassified["open_tasks"], 4)
+
+    def test_unchanged_daily_snapshot_advances_only_local_stale_scan_guard(self):
+        self.connect()
+        first = self.row()
+        self.ws.sync([first], force=True)
+        remote_cutoff = self.api.summaries()[0]["properties"]["Statistics Until ISO"]["rich_text"]
+        self.time += timedelta(minutes=6)
+        newer = self.row(statistics_until=self.time.isoformat())
+        self.assertEqual(self.ws.sync([newer], force=True)["changed"], 0)
+        self.assertEqual(self.api.summaries()[0]["properties"]["Statistics Until ISO"]["rich_text"], remote_cutoff)
+        delayed = self.row(total_tokens=999, statistics_until=NOW.isoformat())
+        self.assertEqual(self.ws.sync([delayed], force=True)["changed"], 0)
+        self.assertEqual(self.api.summaries()[0]["properties"]["Total Tokens"]["number"], 100)
+
+    def test_regular_sync_checks_history_daily_and_after_binding_changes(self):
+        self.connect()
+        dataset = self.ws.config["dataset_id"]
+        def history_reads(calls):
+            return [c for c in calls if c[0] == "POST" and isinstance(c[2], dict)
+                    and c[2].get("filter", {}).get("property") == "Dataset"]
+        self.ws.sync([self.row()], complete_dataset_ids=[dataset])
+        self.time += timedelta(minutes=6)
+        start = len(self.api.calls)
+        self.ws.sync([self.row(total_tokens=120)], complete_dataset_ids=[dataset])
+        self.assertEqual(history_reads(self.api.calls[start:]), [])
+        self.assertEqual(self.api.summaries()[0]["properties"]["Counted Tokens"]["number"], 120)
+        second = self.ws.create_project("task-b", "第二项目", icon=PROJECT_ICON)
+        self.ws.bind("task-a", second["page_id"])
+        self.time += timedelta(minutes=6)
+        start = len(self.api.calls)
+        self.ws.sync([self.row(total_tokens=120)], complete_dataset_ids=[dataset])
+        self.assertEqual(len(history_reads(self.api.calls[start:])), 1)
+        self.assertEqual(sum(p["properties"]["Counted Tokens"]["number"] for p in self.api.summaries()), 120)
+        self.time += timedelta(days=1)
+        start = len(self.api.calls)
+        self.ws.sync([self.row(total_tokens=120)], complete_dataset_ids=[dataset])
+        self.assertEqual(len(history_reads(self.api.calls[start:])), 1)
 
     def test_project_verification_uses_current_manual_progress_over_preserved_task_counts(self):
         project = self.connect(); source = self.task_source()

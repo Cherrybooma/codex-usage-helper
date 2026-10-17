@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 .DS_Store
 widget/build/
+dist/
 
 # Private local records, diagnostics and export reports
 widget/data/
@@ -19,6 +20,7 @@ token*.pages
 widget/preview/*
 !widget/preview/demo.html
 !widget/preview/comparison.html
+!widget/preview/layout-review.html
 
 # Local design notes
 widget/brand-spec.md

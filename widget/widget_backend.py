@@ -13,6 +13,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
 import fcntl
+import math
 import os
 import hashlib
 from pathlib import Path
@@ -101,6 +102,59 @@ def normalize_limits(raw: dict, observed_at: datetime, source: str) -> dict:
             "source": source, "limit_id": rate.get("limitId") or "codex",
             "plan": plan if isinstance(plan, str) else None,
             "windows": windows}
+
+
+def normalize_cached_quota(quota: dict) -> dict:
+    """Recompute remaining from the authoritative used counter in old caches."""
+    if not isinstance(quota, dict) or not isinstance(quota.get("windows"), list):
+        raise ValueError("Invalid quota cache")
+    observed = datetime.fromisoformat(quota.get("observed_at", "").replace("Z", "+00:00"))
+    if observed.tzinfo is None:
+        raise ValueError("Invalid quota cache time")
+    windows = []
+    for window in quota.get("windows", []):
+        if not isinstance(window, dict):
+            continue
+        used = window.get("used_percent")
+        duration, reset = window.get("duration_mins"), window.get("resets_at")
+        if (isinstance(used, bool) or not isinstance(used, (int, float)) or
+                not math.isfinite(used) or not 0 <= used <= 100 or
+                not isinstance(window.get("key"), str) or
+                isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0 or
+                isinstance(reset, bool) or not isinstance(reset, (int, float)) or not math.isfinite(reset)):
+            continue
+        windows.append({**window, "remaining_percent": 100 - float(used)})
+    if not windows:
+        raise ValueError("Invalid quota cache windows")
+    return {**quota, "windows": windows}
+
+
+def estimated_investment(budget: dict) -> dict:
+    """User-defined $5 weekly reference; no token-to-quota conversion."""
+    quality = budget.get("usage_quality")
+    # Compatibility is intentionally conservative for pre-quality caches.
+    if quality is None and budget.get("status") == "estimated":
+        quality = "estimated"
+    value = budget.get("observed_total_percent")
+    valid = (quality in ("estimated", "lower_bound") and
+             isinstance(value, (int, float)) and not isinstance(value, bool) and
+             math.isfinite(value) and value >= 0)
+    return {"estimated_cost_usd": 5 * value / 100 if valid else None,
+            "estimated_cost_status": quality if valid else "unavailable",
+            "estimated_cost_lower_bound": bool(valid and quality == "lower_bound")}
+
+
+def attach_project_investment(rows: list[dict], reference: dict, total_tokens: int) -> None:
+    for row in rows:
+        amount = reference["estimated_cost_usd"]
+        attributable = row.get("usage_linked") is not False and total_tokens > 0
+        row.update({**reference,
+                    "estimated_cost_usd": amount * row["total_tokens"] / total_tokens
+                    if amount is not None and attributable else None,
+                    "estimated_cost_status": reference["estimated_cost_status"]
+                    if attributable else "unavailable",
+                    "estimated_cost_lower_bound": reference["estimated_cost_lower_bound"]
+                    if attributable else False})
 
 
 def official_cli() -> str | None:
@@ -244,6 +298,7 @@ def weekly_budget(db: sqlite3.Connection, now: datetime, *, read_failed: bool = 
     usage. Missing observations or ambiguous window changes stay explicit.
     """
     stamp = now.timestamp()
+    week_start, week_end = calendar_week(now)
     rows = db.execute("""SELECT o.observed,o.window_key,o.reset,o.used,c.plan,c.limit_id
         FROM observations o LEFT JOIN observation_context c
         ON o.observed=c.observed AND o.window_key=c.window_key
@@ -251,9 +306,10 @@ def weekly_budget(db: sqlite3.Connection, now: datetime, *, read_failed: bool = 
         (stamp,)).fetchall()
     if not rows:
         return {"status": "unavailable", "observed_total_percent": None,
+                "usage_quality": "unavailable",
+                "period_start": week_start.timestamp(), "period_end": week_end.timestamp(),
                 "excess_percent": None, "reset_count": 0,
                 "notes": ["尚无周额度观测，暂无法确认超额。"]}
-    week_start, week_end = calendar_week(now)
     start, end = week_start.timestamp(), week_end.timestamp()
     window_key = rows[0][1]
     reasons = []
@@ -303,13 +359,18 @@ def weekly_budget(db: sqlite3.Connection, now: datetime, *, read_failed: bool = 
                 # baseline as a whole new allowance.
                 ambiguous = True
                 incomplete("已用比例下降但截止时间未变，变化原因未确认。")
+            elif old_used == 0 and used == 0:
+                # The service moves an idle window's deadline forward while
+                # its counter stays at zero. That is not evidence of consumed
+                # capacity being replenished or an extra allowance reset.
+                pass
             else:
                 new_start = reset - WEEK_SECONDS
                 # A fresh weekly window must begin between observations.
                 # Otherwise a shifted deadline alone is not proof of a reset.
                 if old_time - 120 <= new_start <= observed + 120 and new_start >= start:
                     total += used
-                    if new_start < old_reset - 120:
+                    if old_used > 0 and new_start < old_reset - 120:
                         resets += 1
                     # Even a close pair may miss the old counter's final use.
                     if old_used < 100 and observed > old_time:
@@ -330,6 +391,8 @@ def weekly_budget(db: sqlite3.Connection, now: datetime, *, read_failed: bool = 
     excess = (round(max(0, total - 100), 6) if valid_total is not None and
               (not reasons or (total > 100 and not ambiguous)) else None)
     return {"status": "incomplete" if reasons else "estimated",
+            "usage_quality": "unavailable" if valid_total is None or ambiguous else
+                             "lower_bound" if reasons else "estimated",
             "period_start": start, "period_end": end,
             "observed_total_percent": valid_total, "excess_percent": excess,
             "reset_count": resets, "last_observed_at": latest[0],
@@ -485,6 +548,12 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
             notion_status = {"connected": False, "state": "error", "message": "Notion 配置暂不可读，本地统计正常"}
         if metadata:
             all_tasks, daily_rows, local_projects = aggregate(report, task_root, registry, metadata)
+    # Capsule tasks retain folder identity even when several folders share one
+    # Notion page. Daily Notion accounting still uses its existing project rollup.
+    folder_metadata = {task_id: {key: value for key, value in item.items() if key != "page_id"}
+                       for task_id, item in metadata.items()}
+    folder_tasks, _, _ = aggregate(report, task_root, registry, folder_metadata)
+    folder_tasks = [row for row in folder_tasks if row["total_tokens"] > 0]
     major, small = split_small(all_tasks, report["totals"]["total_tokens"])
     managed = None
     if workspace is not None and notion_status.get("connected"):
@@ -507,8 +576,14 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
             atomic_json(quota_file, quota)
         except (RuntimeError, ValueError, OSError) as error:
             quota_error = str(error)
-    if quota is None and quota_file.is_file():
-        quota = json.loads(quota_file.read_text(encoding="utf-8"))
+    try:
+        if quota is None and quota_file.is_file():
+            quota = json.loads(quota_file.read_text(encoding="utf-8"))
+        if quota is not None:
+            quota = normalize_cached_quota(quota)
+    except (ValueError, TypeError, AttributeError, OSError):
+        quota = None
+        quota_error = quota_error or "上次额度记录暂不可读；本机 Token 统计继续可用。"
     with closing(open_history(data / "quota-history.sqlite3")) as db:
         if quota:
             save_observation(db, quota)
@@ -519,6 +594,9 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
         age = max(0, (end - datetime.fromisoformat(quota["observed_at"])).total_seconds())
         quota = {**quota, "age_seconds": round(age), "stale": age > 180 or
                  any(window["resets_at"] <= end.timestamp() for window in quota["windows"])}
+    investment = estimated_investment(budget)
+    for rows in (all_tasks, major, small, folder_tasks, managed or []):
+        attach_project_investment(rows, investment, report["totals"]["total_tokens"])
     try:
         accounting = accounting_snapshot(home, task_root, data, end)
     except (ValueError, OSError, sqlite3.Error):
@@ -529,6 +607,8 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
             "legacy_updates": report["totals"]["legacy_updates"],
             "today_tokens": today_tokens,
             "tasks": major, "other_tasks": small,
+            "all_usage_tasks": folder_tasks, "task_count": len(folder_tasks),
+            **investment,
             "management_projects": managed,
             "dataset_id": registry.dataset_id, "available_projects": local_projects,
             "notion": notion_status,
@@ -551,6 +631,7 @@ def main():
     action.add_argument("--sync-notion", action="store_true", help="Sync project and independent period summaries")
     action.add_argument("--accounting-summary", action="store_true", help="Recompute natural-week and confirmed billing-month summaries locally")
     parser.add_argument("--force-sync", action="store_true", help="Bypass the Notion sync interval")
+    parser.add_argument("--quota-window-audit", action="store_true", help="Explicitly sync optional quota-window audit rows; ordinary Notion sync keeps these locally")
     args = parser.parse_args()
     try:
         settings_file = args.data_dir / "app-settings.json"
@@ -611,6 +692,7 @@ def main():
                     ledger_rows, window_rows = report_rows(accounting, accounting["dataset_id"])
                     period_result = periods.sync(ledger_rows, window_rows,
                         now=datetime.now(UTC), force=args.force_sync,
+                        sync_windows=args.quota_window_audit,
                         billing_configured=accounting["monthly"]["status"] == "configured",
                         active_monthly_schedule=accounting["monthly"].get("schedule_id"))
             except (NotionError, ValueError, OSError, sqlite3.Error) as exc:

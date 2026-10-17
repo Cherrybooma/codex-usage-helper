@@ -1,0 +1,9 @@
+# Defense in depth: release archives contain source, never local runtime data.
+/.venv export-ignore
+/validation export-ignore
+/widget/data export-ignore
+/widget/build export-ignore
+/dist export-ignore
+*.pages export-ignore
+.env export-ignore
+.env.* export-ignore

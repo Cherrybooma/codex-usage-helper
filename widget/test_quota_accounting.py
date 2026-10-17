@@ -92,6 +92,35 @@ class QuotaAccountingTests(unittest.TestCase):
         self.assertEqual(sum(r['state']=='进行中' for r in report['windows']),1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM observations').fetchone()[0],11)
 
+    def test_idle_zero_history_is_suppressed_without_deleting_raw_observations(self):
+        self.add(100, 58, reset=604800, duration=10080, key="secondary")
+        for offset in range(1000, 11000, 1000):
+            self.add(offset, 0, reset=604800 + offset, duration=10080, key="secondary")
+        # No window_changes table entries are needed: older zero deadlines may
+        # still be in the future, but only the newest one is the current zero.
+        before = self.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        report = self.report(11000)
+        self.assertEqual(len(report["windows"]), 2)
+        self.assertEqual(sorted(row["used_percent"] for row in report["windows"]), [0, 58])
+        self.assertEqual(report["idle_zero_windows_omitted"], 9)
+        self.assertEqual(report["windows_recorded_locally"], 11)
+        self.assertFalse(report["history_limited"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0], before)
+
+    def test_all_zero_closed_history_is_not_an_unused_allowance_claim(self):
+        self.add(100, 0, reset=18000)
+        report = self.report(19000)
+        self.assertEqual(report["windows"], [])
+        self.assertEqual(report["idle_zero_windows_omitted"], 1)
+
+    def test_fixed_cutoff_keeps_then_current_zero_before_future_usage(self):
+        self.add(100, 0, reset=18000)
+        self.add(700, 20, reset=18700)
+        report = self.report(600)
+        self.assertEqual(len(report["windows"]), 1)
+        self.assertEqual(report["windows"][0]["used_percent"], 0)
+        self.assertEqual(report["idle_zero_windows_omitted"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

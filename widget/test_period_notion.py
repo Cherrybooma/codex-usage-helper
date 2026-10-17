@@ -316,6 +316,46 @@ class PeriodNotionTests(unittest.TestCase):
         self.assertEqual(len(other_pages), 1)
         self.assertTrue(other_pages[0]["properties"]["Included"]["checkbox"])
 
+    def test_open_period_clock_tick_does_not_write_or_accept_delayed_old_counts(self):
+        self.sync([self.row(total=120)])
+        remote = deepcopy(self.api.period_pages()[0]["properties"])
+        self.now += timedelta(minutes=6)
+        self.assertEqual(self.sync([self.row(total=120)])["changed"], 0)
+        self.assertEqual(self.api.period_pages()[0]["properties"], remote)
+        delayed = self.row(total=999, until=NOW)
+        self.assertEqual(self.sync([delayed])["changed"], 0)
+        self.assertEqual(self.api.period_pages()[0]["properties"]["Total Tokens"]["number"], 120)
+        self.assertEqual(self.sync([self.row(total=121)])["changed"], 1)
+
+    def test_regular_period_sync_avoids_full_history_reads_until_daily_audit(self):
+        self.ws.sync([self.row()], [], now=self.now)
+        self.now += timedelta(minutes=6)
+        start = len(self.api.calls)
+        self.ws.sync([self.row(total=120)], [], now=self.now)
+        history_reads = lambda calls: [c for c in calls if c[0] == "POST" and isinstance(c[2], dict)
+            and c[2].get("filter", {}).get("property") == "Dataset"]
+        self.assertEqual(history_reads(self.api.calls[start:]), [])
+        self.assertEqual(self.api.period_pages()[0]["properties"]["Counted Tokens"]["number"], 120)
+        self.now += timedelta(days=1)
+        start = len(self.api.calls)
+        self.ws.sync([self.row(total=120)], [], now=self.now)
+        self.assertEqual(len(history_reads(self.api.calls[start:])), 2)
+
+    def test_ledger_only_sync_leaves_quota_pending_and_cloud_history_untouched(self):
+        self.api.schedule(lambda method, path, payload: method == "POST" and path == "/pages",
+                          (403, {}, {"code": "restricted_resource"}))
+        self.sync([], [self.window()])
+        self.assertEqual(self.ws.status()["pending_count"], 1)
+        start = len(self.api.calls)
+        result = self.ws.sync([self.row()], [self.window()], now=self.now, force=True, sync_windows=False)
+        self.assertIsNone(result["error"])
+        self.assertEqual(len(self.api.period_pages()), 1)
+        self.assertEqual(self.api.period_pages()[0]["properties"]["Kind"]["select"]["name"], "自然周")
+        self.assertEqual(result["pending_count"], 1)
+        window_source = self.ws.config["period_windows_data_source_id"]
+        self.assertFalse(any(window_source in c[1] for c in self.api.calls[start:]))
+        self.assertEqual(self.sync([], [self.window()])["changed"], 1)
+
     def test_delayed_old_scan_cannot_roll_back_or_retire_newer_snapshot(self):
         self.sync([self.row(total=120)], complete_kinds=["natural_week"], complete_until=NOW)
         result = self.sync([], complete_kinds=["natural_week"], complete_until=NOW - timedelta(hours=1))

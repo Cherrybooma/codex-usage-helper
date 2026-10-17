@@ -51,12 +51,27 @@ def quota_window_report(path: Path | str, now: datetime, *, history_limit: int =
             skipped += 1
             continue
         grouped[(key, duration, reset)].append((observed, used, contexts.get((observed, key), (None, None))))
+    # Keep raw observations intact. Idle 0% deadlines can roll forward on each
+    # read; old zero-only groups are not separate consumption histories worth
+    # exporting as hundreds of account-period cards. Retain the newest current
+    # zero window, and every window that ever contained observed usage.
+    newest = {}
+    for (key, duration, reset), samples in grouped.items():
+        candidate = (samples[-1][0], reset)
+        if candidate > newest.get((key, duration), (-math.inf, -math.inf)):
+            newest[(key, duration)] = candidate
     windows = []
+    idle_omitted = 0
     for (key, duration, reset), samples in grouped.items():
         first, last = samples[0], samples[-1]
         inferred_start = reset - duration * 60
         change = changes.get((key, duration, reset))
         ended_at = min(reset, change) if change is not None else reset
+        peak = max(s[1] for s in samples)
+        if peak == 0 and not (ended_at > cutoff and
+                              newest[(key, duration)] == (last[0], reset)):
+            idle_omitted += 1
+            continue
         notes = []
         if first[0] > inferred_start + GAP_SECONDS:
             notes.append("未从窗口开始连续采集，首次观测之前的过程未知。")
@@ -82,7 +97,7 @@ def quota_window_report(path: Path | str, now: datetime, *, history_limit: int =
             "observed_until": _iso(last[0]), "ended_at": _iso(ended_at),
             "duration_mins": duration, "used_percent": last[1],
             "remaining_percent": max(0, 100 - last[1]),
-            "first_used_percent": first[1], "peak_used_percent": max(s[1] for s in samples),
+            "first_used_percent": first[1], "peak_used_percent": peak,
             "observed_increase_percent": delta, "observations": len(samples),
             "first_observed_at": _iso(first[0]), "last_observed_at": _iso(last[0]),
             "state": "进行中" if ended_at > cutoff else "已结束",
@@ -93,7 +108,8 @@ def quota_window_report(path: Path | str, now: datetime, *, history_limit: int =
             "data_scope": "官方已返回的百分比；窗口开始按时长反推，不是Token账单。",
         })
     windows.sort(key=lambda row: (row["end"], row["kind"]), reverse=True)
-    total_windows = len(windows)
+    total_windows = len(grouped)
+    displayable_windows = len(windows)
     current = [row for row in windows if row["state"] == "进行中"]
     history = [row for row in windows if row["state"] == "已结束"][:history_limit]
     # This is a partial display/export, never a reconciliation scope. Keep all
@@ -103,6 +119,7 @@ def quota_window_report(path: Path | str, now: datetime, *, history_limit: int =
     return {"status": "recorded" if windows else "unavailable", "statistics_until": _iso(cutoff), "windows": windows,
             "windows_recorded_locally": total_windows, "history_limit": history_limit,
             "history_scope": "current_and_recent_closed_windows",
-            "history_limited": total_windows > len(windows),
+            "history_limited": displayable_windows > len(windows),
+            "idle_zero_windows_omitted": idle_omitted,
             "skipped_observations": skipped,
             "notes": ["不对不同窗口的剩余百分比求和；未采集的历史额度保持未知。"]}

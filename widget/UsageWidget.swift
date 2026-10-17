@@ -3,6 +3,7 @@ import SwiftUI
 import CoreGraphics
 
 struct TaskRow: Decodable, Identifiable {
+    var task_ids: [String]?
     var id: String { is_other == true ? "__other_bucket__" : "folder:\(task_id ?? name)" }
     let name: String
     let total_tokens: Int
@@ -22,6 +23,13 @@ struct TaskRow: Decodable, Identifiable {
     let project_goal: String?
     let weekly_goal: String?
     let next_step: String?
+    let current_goal: String?
+    let human_open_tasks: Int?
+    let human_blocked_tasks: Int?
+    let human_completed_tasks: Int?
+    let latest_output_title: String?
+    let latest_output_url: String?
+    let latest_progress_summary: String?
     let project_priority: String?
     let project_health: String?
     let target_date: String?
@@ -34,6 +42,9 @@ struct TaskRow: Decodable, Identifiable {
     let development_progress: Double?
     let progress_source: String?
     let today_tokens: Int?
+    let estimated_cost_usd: Double?
+    let estimated_cost_status: String?
+    let estimated_cost_lower_bound: Bool?
 }
 
 struct LocalProject: Decodable, Identifiable {
@@ -85,6 +96,7 @@ struct WeeklyBudget: Decodable {
     let excess_percent: Double?
     let reset_count: Int
     let notes: [String]
+    let usage_quality: String?
 }
 
 extension WeeklyBudget {
@@ -107,6 +119,11 @@ struct Snapshot: Decodable {
     let legacy_updates: Int
     let tasks: [TaskRow]
     let other_tasks: [TaskRow]
+    let all_usage_tasks: [TaskRow]?
+    let task_count: Int?
+    let estimated_cost_usd: Double?
+    let estimated_cost_status: String?
+    let estimated_cost_lower_bound: Bool?
     let management_projects: [TaskRow]?
     let quota: Quota?
     let quota_error: String?
@@ -544,6 +561,20 @@ struct UsageView: View {
 class FloatingPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+    var backgroundDragRegion: ((CGPoint) -> Bool)?
+    var onBackgroundDrag: ((Bool) -> Void)?
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown, backgroundDragRegion?(event.locationInWindow) == true {
+            // Intercept before NSHostingView can route this background press
+            // to a rectangular SwiftUI tracking or button area.
+            onBackgroundDrag?(true)
+            performDrag(with: event)
+            onBackgroundDrag?(false)
+            return
+        }
+        super.sendEvent(event)
+    }
 }
 
 @MainActor
@@ -591,6 +622,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Match the approved pale-glass preview; the original box retains system appearance.
             strip.appearance = NSAppearance(named: .aqua)
             strip.hasShadow = false
+            strip.isMovableByWindowBackground = false
+            strip.backgroundDragRegion = { [weak self, weak strip] location in
+                guard let self, let strip else { return false }
+                let point = CGPoint(x: location.x, y: strip.frame.height - location.y)
+                return self.stripHitTarget(kind, at: point) == .background
+            }
+            strip.onBackgroundDrag = { [weak self, weak state] dragging in
+                if dragging { state?.beginDragging() } else { state?.endDragging() }
+                self?.pointerZones.removeValue(forKey: kind)
+                if !dragging { self?.updatePointerPassthrough() }
+            }
             interactions[kind] = state
             strips[kind] = strip
             state.onResize = { [weak self] in self?.resizeStrip(kind) }
@@ -690,7 +732,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let window = strips[kind], let state = interactions[kind] else { return }
         resizingStrips = true
         defer { resizingStrips = false }
-        let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric)
+        let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric, managementEnabled: model.notionEnabled)
         let vertical = kind == .vertical
         let natural = UsageStrip.canvasSize(itemCount: items.count, vertical: vertical)
         // Reserve a fixed overlay budget so hover never moves its anchor.
@@ -698,7 +740,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let screen = initial ? (NSScreen.screens.first { Double(($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0) == savedScreen } ?? NSScreen.main) : (window.screen ?? NSScreen.main)
         let bounds = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let width = min(natural.width, bounds.width - 16)
-        let height = min(natural.height, max(200, bounds.height - 64))
+        let height = min(natural.height, max(0, bounds.height - 16))
         var x = window.frame.minX
         var anchorTop = window.frame.maxY - (headerOffsets[kind] ?? 0)
         if initial {
@@ -730,34 +772,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let mouse = NSEvent.mouseLocation
         for (kind, window) in strips {
             guard let state = interactions[kind], window.isVisible else { continue }
-            let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric)
+            let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric, managementEnabled: model.notionEnabled)
             let x = mouse.x - window.frame.minX
             let y = window.frame.maxY - mouse.y
             let point = CGPoint(x: x, y: y)
-            let canvas = window.frame.size
-            let vertical = kind == .vertical
-            let offset = headerOffsets[kind] ?? 0
-            let header = UsageStrip.headerFrame(itemCount: items.count, vertical: vertical, canvas: canvas, headerOffset: offset).insetBy(dx: UsageStrip.inset, dy: UsageStrip.inset)
+            let target = stripHitTarget(kind, at: point)
             var hovered: String?
-            if pointInCapsule(point, rect: header) {
-                if !vertical {
-                    let index = Int((x - header.minX) / UsageStrip.moduleWidth)
-                    if items.indices.contains(index) { hovered = items[index].id }
-                } else { hovered = "__vertical_surface__" }
+            switch target {
+            case .module(let index): if items.indices.contains(index) { hovered = items[index].id }
+            case .detail, .connector: hovered = state.expanded
+            case .background, .outside: break
             }
-            if hovered == nil, let selected = state.expanded, let index = items.firstIndex(where: { $0.id == selected }) {
-                let card = UsageStrip.detailFrame(for: items[index], index: index, itemCount: items.count, vertical: vertical, canvas: canvas, headerOffset: offset, locked: state.locked)
-                let bridge = UsageStrip.connectorFrame(index: index, itemCount: items.count, vertical: vertical, canvas: canvas, detail: card, headerOffset: offset)
-                if pointInRoundedRectangle(point, rect: card, radius: UsageStrip.detailRadius) || bridge.contains(point) { hovered = selected }
-            }
-            window.ignoresMouseEvents = hovered == nil
+            // The visible rail background receives dragging without selecting
+            // a module. Only the unused transparent canvas passes through.
+            window.ignoresMouseEvents = !target.acceptsMouse
             if pointerZones[kind] != hovered {
                 if hovered == nil { state.leaveAllHoverZones() }
                 else if let previous = pointerZones[kind] { state.hover(previous, inside: false, zone: "native-pointer") }
-                if let hovered, hovered != "__vertical_surface__" { state.hover(hovered, inside: true, zone: "native-pointer") }
+                if let hovered { state.hover(hovered, inside: true, zone: "native-pointer") }
                 pointerZones[kind] = hovered
             }
         }
+    }
+
+    func stripHitTarget(_ kind: WidgetKind, at point: CGPoint) -> StripHitTarget {
+        guard let window = strips[kind], let state = interactions[kind], model != nil else { return .outside }
+        let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric, managementEnabled: model.notionEnabled)
+        let canvas = window.frame.size
+        let vertical = kind == .vertical
+        let offset = headerOffsets[kind] ?? 0
+        let selectedIndex = items.firstIndex { $0.id == state.expanded }
+        let detail = selectedIndex.map { index in
+            UsageStrip.detailFrame(for: items[index], index: index, itemCount: items.count, vertical: vertical, canvas: canvas,
+                headerOffset: offset, locked: state.locked, page: state.dashboardPage, sectionPage: state.sectionPage)
+        }
+        return UsageStrip.hitTarget(at: point, itemCount: items.count, vertical: vertical, canvas: canvas,
+            headerOffset: offset, detail: detail, detailIndex: selectedIndex)
     }
 
     func restorePosition(_ window: NSWindow, kind: WidgetKind) {
@@ -781,7 +831,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "x": (window.frame.minX - bounds.minX) / max(1, bounds.width - window.frame.width),
             "top": (bounds.maxY - window.frame.maxY) / max(1, bounds.height - window.frame.height)]
         if kind != .box {
-            let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: interactions[kind]?.quotaMetric ?? .weeklyUsed)
+            let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: interactions[kind]?.quotaMetric ?? .weeklyUsed, managementEnabled: model.notionEnabled)
             let anchorTop = window.frame.maxY - (headerOffsets[kind] ?? 0)
             saved["anchor_top"] = (bounds.maxY - anchorTop) / max(1, bounds.height - UsageStrip.naturalSize(itemCount: items.count, vertical: kind == .vertical).height)
         }

@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from widget_backend import group_tasks, normalize_limits, save_observation, cycle_history, open_history, weekly_budget, WEEK_SECONDS, calendar_week
 from widget_backend import build_snapshot, main as backend_main
+from widget_backend import estimated_investment, attach_project_investment
 
 
 class SnapshotIntegrationTests(unittest.TestCase):
@@ -107,7 +108,8 @@ class SnapshotIntegrationTests(unittest.TestCase):
             self.assertNotIn("PRIVATE_SYNTHETIC_MARKER", str(result))
 
     def test_explicit_opt_in_preserves_forced_summary_sync(self):
-        with tempfile.TemporaryDirectory() as temporary, patch("notion_sync.NotionWorkspace") as constructor, \
+        with tempfile.TemporaryDirectory() as temporary, patch("period_notion.PeriodNotionWorkspace") as periods, \
+             patch("notion_sync.NotionWorkspace") as constructor, \
              patch("notion_sync.keychain_token", side_effect=AssertionError("credential accessed")), \
              patch("notion_sync.urllib_transport", side_effect=AssertionError("network accessed")):
             data = Path(temporary)
@@ -116,6 +118,9 @@ class SnapshotIntegrationTests(unittest.TestCase):
                      "statistics_until": self.NOW.isoformat()}
             (data / "notion-daily.json").write_text(json.dumps(saved))
             workspace = constructor.return_value
+            # This project-summary test must not depend on optional account
+            # pages, nor import their base class for the first time under a mock.
+            periods.return_value.status.return_value = {"ready": False}
             workspace.status.return_value = {"ready": True}
             workspace.sync.return_value = {"changed": 1}
             code, result = self.sync_command(data, force=True)
@@ -217,6 +222,83 @@ class SnapshotIntegrationTests(unittest.TestCase):
             snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
             self.assertFalse(snapshot["quota"]["stale"])
             self.assertEqual(snapshot["quota"]["age_seconds"], 0)
+
+    def test_stored_remaining_is_recomputed_from_used_not_mislabeled(self):
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()):
+            data = Path(temporary)
+            quota = {"observed_at": self.NOW.isoformat(), "plan": "plus", "source": "test", "limit_id": "codex",
+                     "windows": [{"key": "secondary", "label": "weekly", "duration_mins": 10080,
+                                  "used_percent": 69, "remaining_percent": 69,
+                                  "resets_at": self.NOW.timestamp() + 5000}]}
+            (data / "official-latest.json").write_text(json.dumps(quota))
+            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+            self.assertEqual(snapshot["quota"]["windows"][0]["remaining_percent"], 31)
+
+    def test_invalid_quota_cache_does_not_drop_local_usage_or_print_contents(self):
+        for value in ["PRIVATE_SYNTHETIC_CACHE", '["private"]', '{"windows":[{}]}']:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary, \
+                 patch("widget_backend.scan_usage", return_value=self.report()):
+                data = Path(temporary)
+                (data / "official-latest.json").write_text(value)
+                snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+                self.assertEqual(snapshot["total_tokens"], 100)
+                self.assertIsNone(snapshot["quota"])
+                self.assertNotIn("PRIVATE", snapshot["quota_error"])
+
+    def test_all_positive_folder_tasks_survive_threshold_and_notion_rollup(self):
+        payload = self.report()
+        numbers = [70, 10, 8, 5, 4, 3, 0]
+        payload["projects"] = [{"project": f"/tmp/widget-root/task-{i}/sub", "total_tokens": amount,
+                                "request_records": int(amount > 0), "thread_ids": [f"thread-{i}"]}
+                               for i, amount in enumerate(numbers)]
+        payload["project_daily"] = [dict(row, day="2026-10-13") for row in payload["projects"]]
+        payload["totals"]["request_records"] = 6
+        metadata = {"page_id": "shared", "display_name": "同一管理页", "project_goal": "愿景",
+                    "development_progress": 65, "progress_source": "ai", "current_goal": "交付已验证成果"}
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=payload), \
+             patch("notion_sync.NotionWorkspace") as constructor:
+            workspace = constructor.return_value
+            workspace.status.return_value = {"connected": True}
+            workspace.project_for_task.return_value = metadata
+            workspace.cached_projects.return_value = []
+            snapshot = build_snapshot(Path(temporary), Path("/tmp/widget-root"), Path(temporary), False, self.NOW)
+            self.assertEqual(snapshot["task_count"], 6)
+            self.assertEqual(snapshot["request_records"], 6)
+            self.assertEqual([row["total_tokens"] for row in snapshot["all_usage_tasks"]], numbers[:-1])
+            self.assertEqual(len({row["task_id"] for row in snapshot["all_usage_tasks"]}), 6)
+            self.assertEqual(sum(row["total_tokens"] for row in snapshot["all_usage_tasks"]), 100)
+            self.assertEqual(sum(row["percent"] for row in snapshot["all_usage_tasks"]), 100)
+            self.assertTrue(all(row["development_progress"] == 65 for row in snapshot["all_usage_tasks"]))
+            # Existing Notion accounting may merge folders; that cannot change
+            # the capsule's folder count or its shares.
+            self.assertEqual(len(snapshot["tasks"]), 1)
+
+
+class InvestmentTests(unittest.TestCase):
+    def test_week_reference_and_all_project_shares_conserve_amount(self):
+        reference = estimated_investment({"status": "estimated", "usage_quality": "estimated",
+                                          "observed_total_percent": 140})
+        self.assertEqual(reference["estimated_cost_usd"], 7)
+        rows = [{"total_tokens": 882}, {"total_tokens": 100}, {"total_tokens": 18}]
+        attach_project_investment(rows, reference, 1000)
+        self.assertAlmostEqual(rows[0]["estimated_cost_usd"], 6.174)
+        self.assertAlmostEqual(sum(row["estimated_cost_usd"] for row in rows), 7)
+        self.assertTrue(all(not row["estimated_cost_lower_bound"] for row in rows))
+
+    def test_partial_observations_keep_explicit_lower_bound_and_unknown_stays_unknown(self):
+        reference = estimated_investment({"status": "incomplete", "usage_quality": "lower_bound",
+                                          "observed_total_percent": 60})
+        self.assertEqual(reference["estimated_cost_usd"], 3)
+        self.assertTrue(reference["estimated_cost_lower_bound"])
+        for budget in [{}, {"status": "incomplete", "observed_total_percent": 70},
+                       {"usage_quality": "unavailable", "observed_total_percent": 130},
+                       {"usage_quality": "estimated", "observed_total_percent": float("nan")}]:
+            with self.subTest(budget=budget):
+                self.assertIsNone(estimated_investment(budget)["estimated_cost_usd"])
+        rows = [{"total_tokens": 0, "usage_linked": False}]
+        attach_project_investment(rows, reference, 1000)
+        self.assertIsNone(rows[0]["estimated_cost_usd"])
+        self.assertEqual(rows[0]["estimated_cost_status"], "unavailable")
 
 
 class WidgetTests(unittest.TestCase):
@@ -347,6 +429,7 @@ class WeeklyBudgetTests(unittest.TestCase):
         self.assertEqual(result["observed_total_percent"], 60)
         self.assertEqual(result["excess_percent"], 0)
         self.assertEqual(result["status"], "estimated")
+        self.assertEqual(result["usage_quality"], "estimated")
 
     def test_full_early_reset_retains_consumption_and_original_deadline(self):
         self.add(60, 100)
@@ -366,6 +449,32 @@ class WeeklyBudgetTests(unittest.TestCase):
         self.assertEqual(result["observed_total_percent"], 150)
         self.assertEqual(result["excess_percent"], 50)
         self.assertEqual(result["status"], "incomplete")
+
+    def test_idle_zero_deadlines_are_not_extra_resets_or_new_consumption(self):
+        self.add(60, 0, reset_offset=WEEK_SECONDS + 1000)
+        self.add(120, 0, reset_offset=WEEK_SECONDS + 2000)
+        result = self.summary(120)
+        self.assertEqual(result["reset_count"], 0)
+        self.assertEqual(result["observed_total_percent"], 0)
+        self.assertEqual(result["usage_quality"], "estimated")
+
+    def test_idle_deadline_rolls_preserve_positive_109_percent_without_167_resets(self):
+        self.db.execute("DELETE FROM observations")
+        self.db.execute("DELETE FROM observation_context")
+        self.add(60, 32, reset_offset=WEEK_SECONDS - 3600)
+        self.add(120, 58, reset_offset=WEEK_SECONDS - 3600)
+        offset = 3000
+        self.add(offset, 0, reset_offset=WEEK_SECONDS + offset)
+        for _ in range(166):
+            offset += 180
+            self.add(offset, 0, reset_offset=WEEK_SECONDS + offset)
+        self.add(offset + 60, 83, reset_offset=WEEK_SECONDS + offset)
+        before = self.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        result = self.summary(offset + 60)
+        self.assertEqual(result["observed_total_percent"], 109)
+        self.assertEqual(result["reset_count"], 1)
+        self.assertEqual(result["usage_quality"], "lower_bound")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0], before)
 
     def test_first_post_reset_observation_can_already_contain_usage(self):
         self.add(60, 100)
@@ -401,6 +510,7 @@ class WeeklyBudgetTests(unittest.TestCase):
         result = self.summary(3900)
         self.assertIsNone(result["excess_percent"])
         self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["usage_quality"], "lower_bound")
         self.assertTrue(any("采集间隔" in n for n in result["notes"]))
         self.assertTrue(any("过期" in n for n in result["notes"]))
         self.add(3960, 70)
@@ -444,6 +554,7 @@ class WeeklyBudgetTests(unittest.TestCase):
         result = self.summary(180)
         self.assertEqual(result["observed_total_percent"], 70)
         self.assertIsNone(result["excess_percent"])
+        self.assertEqual(result["usage_quality"], "unavailable")
         self.add(240, 30, reset_offset=WEEK_SECONDS + 1000)
         result = self.summary(240)
         self.assertEqual(result["reset_count"], 0)
@@ -525,6 +636,8 @@ class WeeklyBudgetTests(unittest.TestCase):
         self.db.execute("DELETE FROM observations")
         result = self.summary(0)
         self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["usage_quality"], "unavailable")
+        self.assertEqual(result["period_start"], self.START)
         self.assertIsNone(result["excess_percent"])
 
 

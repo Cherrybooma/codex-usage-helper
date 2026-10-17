@@ -422,9 +422,13 @@ class PeriodNotionWorkspace(NotionWorkspace):
 
     @staticmethod
     def _fingerprint(row):
-        # Replay time advances even when a closed period is unchanged. Keep it
-        # locally for stale-scan protection without issuing identical writes.
-        content = {field: value for field, value in row.items() if field != "scan_cutoff"}
+        # Keep scan watermarks locally. Advancing time alone is not new usage:
+        # preserve the last transmitted cutoff without repainting the cloud row.
+        # Window observations retain their observation time/count semantics.
+        ignored = {"scan_cutoff"}
+        if row.get("family") == "ledger":
+            ignored.add("statistics_until")
+        content = {field: value for field, value in row.items() if field not in ignored}
         return hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     def _properties(self, row, key, now):
@@ -543,7 +547,7 @@ class PeriodNotionWorkspace(NotionWorkspace):
         self._save(self.state_path, self.state)
         return True
 
-    def sync(self, ledger_rows: list[dict], window_rows: list[dict], *, now=None, force=False,
+    def sync(self, ledger_rows: list[dict], window_rows: list[dict], *, now=None, force=False, sync_windows=True,
              complete_kinds=None, complete_until=None, billing_configured=None,
              active_monthly_schedule=None) -> dict:
         """Reconcile explicit complete kinds only; partial inputs never retire history.
@@ -561,7 +565,9 @@ class PeriodNotionWorkspace(NotionWorkspace):
             state = self._period_state()
             now, changed = self._now(now), 0
             try:
-                rows = self._normalize(ledger_rows, "ledger", now) + self._normalize(window_rows, "windows", now)
+                if not isinstance(sync_windows, bool):
+                    raise NotionError("invalid_input")
+                rows = self._normalize(ledger_rows, "ledger", now) + (self._normalize(window_rows, "windows", now) if sync_windows else [])
                 if complete_kinds is not None and (not isinstance(complete_kinds, list) or any(kind not in ALL_KINDS for kind in complete_kinds)):
                     raise NotionError("invalid_input")
                 if billing_configured is not None and not isinstance(billing_configured, bool):
@@ -576,6 +582,8 @@ class PeriodNotionWorkspace(NotionWorkspace):
                 if cutoff > now:
                     raise NotionError("invalid_input")
                 complete = set(complete_kinds or [])
+                if not sync_windows:
+                    complete -= WINDOW_KINDS.keys()
                 if billing_configured is False:
                     complete.discard("billing_month")
                 if billing_configured is not None:
@@ -645,24 +653,41 @@ class PeriodNotionWorkspace(NotionWorkspace):
                     raise NotionError("not_configured")
                 if not force and self.state.get("automatic_sync_paused"):
                     return {**self._status(), "changed": 0}
-                self._token()
                 if not force and state.get("last_attempt") and (now - self._now(state["last_attempt"])).total_seconds() < 300:
                     return {**self._status(), "changed": 0}
+                self._token()
                 state["last_attempt"] = now.isoformat()
                 # Validate both data sources before any cloud writes.
-                for family in ("ledger", "windows"):
+                families = ("ledger", "windows") if sync_windows else ("ledger",)
+                for family in families:
                     self._validate_source(family, self._source(family))
                 retire, retire_scopes, superseded = {}, {}, {}
-                query_datasets = datasets | {row["dataset_id"] for row in state["pending"].values()}
+                query_datasets = datasets | {row["dataset_id"] for row in state["pending"].values() if sync_windows or row["family"] == "ledger"}
                 if complete or active_monthly_schedule:
                     query_datasets.add(dataset)
-                for family in ("ledger", "windows"):
+                reconciled = state.setdefault("reconciled_datasets", {})
+                audits = {}
+                for family in families:
                     family_complete = complete & (LEDGER_KINDS.keys() if family == "ledger" else WINDOW_KINDS.keys())
                     if family == "ledger" and active_monthly_schedule:
                         family_complete = family_complete | {"billing_month"}
                     seen = set()
                     for remote_dataset in sorted(query_datasets):
+                        keys = sorted(self._key(row) for row in rows if row["family"] == family and row["dataset_id"] == remote_dataset)
+                        fingerprint = hashlib.sha256(json.dumps([keys, sorted(family_complete), active_monthly_schedule]).encode()).hexdigest()
+                        scope = remote_dataset + ":" + family
+                        prior_audit = reconciled.get(scope) or {}
+                        audit_due = (force or bool(state.get("error")) or not prior_audit.get("checked_at")
+                                     or prior_audit.get("fingerprint") != fingerprint
+                                     or any(key not in state["synced"] for key in keys))
+                        try:
+                            audit_due = audit_due or (now - self._now(prior_audit.get("checked_at"))).total_seconds() >= 86400
+                        except NotionError:
+                            audit_due = True
+                        if not audit_due:
+                            continue
                         remote = self._query(self._source(family), filter={"property": "Dataset", "rich_text": {"equals": remote_dataset}})
+                        audits[scope] = {"fingerprint": fingerprint, "checked_at": now.isoformat()}
                         for page in remote:
                             if not isinstance(page, dict):
                                 raise NotionError("invalid_response")
@@ -766,6 +791,8 @@ class PeriodNotionWorkspace(NotionWorkspace):
                     changed += 1
                     self._save(self.state_path, self.state)
                 for key, row in list(state["pending"].items()):
+                    if not sync_windows and row["family"] == "windows":
+                        continue
                     changed += int(self._upsert_period(key, row, now))
                 for kind in complete:
                     state["complete_cutoffs"][cutoff_keys[kind]] = cutoff.isoformat()
@@ -773,6 +800,7 @@ class PeriodNotionWorkspace(NotionWorkspace):
                     state["schedules"][dataset] = {"schedule_id": active_monthly_schedule,
                                                   "cutoff": monthly_cutoff.isoformat()}
                 state["last_sync"] = now.isoformat()
+                reconciled.update(audits)
                 state.pop("error", None)
             except NotionError as exc:
                 self._remember_period_error(exc)

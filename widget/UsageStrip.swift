@@ -19,8 +19,8 @@ enum WidgetStyle: String, Codable, CaseIterable, Identifiable {
         switch self { case .glass: return "液态玻璃"; case .pulse: return "Pulse 暗色"; case .white: return "经典白色" }
     }
     var primary: Color { self == .pulse ? Color(white: 0.95) : StripInk.primary }
-    var secondary: Color { self == .pulse ? Color(white: 0.67) : StripInk.secondary }
-    var accent: Color { self == .pulse ? Color(red: 0.68, green: 0.88, blue: 0.71) : Color(red: 0.29, green: 0.47, blue: 0.37) }
+    var secondary: Color { self == .pulse ? Color(red: 0.72, green: 0.73, blue: 0.74) : StripInk.secondary }
+    var accent: Color { self == .pulse ? Color(red: 0.70, green: 0.91, blue: 0.76) : Color(red: 0.078, green: 0.424, blue: 0.227) }
     var progress: Color { self == .pulse ? Color(red: 0.88, green: 0.68, blue: 0.45) : Color(red: 0.46, green: 0.59, blue: 0.69) }
     var track: Color { primary.opacity(self == .pulse ? 0.14 : 0.10) }
     var appearance: NSAppearance? { NSAppearance(named: self == .pulse ? .darkAqua : .aqua) }
@@ -167,9 +167,13 @@ struct StripItem: Identifiable {
     var primaryRing: Double?
     var secondaryRing: Double?
     var developmentProgress: Double?
-    var progressLabel = "开发进度"
+    var progressLabel = "完成进度"
     var todayTokens: Int?
     var ringStale = false
+    var estimatedCost = "—"
+    var latestOutputTitle: String?
+    var latestOutputURL: String?
+    var managedMembers: [TaskRow] = []
     var isProject: Bool { id.hasPrefix("folder:") }
 
     static func projectDate(_ value: String) -> String {
@@ -196,182 +200,429 @@ struct StripItem: Identifiable {
     }
 
     static func projectProgress(_ value: Double?, source: String?) -> Double? {
-        guard ["manual", "tasks"].contains(source ?? ""), let value, value.isFinite, 0...100 ~= value else { return nil }
+        guard ["manual", "ai"].contains(source ?? ""), let value, value.isFinite, 0...100 ~= value else { return nil }
         return value
     }
 
+    static func statusLabel(_ value: String?) -> String? {
+        switch value {
+        case "正常": return "顺利"
+        case "阻塞", "受阻": return "遇到卡点"
+        default: return value
+        }
+    }
+
+    static func costLabel(_ amount: Double?, status: String?, lowerBound: Bool? = nil) -> String {
+        guard let amount, amount.isFinite, amount >= 0,
+              ["estimated", "lower_bound"].contains(status ?? "") else { return "—" }
+        return String(format: (status == "lower_bound" || lowerBound == true) ? "≥$%.2f" : "≈$%.2f", amount)
+    }
+
+    private static func notionIdentity(_ row: TaskRow) -> String? {
+        guard let value = row.notion_url, let url = URL(string: value) else { return nil }
+        let component = url.lastPathComponent.replacingOccurrences(of: "-", with: "")
+        let suffix = String(component.suffix(32)).lowercased()
+        if suffix.count == 32 && suffix.allSatisfy({ $0.isHexDigit }) { return "page:" + suffix }
+        return value.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    static func availableManagedProjects(_ snapshot: Snapshot?) -> [TaskRow] {
+        var projects: [TaskRow] = [], indices: [String: Int] = [:]
+        // A Notion page is one project even when several local folders bind to it.
+        // Keep every binding before deduplication so aggregation cannot lose a folder.
+        for row in (snapshot?.management_projects ?? []).sorted(by: { $0.id < $1.id }) {
+            guard row.is_other != true, !["归档", "已归档"].contains(row.project_status ?? ""),
+                  let id = row.task_id, !id.isEmpty else { continue }
+            let key = notionIdentity(row) ?? row.id
+            if let index = indices[key] {
+                projects[index].task_ids = Array(Set((projects[index].task_ids ?? []) + (row.task_ids ?? []) + [id])).sorted()
+            } else {
+                var project = row
+                project.task_ids = Array(Set((row.task_ids ?? []) + [id])).sorted()
+                indices[key] = projects.count
+                projects.append(project)
+            }
+        }
+        return projects
+    }
+
+    private static func matches(_ project: TaskRow, usage: TaskRow) -> Bool {
+        if let id = usage.task_id, project.task_id == id || project.task_ids?.contains(id) == true { return true }
+        if let page = notionIdentity(project), page == notionIdentity(usage) { return true }
+        return false
+    }
+
     static func items(_ snapshot: Snapshot?, failed: Bool = false,
-                      metric: StripQuotaMetric = .weeklyRemaining, now: Date = Date()) -> [StripItem] {
+                      metric: StripQuotaMetric = .weeklyRemaining, now: Date = Date(),
+                      managementEnabled: Bool = true) -> [StripItem] {
+        // The approved Codex entry has one fixed meaning: current weekly quota remaining.
+        // Retain the parameter only for old callers; it cannot change the capsule's meaning.
         guard let snapshot else {
-            return [StripItem(id: "quota", caption: metric.caption, value: "—", title: "Codex 额度",
-                             detailValue: "—", unit: "剩余比例", footnote: failed ? "读取失败，稍后重试" : "正在读取", avatar: .openAI),
-                    StripItem(id: "total", caption: "本周记录", value: "—", title: "本机 Token",
-                             detailValue: "—", unit: "Token", footnote: "正在读取本机记录", avatar: .symbol("book.closed"))]
+            return [StripItem(id: "quota", caption: "周额度剩余", value: "—", title: "Codex",
+                             detailValue: "—", unit: "比例", footnote: failed ? "读取失败" : "正在读取",
+                             facts: [StripFact(label: "本周已用额度", value: "—"), StripFact(label: "本周 Token", value: "—")], avatar: .openAI),
+                    StripItem(id: "total", caption: "本期 Token", value: "—", title: "本期 Token",
+                             detailValue: "—", unit: "Token", footnote: "正在读取",
+                             facts: [StripFact(label: "任务数量", value: "—"), StripFact(label: "统计时间", value: "—"),
+                                     StripFact(label: "模型响应次数", value: "—")], avatar: .symbol("book.closed"))]
         }
-        // Window identity comes from the reported duration, never the primary/secondary key.
         let week = snapshot.quota?.windows.first { $0.duration_mins == 10080 }
-        let short = snapshot.quota?.windows.first { $0.duration_mins == 300 }
         let stale = snapshot.quota?.stale == true || snapshot.quota_error != nil || failed
-        func staleWindow(_ window: QuotaWindow?) -> Bool {
-            stale || window.map { $0.resets_at <= now.timeIntervalSince1970 } == true
+            || week.map { $0.resets_at <= now.timeIntervalSince1970 } == true
+        let remainingPercent = week.flatMap { window -> Double? in
+            guard window.used_percent.isFinite, 0...100 ~= window.used_percent else { return nil }
+            return 100 - window.used_percent
         }
-        func remaining(_ window: QuotaWindow?) -> String {
-            guard let window else { return "—" }
-            let value = window.remaining_percent > 0 && window.remaining_percent < 1 ? "<1%" : String(format: "%.0f%%", window.remaining_percent)
-            return (staleWindow(window) ? "≈" : "") + value
-        }
+        let remaining = remainingPercent.map { value in
+            (stale ? "≈" : "") + (value > 0 && value < 1 ? "<1%" : String(format: "%.0f%%", value))
+        } ?? "—"
         let budget = snapshot.weekly_budget
-        let quotaValue: String
-        switch metric {
-        case .weeklyRemaining: quotaValue = remaining(week)
-        case .shortRemaining: quotaValue = remaining(short)
-        case .weeklyUsed:
-            quotaValue = week.map { (staleWindow($0) ? "≈" : "") + String(format: "%.0f%%", $0.used_percent) } ?? "—"
-        case .weeklyObserved: quotaValue = budget?.stripUsageLabel ?? "—"
-        case .weeklyExcess: quotaValue = budget?.stripExcessLabel ?? "—"
+        let weeklyUsed: String
+        if let value = budget?.observed_total_percent, value.isFinite, value >= 0 {
+            let quality = budget?.usage_quality ?? (budget?.status == "estimated" ? "estimated" : "unavailable")
+            weeklyUsed = ["estimated", "lower_bound"].contains(quality)
+                ? String(format: quality == "lower_bound" ? "≥%.1f%%" : "≈%.1f%%", value) : "—"
+        } else { weeklyUsed = "—" }
+        var globalAmount = snapshot.estimated_cost_usd
+        var globalStatus = snapshot.estimated_cost_status
+        if globalAmount == nil, globalStatus == nil, budget?.status == "estimated",
+           budget?.usage_quality == nil || budget?.usage_quality == "estimated",
+           let used = budget?.observed_total_percent, used.isFinite, used >= 0 {
+            globalAmount = 5 * used / 100; globalStatus = "estimated"
         }
-        let selected = metric == .shortRemaining ? short : week
-        let quotaFoot: String
-        if [.weeklyObserved, .weeklyExcess].contains(metric) {
-            quotaFoot = budget == nil ? "尚无周观测" : budget?.status == "incomplete" ? "已记录累计\n周记录不完整" : "已记录累计\n不是 Token 比例"
-        } else if selected == nil { quotaFoot = "尚未取得额度" }
-        else if staleWindow(selected) { quotaFoot = "上次记录\n等待更新" }
-        else if selected!.remaining_percent <= 0 { quotaFoot = "当前窗口已用尽" }
-        else { quotaFoot = "账号当前额度窗口" }
-        var result = [
-            StripItem(id: "quota", caption: metric.caption, value: quotaValue, title: "Codex 额度",
-                      detailValue: quotaValue, unit: "比例", footnote: quotaFoot, avatar: .openAI),
-            StripItem(id: "total", caption: "本周记录", value: compactTokens(snapshot.total_tokens),
-                      title: "本机 Token", detailValue: compactTokens(snapshot.total_tokens), unit: "Token",
-                      footnote: failed ? "上次记录 · 等待更新" : snapshot.legacy_updates > 0 ? "含旧记录估算" : "本机保留记录", avatar: .symbol("book.closed"))
-        ]
-        switch metric {
-        case .weeklyRemaining: result[0].primaryRing = fraction(week?.remaining_percent)
-        case .shortRemaining: result[0].primaryRing = fraction(short?.remaining_percent)
-        case .weeklyUsed: result[0].primaryRing = fraction(week?.used_percent)
-        case .weeklyObserved: result[0].primaryRing = fraction(budget?.observed_total_percent)
-        case .weeklyExcess:
-            result[0].primaryRing = fraction(budget?.excess_percent ?? (budget?.observed_total_percent.map { $0 <= 100 ? 0 : nil } ?? nil))
-        }
-        result[0].ringStale = staleWindow(selected)
-        result[1].todayTokens = snapshot.today_tokens.flatMap { $0 >= 0 ? $0 : nil }
-        let major = snapshot.tasks.filter { $0.is_other != true }
-        let ranked = (major + snapshot.other_tasks).sorted {
+        let globalCost = costLabel(globalAmount, status: globalStatus, lowerBound: snapshot.estimated_cost_lower_bound)
+        let sourceRows = snapshot.all_usage_tasks ?? (snapshot.tasks.filter { $0.is_other != true } + snapshot.other_tasks)
+        var seen = Set<String>()
+        let ranked = sourceRows.filter { $0.is_other != true && $0.total_tokens > 0 && seen.insert($0.id).inserted }.sorted {
             $0.total_tokens == $1.total_tokens ? $0.id < $1.id : $0.total_tokens > $1.total_tokens
         }
-        if let week {
-            result[0].facts.append(StripFact(label: "当前已用", value: (staleWindow(week) ? "≈" : "") + String(format: "%.0f%%", week.used_percent)))
-        }
-        result[0].facts.append(StripFact(label: "本周已用", value: budget?.stripUsageLabel ?? "尚无记录"))
-        result[0].facts.append(StripFact(label: "本周超额", value: budget?.stripExcessLabel ?? "尚无记录"))
-        if budget?.status == "incomplete", !result[0].footnote.contains("不完整") {
-            let ring = result[0].primaryRing
-            result[0] = StripItem(id: "quota", caption: metric.caption, value: quotaValue, title: "Codex 额度",
-                detailValue: quotaValue, unit: "比例", footnote: quotaFoot + "\n周记录不完整",
-                facts: result[0].facts, avatar: .openAI)
-            result[0].primaryRing = ring
-            result[0].ringStale = staleWindow(selected)
-        }
-        result[0].todayTokens = snapshot.today_tokens.flatMap { $0 >= 0 ? $0 : nil }
-        if let week {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "zh_CN")
-            formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
-            formatter.dateFormat = "EEE HH:mm"
-            result[0].facts.append(StripFact(label: "下次重置", value: formatter.string(from: Date(timeIntervalSince1970: week.resets_at))))
-        }
-        if let short {
-            result[0].facts.append(StripFact(label: "5小时剩余", value: remaining(short)))
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "zh_CN")
-            formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
-            formatter.dateFormat = "EEE HH:mm"
-            result[0].facts.append(StripFact(label: "5小时重置", value: formatter.string(from: Date(timeIntervalSince1970: short.resets_at))))
-        }
-        if let observed = snapshot.quota?.observed_at {
-            result[0].facts.append(StripFact(label: "最近观测", value: timestampLabel(observed)))
-        }
-        result[1].facts = [StripFact(label: "任务数量", value: "\(ranked.count) 个"),
-                           StripFact(label: "模型响应", value: "\(snapshot.request_records) 次")]
-        if snapshot.legacy_updates > 0 {
-            result[1].facts.append(StripFact(label: "记录质量", value: "含旧版估算"))
-        }
-        if let count = snapshot.warnings_count, count > 0 {
-            result[1].facts.append(StripFact(label: "扫描提示", value: "\(count) 项"))
-        }
+        var result = [
+            StripItem(id: "quota", caption: "周额度剩余", value: remaining, title: "Codex",
+                      detailValue: remaining, unit: "比例", footnote: stale ? "等待更新" : remainingPercent == 0 ? "当前窗口已用尽" : "",
+                      facts: [StripFact(label: "本周已用额度", value: weeklyUsed),
+                              StripFact(label: "本周 Token", value: compactTokens(snapshot.total_tokens))],
+                      avatar: .openAI, primaryRing: fraction(remainingPercent), todayTokens: snapshot.today_tokens,
+                      ringStale: stale, estimatedCost: globalCost),
+            StripItem(id: "total", caption: "本期 Token", value: compactTokens(snapshot.total_tokens),
+                      title: "本期 Token", detailValue: compactTokens(snapshot.total_tokens), unit: "Token",
+                      footnote: snapshot.legacy_updates > 0 ? "含旧记录估算" : "",
+                      facts: [StripFact(label: "任务数量", value: "\(snapshot.task_count ?? ranked.count) 个"),
+                              StripFact(label: "模型响应次数", value: "\(snapshot.request_records) 次")],
+                      avatar: .symbol("book.closed"), todayTokens: snapshot.today_tokens)
+        ]
         if let start = budget?.period_start, let end = budget?.period_end {
-            result[1].facts.append(StripFact(label: "统计时间", value: localDate(start) + "\n—\n" + localDate(end - 1)))
+            result[1].facts.append(StripFact(label: "统计时间", value: localDate(start) + " — " + localDate(end - 1)))
+        } else if let start = snapshot.range?.since_inclusive, let end = snapshot.range?.until_exclusive {
+            result[1].facts.append(StripFact(label: "统计时间", value: projectDate(start) + " — " + projectDate(end)))
+        } else { result[1].facts.append(StripFact(label: "统计时间", value: "—")) }
+        let managed = managementEnabled ? availableManagedProjects(snapshot) : []
+        var projects: [(usage: [TaskRow], metadata: TaskRow)] = []
+        var claimedUsageIDs = Set<String>()
+        for project in managed {
+            let usage = ranked.filter { !claimedUsageIDs.contains($0.id) && matches(project, usage: $0) }
+            claimedUsageIDs.formUnion(usage.map(\.id))
+            projects.append((usage, project))
         }
-        let projectRows = snapshot.management_projects ?? ranked
-        let visible = Array(projectRows.prefix(3))
-        for row in visible {
-            let title = row.display_name?.isEmpty == false ? row.display_name! : row.name
+        if managed.isEmpty {
+            // Standalone mode and old offline snapshots retain the local folder ranking.
+            projects = ranked.map { ([$0], $0) }
+        }
+        projects.sort {
+            let left = $0.usage.reduce(0) { $0 + $1.total_tokens }
+            let right = $1.usage.reduce(0) { $0 + $1.total_tokens }
+            return left == right ? $0.metadata.id < $1.metadata.id : left > right
+        }
+        let displayed = Array(projects.prefix(4))
+        var displayedUsageIDs = Set<String>(), displayedManagedIDs = Set<String>()
+        for (usage, metadata) in displayed {
+            displayedUsageIDs.formUnion(usage.map(\.id))
+            displayedManagedIDs.insert(metadata.task_id ?? "")
+            let row = usage.first ?? metadata
+            // Notion enriches a task's identity and management; it never replaces its usage.
+            let hasUsage = !usage.isEmpty
+            let tokens = usage.reduce(0) { $0 + $1.total_tokens }
+            let title = metadata.display_name?.isEmpty == false ? metadata.display_name! : metadata.name
+            let percent = snapshot.total_tokens > 0 ? Double(tokens) * 100 / Double(snapshot.total_tokens) : 0
             var management: [StripFact] = []
             func add(_ label: String, _ value: String?) {
                 if let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
                     management.append(StripFact(label: label, value: value))
                 }
             }
-            add("本周目标", row.weekly_goal)
-            add("下一步", row.next_step)
-            add("项目目标", row.project_goal)
-            add("交付日期", row.target_date.map(projectDate))
-            add("优先级", row.project_priority)
-            add("健康度", row.project_health)
-            if let count = row.open_tasks { add("待办任务", "\(count) 项") }
-            if let count = row.blocked_tasks { add("受阻任务", "\(count) 项") }
-            if let count = row.completed_tasks { add("已完成", "\(count) 项") }
-            add("项目摘要", row.project_summary)
-            add("最近复盘", row.last_reviewed.map(projectDate))
-            let projectAvatar = StripAvatar.project(row)
-            let usageLinked = row.usage_linked != false
-            let development = projectProgress(row.development_progress, source: row.progress_source)
-            var facts: [StripFact] = []
-            if usageLinked {
-                facts = [StripFact(label: "本周占比", value: String(format: "%.1f%%", row.percent)),
-                         StripFact(label: "会话数量", value: row.sessions_count.map { "\($0) 个" } ?? "未记录"),
-                         StripFact(label: "模型响应", value: "\(row.request_records) 次")]
-                if let rank = ranked.firstIndex(where: { $0.id == row.id }) {
-                    facts.insert(StripFact(label: "用量排名", value: "第 \(rank + 1) 名"), at: 1)
-                }
-            }
-            if usageLinked && snapshot.legacy_updates == 0 && row.request_records > 0 {
-                let mean = Int((Double(row.total_tokens) / Double(row.request_records)).rounded())
-                facts.append(StripFact(label: "平均/响应", value: compactTokens(mean) + " Token"))
-            }
-            result.append(StripItem(id: row.id, caption: title, value: usageLinked ? String(format: "%.1f%%", row.percent) : "—",
-                title: title, detailValue: usageLinked ? compactTokens(row.total_tokens) : "—", unit: usageLinked ? "Token" : "未关联本地记录",
-                footnote: usageLinked ? (row.sessions_count.map { "\($0) 个会话" } ?? "会话数未记录") : "未关联本地记录",
-                facts: facts, managementFacts: management, avatar: projectAvatar,
-                projectStatus: row.project_status?.isEmpty == false ? row.project_status : row.notion_url == nil ? nil : "未设置",
-                notionURL: row.notion_url, notionStale: row.notion_stale == true,
-                needsProjectIcon: projectAvatar == .symbol("folder"), usageLinked: usageLinked,
-                managementList: snapshot.management_projects != nil,
-                primaryRing: usageLinked ? fraction(row.percent) : nil,
-                secondaryRing: fraction(development), developmentProgress: development,
-                progressLabel: row.progress_source == "tasks" ? "行动完成率" : "开发进度",
-                todayTokens: usageLinked ? row.today_tokens.flatMap { $0 >= 0 ? $0 : nil } : nil))
+            add("当前目标", metadata.current_goal ?? row.current_goal ?? metadata.weekly_goal ?? row.weekly_goal)
+            add("下一步", metadata.next_step ?? row.next_step)
+            add("项目愿景", metadata.project_goal ?? row.project_goal)
+            add("健康度", metadata.project_health ?? row.project_health)
+            if let count = metadata.human_open_tasks ?? row.human_open_tasks { add("人工待办", "\(count) 项") }
+            if let count = metadata.human_blocked_tasks ?? row.human_blocked_tasks { add("人工受阻", "\(count) 项") }
+            if let count = metadata.human_completed_tasks ?? row.human_completed_tasks { add("人工已完成", "\(count) 项") }
+            add("最新产出与进度记录", metadata.latest_progress_summary ?? row.latest_progress_summary)
+            let development = projectProgress(metadata.development_progress ?? row.development_progress,
+                                             source: metadata.progress_source ?? row.progress_source)
+            let projectAvatar = StripAvatar.project(metadata)
+            let ownCost: Double?
+            let costStatus: String?
+            if let globalAmount, ["estimated", "lower_bound"].contains(globalStatus ?? "") {
+                ownCost = globalAmount * percent / 100; costStatus = globalStatus
+            } else if hasUsage && usage.allSatisfy({ $0.estimated_cost_usd != nil && ["estimated", "lower_bound"].contains($0.estimated_cost_status ?? "") }) {
+                ownCost = usage.reduce(0) { $0 + $1.estimated_cost_usd! }
+                costStatus = usage.contains { $0.estimated_cost_status == "lower_bound" || $0.estimated_cost_lower_bound == true } ? "lower_bound" : "estimated"
+            } else { ownCost = nil; costStatus = nil }
+            let today = usage.isEmpty ? 0 : usage.allSatisfy({ ($0.today_tokens ?? -1) >= 0 })
+                ? usage.reduce(0) { $0 + $1.today_tokens! } : nil
+            result.append(StripItem(id: metadata.id, caption: title, value: String(format: "%.1f%%", percent),
+                title: title, detailValue: compactTokens(tokens), unit: "Token", footnote: "",
+                facts: [StripFact(label: "本周占比", value: String(format: "%.1f%%", percent))],
+                managementFacts: management, avatar: projectAvatar,
+                projectStatus: statusLabel(metadata.project_health?.isEmpty == false ? metadata.project_health : metadata.project_status ?? row.project_status),
+                notionURL: metadata.notion_url ?? row.notion_url, notionStale: metadata.notion_stale == true || row.notion_stale == true,
+                needsProjectIcon: projectAvatar == .symbol("folder"),
+                usageLinked: hasUsage,
+                primaryRing: fraction(percent), secondaryRing: fraction(development), developmentProgress: development,
+                todayTokens: today,
+                estimatedCost: costLabel(ownCost, status: costStatus, lowerBound: snapshot.estimated_cost_lower_bound),
+                latestOutputTitle: metadata.latest_output_title ?? row.latest_output_title,
+                latestOutputURL: metadata.latest_output_url ?? row.latest_output_url))
         }
-        let remainder = Array(projectRows.dropFirst(visible.count))
-        if !remainder.isEmpty {
-            if snapshot.management_projects != nil {
-                result.append(StripItem(id: "remainder", caption: "更多项目", value: "\(remainder.count)",
-                    title: "更多项目", detailValue: "\(remainder.count)", unit: "项目", footnote: "Notion 项目列表",
-                    members: remainder, facts: [], avatar: .symbol("ellipsis"), managementList: true))
-            } else {
-                let tokens = remainder.reduce(0) { $0 + $1.total_tokens }
-                let percent = snapshot.total_tokens > 0 ? Double(tokens) * 100 / Double(snapshot.total_tokens) : 0
-                result.append(StripItem(id: "remainder", caption: "其他", value: String(format: "%.1f%%", percent),
-                    title: "其他任务", detailValue: compactTokens(tokens), unit: "Token",
-                    footnote: "其余任务合计", members: remainder,
-                    facts: [StripFact(label: "合并任务", value: "\(remainder.count) 个")], avatar: .symbol("ellipsis")))
-            }
+        let remainder = ranked.filter { !displayedUsageIDs.contains($0.id) }
+        let managedRemainder = managed.filter { project in
+            !displayedManagedIDs.contains(project.task_id ?? "") && !ranked.contains { matches(project, usage: $0) }
         }
-        if projectRows.isEmpty {
+        if !remainder.isEmpty || !managedRemainder.isEmpty {
+            let tokens = remainder.reduce(0) { $0 + $1.total_tokens }
+            let percent = snapshot.total_tokens > 0 ? Double(tokens) * 100 / Double(snapshot.total_tokens) : 0
+            result.append(StripItem(id: "remainder", caption: "其他", value: String(format: "%.1f%%", percent),
+                title: "其他任务", detailValue: compactTokens(tokens), unit: "Token", footnote: "",
+                members: remainder, avatar: .symbol("ellipsis"), primaryRing: fraction(percent), managedMembers: managedRemainder))
+        }
+        if displayed.isEmpty && ranked.isEmpty && managedRemainder.isEmpty {
             result.append(StripItem(id: "empty", caption: "暂无项目", value: "—", title: "暂无项目",
-                detailValue: "—", unit: "项目", footnote: snapshot.management_projects == nil ? "本周暂无可识别记录" : "请在 Notion\n创建项目并分配图标", avatar: .symbol("folder")))
+                detailValue: "—", unit: "项目", footnote: "本周暂无有用量任务", avatar: .symbol("folder")))
         }
         return result
+    }
+
+}
+
+// Detail content is data first, so each entry's approved fields can be verified
+// independently of rendering and paginated without a card-internal scroll view.
+struct StripDetailSection: Identifiable {
+    enum Kind { case row, status, statement, progress, manual, artifact }
+    let id: String
+    let kind: Kind
+    let label: String
+    let value: String
+    var percent: Double?
+    var url: String?
+
+    static func content(for item: StripItem, locked: Bool, page: StripDashboardPage) -> [Self] {
+        func management(_ label: String) -> String { item.managementFacts.first { $0.label == label }?.value ?? "—" }
+        func record(_ label: String) -> String { item.facts.first { $0.label == label }?.value ?? "—" }
+        func row(_ id: String, _ label: String, _ value: String) -> Self { Self(id: id, kind: .row, label: label, value: value) }
+        func statement(_ id: String, _ label: String, _ value: String) -> Self { Self(id: id, kind: .statement, label: label, value: value) }
+        let status = Self(id: "status", kind: .status, label: "项目状态", value: item.projectStatus ?? "未设置")
+        let progress = Self(id: "progress", kind: .progress, label: "完成进度",
+                            value: item.developmentProgress.map { String(format: "%.0f%%", $0) } ?? "—", percent: item.developmentProgress)
+        let share = row("share", "本周占比", item.value)
+        if item.isProject {
+            if !locked { return [status, statement("next", "下一步行动", management("下一步")), progress, share] }
+            switch page {
+            case .overview: return [status, statement("vision", "项目愿景", management("项目愿景")), progress, share]
+            case .actions:
+                var result = [statement("goal", "当前目标", management("当前目标")),
+                    Self(id: "manual", kind: .manual, label: "人工待办",
+                         value: [management("人工待办"), management("人工受阻"), management("人工已完成")].joined(separator: "|")),
+                    statement("latest", "进度记录", management("最新产出与进度记录"))]
+                if let title = item.latestOutputTitle, !title.isEmpty, let url = item.latestOutputURL,
+                   safeOutputURL(url) != nil {
+                    result.append(Self(id: "output", kind: .artifact, label: "最新产出", value: title, url: url))
+                }
+                return result
+            case .investment:
+                return [row("week-tokens", "本周 Token", item.detailValue),
+                        row("today-tokens", "今日 Token", item.todayTokens.map(compactTokens) ?? "—"), share,
+                        row("cost", "估算投入", item.estimatedCost)]
+            }
+        }
+        if item.id == "quota" {
+            return [row("remaining", "周额度剩余", item.detailValue), row("used", "本周已用额度", record("本周已用额度")),
+                    row("week-tokens", "本周 Token", record("本周 Token")), row("cost", "估算投入", item.estimatedCost)]
+        }
+        if item.id == "total" {
+            return [row("week-tokens", "本周 Token", item.detailValue), row("tasks", "任务数量", record("任务数量")),
+                    row("time", "统计时间", record("统计时间")), row("responses", "模型响应次数", record("模型响应次数"))]
+        }
+        if item.id == "remainder" {
+            return [row("share", "本周占比", item.value), row("week-tokens", "本周 Token", item.detailValue)] + item.members.map { member in
+                if let url = member.notion_url, safeOutputURL(url) != nil {
+                    return Self(id: member.id, kind: .artifact, label: "项目", value: (member.display_name ?? member.name) + " · " + String(format: "%.1f%%", member.percent), url: url)
+                }
+                return row(member.id, member.display_name ?? member.name, String(format: "%.1f%%", member.percent))
+            } + item.managedMembers.map { member in
+                if let url = member.notion_url, safeOutputURL(url) != nil {
+                    return Self(id: member.id, kind: .artifact, label: "项目", value: member.display_name ?? member.name, url: url)
+                }
+                return row(member.id, member.display_name ?? member.name, member.project_health ?? member.project_status ?? "未设置")
+            }
+        }
+        return [statement("empty", "暂无项目", item.footnote)]
+    }
+
+    static func safeOutputURL(_ value: String) -> URL? {
+        if let url = StripAvatar.safeRemoteURL(value) { return url }
+        // Formal local outputs are documents, not executables or arbitrary URL schemes.
+        let url = value.hasPrefix("/") ? URL(fileURLWithPath: value) : URL(string: value)
+        guard let url, url.isFileURL, url.host == nil || url.host == "" || url.host == "localhost",
+              ["md", "txt", "pdf", "html", "docx", "xlsx", "pptx", "png", "jpg", "jpeg", "svg"].contains(url.pathExtension.lowercased()) else { return nil }
+        return url
+    }
+
+    var textValue: Bool {
+        id == "time" || value.rangeOfCharacter(from: .decimalDigits) == nil
+    }
+    var valueSize: CGFloat { textValue ? StripDetailMetrics.bodySize : StripDetailMetrics.titleSize }
+    var valueWeight: NSFont.Weight { textValue ? .regular : .semibold }
+    var countUnit: String? {
+        ["个", "次", "项"].first { value.hasSuffix(" " + $0) }
+    }
+    func labelWidth(width: CGFloat) -> CGFloat {
+        min(width * 0.5, ceil((label as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: StripDetailMetrics.labelSize)]).width))
+    }
+    static func textHeight(_ text: String, width: CGFloat, size: CGFloat = StripDetailMetrics.bodySize,
+                           weight: NSFont.Weight = .regular, lineHeight: CGFloat = StripDetailMetrics.bodyLine) -> CGFloat {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.minimumLineHeight = lineHeight
+        paragraph.maximumLineHeight = lineHeight
+        paragraph.lineBreakMode = .byWordWrapping
+        let bounds = (text as NSString).boundingRect(with: CGSize(width: max(20, width), height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: [
+                .font: NSFont.systemFont(ofSize: size, weight: weight), .paragraphStyle: paragraph])
+        return max(lineHeight, ceil(bounds.height))
+    }
+    func height(width: CGFloat) -> CGFloat {
+        switch kind {
+        case .row: return max(StripDetailMetrics.bodyLine,
+                              Self.textHeight(label, width: labelWidth(width: width), size: StripDetailMetrics.labelSize, lineHeight: StripDetailMetrics.labelLine),
+                              Self.textHeight(value, width: width - labelWidth(width: width) - StripDetailMetrics.sectionGap,
+                                              size: valueSize, weight: valueWeight))
+        case .status: return max(24, Self.textHeight(value, width: width * 0.60 - 22, size: StripDetailMetrics.labelSize,
+                                                   weight: .medium, lineHeight: StripDetailMetrics.labelLine) + 6)
+        case .progress: return 32
+        case .manual: return 46
+        case .artifact: return StripDetailMetrics.labelLine + StripDetailMetrics.fieldGap + Self.textHeight(value, width: width - 26)
+        case .statement: return StripDetailMetrics.labelLine + StripDetailMetrics.fieldGap + Self.textHeight(value, width: width)
+        }
+    }
+
+    static func pages(_ sections: [Self], width: CGFloat, height: CGFloat, metrics: Bool = false) -> [[Self]] {
+        let budget = max(1, height)
+        let fragmentBudget = max(1, budget - (metrics ? 2 : 0))
+        var expanded: [Self] = []
+        for original in sections {
+            var section = original
+            if section.kind == .manual && section.height(width: width) > budget {
+                let values = section.value.components(separatedBy: "|")
+                for (index, label) in ["人工待办", "人工受阻", "人工已完成"].enumerated() {
+                    expanded.append(Self(id: section.id + ":\(index)", kind: .row, label: label,
+                                         value: values.indices.contains(index) ? values[index] : "—"))
+                }
+                continue
+            }
+            if [.row, .status].contains(section.kind) && section.height(width: width) > budget {
+                section = Self(id: section.id, kind: .statement, label: section.kind == .status ? section.label : "任务用量",
+                               value: section.kind == .status ? section.value : section.label + " · " + section.value)
+            }
+            // Every variable-length text is split, including output buttons and
+            // long names in Other; no page relies on clipped text or a tooltip.
+            if [.statement, .artifact].contains(section.kind) && section.height(width: width) > fragmentBudget {
+                let characters = Array(section.value)
+                var start = 0
+                var part = 0
+                while start < characters.count {
+                    var low = start + 1, high = characters.count, end = start + 1
+                    while low <= high {
+                        let middle = (low + high) / 2
+                        let probe = Self(id: section.id, kind: section.kind, label: section.label,
+                                         value: String(characters[start..<middle]), url: section.url)
+                        if probe.height(width: width) <= fragmentBudget { end = middle; low = middle + 1 }
+                        else { high = middle - 1 }
+                    }
+                    expanded.append(Self(id: section.id + ":\(part)", kind: section.kind,
+                        label: section.label + (part == 0 ? "" : "（续）"), value: String(characters[start..<end]), url: section.url))
+                    start = end; part += 1
+                }
+            } else { expanded.append(section) }
+        }
+        var pages: [[Self]] = [], current: [Self] = []
+        for section in expanded {
+            let candidate = current + [section]
+            if !current.isEmpty && StripDetailLayout.contentHeight(candidate, width: width, metrics: metrics) > budget {
+                pages.append(current); current = []
+            }
+            current.append(section)
+        }
+        if !current.isEmpty { pages.append(current) }
+        return pages.isEmpty ? [[]] : pages
+    }
+}
+
+// Approved HTML review: the same measurements drive drawing, pagination and
+// the desktop panel's pointer hit regions. Short screens never change fonts.
+enum StripDetailMetrics {
+    static let labelSize: CGFloat = 12
+    static let bodySize: CGFloat = 14
+    static let titleSize: CGFloat = 16
+    static let labelLine: CGFloat = 18
+    static let bodyLine: CGFloat = 22
+    static let padding: CGFloat = 20
+    static let sectionGap: CGFloat = 16
+    static let fieldGap: CGFloat = 6
+    static let maxHeight: CGFloat = 520
+    static let tabsHeight: CGFloat = 42
+    static let navigationHeight: CGFloat = 57
+    static let footerHeight: CGFloat = 51
+}
+
+struct StripDetailLayout {
+    let pages: [[StripDetailSection]]
+    let selectedPage: Int
+    let height: CGFloat
+    let maximumPageHeight: CGFloat
+    let contentWidth: CGFloat
+    let headerHeight: CGFloat
+    let hasTabs: Bool
+    let showsFooter: Bool
+    let metrics: Bool
+    var visibleSections: [StripDetailSection] { pages[selectedPage] }
+
+    static func contentHeight(_ sections: [StripDetailSection], width: CGFloat, metrics: Bool) -> CGFloat {
+        guard !sections.isEmpty else { return 0 }
+        let total = sections.reduce(CGFloat(0)) { $0 + $1.height(width: width) }
+        return total + (metrics ? 2 + CGFloat(sections.count - 1) * 19 : CGFloat(sections.count - 1) * StripDetailMetrics.sectionGap)
+    }
+
+    static func make(item: StripItem, locked: Bool, page: StripDashboardPage, sectionPage: Int = 0,
+                     width: CGFloat = 360, maxHeight: CGFloat = StripDetailMetrics.maxHeight) -> Self {
+        let contentWidth = max(20, width - 2 * StripDetailMetrics.padding)
+        let hasTabs = item.isProject && locked
+        let showsFooter = item.isProject && locked
+        let headerHeight = max(30, StripDetailSection.textHeight(item.title, width: contentWidth - 80,
+            size: StripDetailMetrics.titleSize, weight: .semibold))
+        let base = 2 * StripDetailMetrics.padding + headerHeight + StripDetailMetrics.sectionGap
+            + (hasTabs ? StripDetailMetrics.tabsHeight + StripDetailMetrics.sectionGap : 0)
+            + (showsFooter ? StripDetailMetrics.footerHeight : 0)
+        let sections = StripDetailSection.content(for: item, locked: locked, page: page)
+        let metrics = !sections.isEmpty && sections.allSatisfy { $0.kind == .row }
+        let completeHeight = contentHeight(sections, width: contentWidth, metrics: metrics)
+        let pages = base + completeHeight <= maxHeight ? [sections] : StripDetailSection.pages(sections, width: contentWidth,
+            height: maxHeight - base - StripDetailMetrics.navigationHeight, metrics: metrics)
+        let selected = min(max(0, sectionPage), pages.count - 1)
+        return Self(pages: pages, selectedPage: selected,
+            height: base + contentHeight(pages[selected], width: contentWidth, metrics: metrics)
+                + (pages.count > 1 ? StripDetailMetrics.navigationHeight : 0),
+            maximumPageHeight: base + (pages.map { contentHeight($0, width: contentWidth, metrics: metrics) }.max() ?? 0)
+                + (pages.count > 1 ? StripDetailMetrics.navigationHeight : 0),
+            contentWidth: contentWidth, headerHeight: headerHeight, hasTabs: hasTabs, showsFooter: showsFooter, metrics: metrics)
     }
 }
 
@@ -387,23 +638,14 @@ enum StripDashboardPage: String, CaseIterable, Identifiable {
     }
 }
 
-// Quota switching belongs only to the icon, never to the dashboard scroll area.
-enum QuotaWheelRouting {
-    static func consumes(sameWindow: Bool, point: CGPoint, iconBounds: CGRect,
-                         deltaX: CGFloat, deltaY: CGFloat, momentum: Bool) -> Bool {
-        guard sameWindow, !momentum, abs(deltaY) > abs(deltaX), iconBounds.width > 0, iconBounds.height > 0 else { return false }
-        let dx = (point.x - iconBounds.midX) / (iconBounds.width / 2)
-        let dy = (point.y - iconBounds.midY) / (iconBounds.height / 2)
-        return dx * dx + dy * dy <= 1
-    }
-}
-
 @MainActor
 final class StripInteraction: ObservableObject {
     @Published var expanded: String?
     @Published var locked = false
     @Published var dashboardPage: StripDashboardPage = .overview
-    @Published var quotaMetric: StripQuotaMetric = .weeklyUsed
+    @Published var quotaMetric: StripQuotaMetric = .weeklyRemaining
+    @Published var sectionPage = 0
+    private(set) var isDragging = false
     private var hovered: String?
     private var zones: [String: (id: String, sequence: Int)] = [:]
     private var sequence = 0
@@ -411,6 +653,7 @@ final class StripInteraction: ObservableObject {
     var onResize: (() -> Void)?
 
     func hover(_ id: String, inside: Bool, zone: String = "pointer") {
+        guard !isDragging else { return }
         if inside {
             sequence += 1
             zones[zone] = (id, sequence)
@@ -420,7 +663,7 @@ final class StripInteraction: ObservableObject {
         pending?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            if self.expanded != self.hovered { self.dashboardPage = .overview }
+            if self.expanded != self.hovered { self.dashboardPage = .overview; self.sectionPage = 0 }
             self.expanded = self.hovered
             self.onResize?()
         }
@@ -429,10 +672,11 @@ final class StripInteraction: ObservableObject {
     }
 
     func click(_ id: String) {
+        guard !isDragging else { return }
         pending?.cancel()
         if locked && expanded == id { dismiss() }
         else {
-            if expanded != id { dashboardPage = .overview }
+            if expanded != id || !locked { dashboardPage = .overview; sectionPage = 0 }
             expanded = id; locked = true; onResize?()
         }
     }
@@ -440,10 +684,24 @@ final class StripInteraction: ObservableObject {
     func selectPage(_ page: StripDashboardPage) {
         guard expanded != nil, locked else { return }
         dashboardPage = page
+        sectionPage = 0
+        onResize?()
+    }
+
+    func beginDragging() {
+        isDragging = true
+        dismiss()
+    }
+
+    func endDragging() { isDragging = false }
+
+    func selectSectionPage(_ page: Int) {
+        sectionPage = max(0, page)
+        onResize?()
     }
 
     func cycleQuota(steps: Int = 1) {
-        quotaMetric = quotaMetric.advanced(by: steps)
+        quotaMetric = .weeklyRemaining
         onResize?()
     }
 
@@ -468,6 +726,7 @@ final class StripInteraction: ObservableObject {
         zones.removeAll()
         locked = false
         dashboardPage = .overview
+        sectionPage = 0
         expanded = nil
         onResize?()
     }
@@ -480,8 +739,8 @@ private enum StripBrandAsset {
 }
 
 enum StripInk {
-    static let primary = Color(red: 0.12, green: 0.16, blue: 0.14)
-    static let secondary = Color(red: 0.30, green: 0.36, blue: 0.32)
+    static let primary = Color(red: 0.067, green: 0.090, blue: 0.071)
+    static let secondary = Color(red: 0.282, green: 0.341, blue: 0.306)
     static let avatar = Color(red: 0.86, green: 0.89, blue: 0.85)
 }
 
@@ -495,18 +754,22 @@ struct SystemGlass: ViewModifier {
     @ViewBuilder func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
         if style == .pulse {
-            content.background(Color(red: 0.085, green: 0.095, blue: 0.11).opacity(reduceTransparency ? 1 : 0.98), in: shape)
+            content.background((active ? Color(red: 0.098, green: 0.106, blue: 0.125) : Color(red: 0.085, green: 0.095, blue: 0.11))
+                .opacity(reduceTransparency ? 1 : 0.98), in: shape)
                 .overlay(shape.strokeBorder(Color.white.opacity(active ? 0.17 : 0.10), lineWidth: 0.7).allowsHitTesting(false))
         } else if style == .white || reduceTransparency || contrast == .increased {
-            content.background(Color(red: 0.98, green: 0.98, blue: 0.96), in: shape)
+            content.background(style == .white ? Color.white : Color(red: 0.98, green: 0.99, blue: 0.97), in: shape)
                 .overlay(shape.strokeBorder(StripInk.primary.opacity(active ? 0.14 : 0.09), lineWidth: 0.7).allowsHitTesting(false))
         } else if #available(macOS 26.0, *) {
-            content.glassEffect(.regular.tint(Color.white.opacity(active ? 0.14 : 0.07)), in: .rect(cornerRadius: radius))
-                .overlay(shape.strokeBorder(Color.white.opacity(0.55), lineWidth: 0.7).allowsHitTesting(false))
+            content.background {
+                shape.fill(Color.white.opacity(active ? 0.88 : 0.80))
+                    .glassEffect(.regular.tint(Color.white.opacity(0.08)), in: .rect(cornerRadius: radius))
+            }.overlay(shape.strokeBorder(Color.white.opacity(0.55), lineWidth: 0.7).allowsHitTesting(false))
         } else {
-            content.background(.ultraThinMaterial, in: shape)
-                .overlay(shape.fill(Color.white.opacity(active ? 0.13 : 0.06)).allowsHitTesting(false))
-                .overlay(shape.strokeBorder(Color.white.opacity(0.65), lineWidth: 0.7).allowsHitTesting(false))
+            content.background {
+                shape.fill(.ultraThinMaterial)
+                    .overlay(shape.fill(Color.white.opacity(active ? 0.80 : 0.72)).allowsHitTesting(false))
+            }.overlay(shape.strokeBorder(Color.white.opacity(0.65), lineWidth: 0.7).allowsHitTesting(false))
         }
     }
 }
@@ -532,53 +795,25 @@ private struct DashboardRing: View {
     }
 }
 
-// A local event monitor receives only scrolls inside this transparent view's bounds.
-// It does not take mouse clicks away from the persistent SwiftUI module button.
-private struct QuotaWheelArea: NSViewRepresentable {
-    let cycle: (Int) -> Void
-    class MonitorView: NSView {
-        var cycle: ((Int) -> Void)?
-        var monitor: Any?
-        var accumulated: CGFloat = 0
-        var lastCycle: TimeInterval = 0
-        override func hitTest(_ point: NSPoint) -> NSView? { nil }
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
-            guard window != nil else { return }
-            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-                guard let self, QuotaWheelRouting.consumes(sameWindow: event.window === self.window,
-                    point: self.convert(event.locationInWindow, from: nil), iconBounds: self.bounds,
-                    deltaX: event.scrollingDeltaX, deltaY: event.scrollingDeltaY,
-                    momentum: !event.momentumPhase.isEmpty) else { return event }
-                let stamp = ProcessInfo.processInfo.systemUptime
-                self.accumulated += event.scrollingDeltaY
-                let threshold: CGFloat = event.hasPreciseScrollingDeltas ? 22 : 1
-                if abs(self.accumulated) >= threshold && stamp - self.lastCycle >= 0.22 {
-                    self.cycle?(self.accumulated < 0 ? 1 : -1)
-                    self.accumulated = 0
-                    self.lastCycle = stamp
-                }
-                return nil
-            }
-        }
-        deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
-    }
-    func makeNSView(context: Context) -> MonitorView { let view = MonitorView(); view.cycle = cycle; return view }
-    func updateNSView(_ view: MonitorView, context: Context) { view.cycle = cycle }
+enum StripHitTarget: Equatable {
+    case module(Int), background, detail, connector, outside
+    var acceptsMouse: Bool { self != .outside }
 }
 
 struct UsageStrip: View {
     static let moduleWidth: CGFloat = 68
     static let headerHeight: CGFloat = 64
     static let diameter: CGFloat = 64
+    // The outer progress ring is 51pt with a 3pt stroke. Its visible outside
+    // edge, rather than the surrounding 64/68pt layout slot, is interactive.
+    static let interactionDiameter: CGFloat = 54
     static let gap: CGFloat = 0
     static let inset: CGFloat = 3
     static let rowInset: CGFloat = 2
-    static let detailWidth: CGFloat = 328
+    static let detailWidth: CGFloat = 360
     static let detailGap: CGFloat = 10
     static let detailRadius: CGFloat = 20
-    static let maxDetailHeight: CGFloat = 420
+    static let maxDetailHeight: CGFloat = StripDetailMetrics.maxHeight
     static func naturalSize(itemCount: Int, vertical: Bool = false) -> CGSize {
         CGSize(width: vertical ? diameter + 2 * inset : CGFloat(itemCount) * moduleWidth + 2 * inset,
                height: vertical ? CGFloat(itemCount) * (diameter + 2 * rowInset) + 2 * inset : headerHeight + 2 * inset)
@@ -599,25 +834,72 @@ struct UsageStrip: View {
         return CGRect(x: vertical ? canvas.width - natural.width : (canvas.width - natural.width) / 2,
                       y: headerOffset, width: natural.width, height: min(natural.height, max(0, canvas.height - headerOffset)))
     }
-    static func detailHeight(for item: StripItem) -> CGFloat { maxDetailHeight }
-    static func needsCompactScroll(availableHeight: CGFloat, locked: Bool) -> Bool {
+    static func moduleCircleFrame(index: Int, itemCount: Int, vertical: Bool, canvas: CGSize, headerOffset: CGFloat = 0) -> CGRect {
+        let header = headerFrame(itemCount: itemCount, vertical: vertical, canvas: canvas, headerOffset: headerOffset)
+        let center = CGPoint(
+            x: header.minX + inset + (vertical ? diameter / 2 : CGFloat(index) * moduleWidth + moduleWidth / 2),
+            y: header.minY + inset + (vertical ? CGFloat(index) * (diameter + 2 * rowInset) : 0) + diameter / 2)
+        return CGRect(x: center.x - interactionDiameter / 2, y: center.y - interactionDiameter / 2,
+                      width: interactionDiameter, height: interactionDiameter)
+    }
+    static func hitTarget(at point: CGPoint, itemCount: Int, vertical: Bool, canvas: CGSize, headerOffset: CGFloat = 0,
+                          detail: CGRect? = nil, detailIndex: Int? = nil) -> StripHitTarget {
+        if let detail, pointInRoundedRectangle(point, rect: detail, radius: detailRadius) { return .detail }
+        let header = headerFrame(itemCount: itemCount, vertical: vertical, canvas: canvas, headerOffset: headerOffset)
+        if pointInCapsule(point, rect: header) {
+            for index in 0..<itemCount {
+                let circle = moduleCircleFrame(index: index, itemCount: itemCount, vertical: vertical, canvas: canvas, headerOffset: headerOffset)
+                if pointInCapsule(point, rect: circle) { return .module(index) }
+            }
+            return .background
+        }
+        if let detail, let detailIndex {
+            let bridge = connectorFrame(index: detailIndex, itemCount: itemCount, vertical: vertical, canvas: canvas,
+                                        detail: detail, headerOffset: headerOffset)
+            if bridge.contains(point) { return .connector }
+        }
+        return .outside
+    }
+    static func detailHeight(for item: StripItem) -> CGFloat {
+        StripDetailLayout.make(item: item, locked: true, page: .overview).height
+    }
+    static func needsPagination(availableHeight: CGFloat, locked: Bool) -> Bool {
         availableHeight < (locked ? 405 : 305)
     }
-    static func detailFrame(for item: StripItem, index: Int, itemCount: Int, vertical: Bool, canvas: CGSize, headerOffset: CGFloat = 0, locked: Bool = true) -> CGRect {
+    static func detailFrame(for item: StripItem, index: Int, itemCount: Int, vertical: Bool, canvas: CGSize,
+                            headerOffset: CGFloat = 0, locked: Bool = true, page: StripDashboardPage = .overview, sectionPage: Int = 0) -> CGRect {
+        detailPlacement(for: item, index: index, itemCount: itemCount, vertical: vertical, canvas: canvas,
+                        headerOffset: headerOffset, locked: locked, page: page, sectionPage: sectionPage).frame
+    }
+    static func detailPlacement(for item: StripItem, index: Int, itemCount: Int, vertical: Bool, canvas: CGSize,
+                                headerOffset: CGFloat = 0, locked: Bool = true, page: StripDashboardPage = .overview,
+                                sectionPage: Int = 0) -> (frame: CGRect, layout: StripDetailLayout) {
         let header = headerFrame(itemCount: itemCount, vertical: vertical, canvas: canvas, headerOffset: headerOffset)
-        let desiredHeight: CGFloat = locked ? detailHeight(for: item) : 318
         let width = min(detailWidth, max(0, canvas.width - 2 * inset))
+        let natural = StripDetailLayout.make(item: item, locked: locked, page: page, width: width)
+        // Keep one direction and one pagination budget for the whole page set.
+        // A shorter last page must not flip sides and re-split the same text.
+        let desiredHeight = natural.maximumPageHeight
         let below = max(0, canvas.height - header.maxY - detailGap - inset)
         let above = max(0, header.minY - detailGap - inset)
         let opensBelow = below >= desiredHeight || below >= above
-        let available = vertical ? canvas.height - 2 * inset : (opensBelow ? below : above)
-        let height = min(desiredHeight, max(0, available))
+        // If the rail leaves too little room for even one readable text page,
+        // let the card cover the rail, as in the short-window HTML review.
+        let minimum = 2 * StripDetailMetrics.padding + natural.headerHeight + StripDetailMetrics.sectionGap
+            + (natural.hasTabs ? StripDetailMetrics.tabsHeight + StripDetailMetrics.sectionGap : 0)
+            + (natural.showsFooter ? StripDetailMetrics.footerHeight : 0)
+            + StripDetailMetrics.navigationHeight + 46
+        let overlapsRail = !vertical && max(below, above) < min(desiredHeight, minimum)
+        let available = vertical || overlapsRail ? canvas.height - 2 * inset : (opensBelow ? below : above)
+        let layout = StripDetailLayout.make(item: item, locked: locked, page: page, sectionPage: sectionPage,
+                                           width: width, maxHeight: min(maxDetailHeight, max(0, available)))
+        let height = layout.height
         let desiredX = header.minX + inset + CGFloat(index) * moduleWidth + moduleWidth / 2 - width / 2
         let x = vertical ? inset : min(max(inset, desiredX), max(inset, canvas.width - width - inset))
         let desiredY = vertical ? header.minY + inset + CGFloat(index) * (diameter + 2 * rowInset) :
-            (opensBelow ? header.maxY + detailGap : header.minY - detailGap - height)
+            overlapsRail ? inset : (opensBelow ? header.maxY + detailGap : header.minY - detailGap - height)
         let y = min(max(inset, desiredY), max(inset, canvas.height - height - inset))
-        return CGRect(x: x, y: y, width: width, height: height)
+        return (CGRect(x: x, y: y, width: width, height: height), layout)
     }
     static func connectorFrame(index: Int, itemCount: Int, vertical: Bool, canvas: CGSize, detail: CGRect, headerOffset: CGFloat = 0) -> CGRect {
         let header = headerFrame(itemCount: itemCount, vertical: vertical, canvas: canvas, headerOffset: headerOffset)
@@ -629,7 +911,7 @@ struct UsageStrip: View {
         if detail.maxY <= header.minY {
             return CGRect(x: x - 9, y: detail.maxY, width: 18, height: header.minY + inset - detail.maxY)
         }
-        return CGRect(x: x - 9, y: header.maxY - inset, width: 18, height: detail.minY - header.maxY + inset)
+        return CGRect(x: x - 9, y: header.maxY - inset, width: 18, height: max(0, detail.minY - header.maxY + inset))
     }
     @ObservedObject var model: UsageModel
     @ObservedObject var interaction: StripInteraction
@@ -638,7 +920,7 @@ struct UsageStrip: View {
     let height: CGFloat
     var canvasWidth: CGFloat = 0
     var headerOffset: CGFloat = 0
-    var items: [StripItem] { StripItem.items(model.snapshot, failed: model.error != nil, metric: interaction.quotaMetric) }
+    var items: [StripItem] { StripItem.items(model.snapshot, failed: model.error != nil, metric: interaction.quotaMetric, managementEnabled: model.notionEnabled) }
     var width: CGFloat { canvasWidth > 0 ? canvasWidth : Self.canvasSize(itemCount: items.count, vertical: vertical).width }
     var canvas: CGSize { CGSize(width: width, height: height) }
     var style: WidgetStyle { model.widgetStyle }
@@ -652,18 +934,18 @@ struct UsageStrip: View {
                 .offset(x: header.minX, y: header.minY).allowsHitTesting(false)
             if let item = items.first(where: { $0.id == interaction.expanded }),
                let index = items.firstIndex(where: { $0.id == item.id }) {
-                let card = Self.detailFrame(for: item, index: index, itemCount: items.count, vertical: vertical, canvas: canvas, headerOffset: headerOffset, locked: interaction.locked)
+                let placement = Self.detailPlacement(for: item, index: index, itemCount: items.count, vertical: vertical, canvas: canvas,
+                    headerOffset: headerOffset, locked: interaction.locked, page: interaction.dashboardPage, sectionPage: interaction.sectionPage)
+                let card = placement.frame
                 let bridge = Self.connectorFrame(index: index, itemCount: items.count, vertical: vertical, canvas: canvas, detail: card, headerOffset: headerOffset)
                 Color.clear.frame(width: bridge.width, height: bridge.height).contentShape(Rectangle())
                     .offset(x: bridge.minX, y: bridge.minY)
-                    .onHover { interaction.hover(item.id, inside: $0, zone: "bridge:\(item.id)") }
-                details(item, availableHeight: card.height).frame(width: card.width, height: card.height, alignment: .top)
+                details(item, layout: placement.layout).frame(width: card.width, height: card.height, alignment: .top)
                     .modifier(SystemGlass(active: true, radius: Self.detailRadius, style: style))
                     .clipShape(RoundedRectangle(cornerRadius: Self.detailRadius, style: .continuous))
                     .shadow(color: .black.opacity(style == .pulse ? 0.28 : 0.14), radius: 20, y: 9)
-                    .offset(x: card.minX, y: card.minY).zIndex(10)
+                    .offset(x: card.minX, y: card.minY).zIndex(card.intersects(header) ? 30 : 10)
                     .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: vertical ? .trailing : .top)))
-                    .onHover { interaction.hover(item.id, inside: $0, zone: "detail:\(item.id)") }
             }
             rail.frame(width: header.width, height: header.height, alignment: .top)
                 .offset(x: header.minX, y: header.minY).zIndex(20)
@@ -692,17 +974,13 @@ struct UsageStrip: View {
 
     @ViewBuilder private var rail: some View {
         if vertical {
-            ScrollView {
-                VStack(spacing: 2 * Self.rowInset) {
-                    ForEach(items) { item in circle(item, foreground: interaction.expanded == item.id)
-                        .onHover { interaction.hover(item.id, inside: $0, zone: "row:\(item.id)") } }
-                }.padding(Self.inset)
-            }.scrollIndicators(.hidden)
+            VStack(spacing: 2 * Self.rowInset) {
+                    ForEach(items) { item in circle(item, foreground: interaction.expanded == item.id) }
+            }.padding(Self.inset)
         } else {
             HStack(spacing: 0) {
                 ForEach(items) { item in circle(item, foreground: interaction.expanded == item.id)
-                    .frame(width: Self.moduleWidth)
-                    .onHover { interaction.hover(item.id, inside: $0, zone: "row:\(item.id)") } }
+                    .frame(width: Self.moduleWidth) }
             }.padding(Self.inset)
         }
     }
@@ -731,235 +1009,198 @@ struct UsageStrip: View {
                                   stale: item.notionStale)
                 }
                 avatar(item)
-            }.frame(width: Self.diameter, height: Self.diameter)
+            }.frame(width: Self.interactionDiameter, height: Self.interactionDiameter)
                 .background(Circle().fill(style.primary.opacity(foreground ? 0.045 : 0)))
                 .shadow(color: style.accent.opacity(foreground ? 0.14 : 0), radius: 8)
                 .contentShape(Circle())
         }.buttonStyle(.plain).foregroundStyle(style.primary)
-            .background {
-                if item.id == "quota" { QuotaWheelArea { interaction.cycleQuota(steps: $0) }.frame(width: Self.diameter, height: Self.diameter) }
-            }
+            .contentShape(.interaction, Circle())
             .accessibilityLabel(item.isProject ? "\(item.title)，\(item.projectStatus ?? "未设置状态")，外环本周 Token 占比，内环\(item.progressLabel)，点击查看项目看板" : "\(item.title)，\(item.caption) \(item.value)")
-            .help(item.id == "quota" ? "滚轮切换额度指标；点击保持看板" : "\(item.title) · 悬停查看项目看板，点击保持")
+            .help("\(item.title) · 悬停查看，点击保持")
             .contextMenu {
-                if item.id == "quota" { ForEach(StripQuotaMetric.allCases) { metric in Button(metric.caption) { interaction.quotaMetric = metric } } }
-                else if item.isProject {
+                if item.isProject {
                     if let url = item.notionURL { Button("打开 Notion 项目") { model.openProject(url) } }
                     Button("项目设置…") { model.openSettings() }
                 }
             }
+            .frame(width: Self.diameter, height: Self.diameter)
     }
 
-    private func management(_ label: String, in item: StripItem) -> String? { item.managementFacts.first(where: { $0.label == label })?.value }
-    private func record(_ label: String, in item: StripItem) -> String? { item.facts.first(where: { $0.label == label })?.value }
-    private func badge(_ value: String, tint: Color? = nil) -> some View {
-        Text(value).font(.system(size: 11, weight: .medium)).foregroundStyle(tint ?? style.secondary)
-            .padding(.horizontal, 8).padding(.vertical, 4).background((tint ?? style.primary).opacity(0.08), in: Capsule())
-    }
-    private func statement(_ label: String, _ value: String, lines: Int = 2) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(label).font(.system(size: 11)).foregroundStyle(style.secondary)
-            Text(value).font(.system(size: 13, weight: .medium)).lineLimit(lines).fixedSize(horizontal: false, vertical: true).help(value)
-        }.frame(maxWidth: .infinity, alignment: .leading)
-    }
-    private func statistic(_ label: String, _ value: String, tint: Color? = nil) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(value).font(.system(size: 16, weight: .semibold, design: .rounded)).monospacedDigit().foregroundStyle(tint ?? style.primary)
-            Text(label).font(.system(size: 11)).foregroundStyle(style.secondary)
-        }.frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    @ViewBuilder func details(_ item: StripItem, availableHeight: CGFloat) -> some View {
-        // Ordinary cards are bounded summaries. Small screens retain a real,
-        // reachable scroll fallback instead of clipping the last actions.
-        if Self.needsCompactScroll(availableHeight: availableHeight, locked: interaction.locked) {
-            ScrollView { dashboard(item).fixedSize(horizontal: false, vertical: true) }
-                .scrollIndicators(.hidden).foregroundStyle(style.primary)
-        } else {
-            ViewThatFits(in: .vertical) {
-                dashboard(item).fixedSize(horizontal: false, vertical: true)
-                ScrollView { dashboard(item).fixedSize(horizontal: false, vertical: true) }.scrollIndicators(.hidden)
-            }.foregroundStyle(style.primary)
-        }
-    }
-
-    private func dashboard(_ item: StripItem) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 10) {
+    @ViewBuilder func details(_ item: StripItem, layout: StripDetailLayout) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center, spacing: 10) {
                 avatar(item).frame(width: 30, height: 30)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(item.title).font(.system(size: 16, weight: .semibold)).lineLimit(2).help(item.title)
-                    Text(item.isProject ? (item.projectStatus ?? (item.notionURL == nil ? "未绑定项目" : "未设置状态")) : item.caption)
-                        .font(.system(size: 11)).foregroundStyle(style.secondary)
-                }
-                Spacer(minLength: 0)
-                if item.isProject { projectAction(item) }
-            }
-            if interaction.locked {
-                HStack(spacing: 4) {
+                detailText(item.title, size: StripDetailMetrics.titleSize, weight: .semibold)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button { interaction.dismiss() } label: {
+                    Image(systemName: "xmark").font(.system(size: 14, weight: .regular))
+                        .frame(width: 28, height: 28).contentShape(Rectangle())
+                }.buttonStyle(.plain).foregroundStyle(style.secondary).accessibilityLabel("收起详情")
+            }.frame(height: layout.headerHeight).padding(.bottom, StripDetailMetrics.sectionGap)
+            if layout.hasTabs {
+                HStack(spacing: 3) {
                     ForEach(StripDashboardPage.allCases) { page in
                         Button { interaction.selectPage(page) } label: {
-                            Text(page.title(for: item)).font(.system(size: 12, weight: .medium))
-                                .frame(maxWidth: .infinity).padding(.vertical, 7)
-                                .background(interaction.dashboardPage == page ? style.primary.opacity(0.09) : Color.clear,
+                            Text(page.title(for: item)).font(.system(size: StripDetailMetrics.bodySize,
+                                weight: interaction.dashboardPage == page ? .medium : .regular))
+                                .frame(maxWidth: .infinity, minHeight: 36)
+                                .background(interaction.dashboardPage == page ? (style == .pulse ? Color.white.opacity(0.10) : Color.white.opacity(0.88)) : Color.clear,
                                             in: RoundedRectangle(cornerRadius: 8))
-                        }.buttonStyle(.plain).accessibilityAddTraits(interaction.dashboardPage == page ? .isSelected : [])
+                                .contentShape(Rectangle())
+                        }.buttonStyle(.plain)
+                            .foregroundStyle(interaction.dashboardPage == page ? style.primary : style.secondary)
+                            .accessibilityAddTraits(interaction.dashboardPage == page ? .isSelected : [])
                     }
-                }.padding(3).background(style.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+                }.padding(3).frame(height: StripDetailMetrics.tabsHeight)
+                    .background(style.track, in: RoundedRectangle(cornerRadius: 10))
+                    .padding(.bottom, StripDetailMetrics.sectionGap)
             }
-            dashboardContent(item, page: interaction.locked ? interaction.dashboardPage : .overview)
-            Spacer(minLength: 0)
-            if item.isProject {
-                Button { if let url = item.notionURL { model.openProject(url) } else { model.openSettings() } } label: {
-                    Label(item.notionURL == nil ? "关联 Notion 项目" : "查看完整项目", systemImage: "arrow.up.right")
-                        .font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading)
-                }.buttonStyle(.plain).foregroundStyle(style.accent)
-            } else if !interaction.locked {
-                Text("点击查看完整记录").font(.system(size: 10)).foregroundStyle(style.secondary)
-            }
-        }.padding(18).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-
-    @ViewBuilder private func dashboardContent(_ item: StripItem, page: StripDashboardPage) -> some View {
-        if item.isProject { projectContent(item, page: page) }
-        else if item.id == "quota" { quotaContent(item, page: page) }
-        else { ledgerContent(item, page: page) }
-    }
-
-    private func progressSummary(_ item: StripItem) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text(item.progressLabel).font(.system(size: 11)).foregroundStyle(style.secondary)
-                Spacer()
-                Text(item.developmentProgress.map { String(format: "%.1f%%", $0) } ?? "未取得")
-                    .font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
-            }
-            if let fraction = item.secondaryRing {
-                GeometryReader { proxy in
-                    Capsule().fill(style.track).overlay(alignment: .leading) {
-                        Capsule().fill(style.progress).frame(width: proxy.size.width * fraction)
-                    }
-                }.frame(height: 4)
-            }
-        }
-    }
-
-    @ViewBuilder private func projectContent(_ item: StripItem, page: StripDashboardPage) -> some View {
-        switch page {
-        case .overview:
-            HStack(spacing: 6) {
-                if let health = management("健康度", in: item) { badge(health) }
-                if item.notionStale { badge("缓存 · 待更新") }
-            }
-            statement("下一步", management("下一步", in: item) ?? "在 Notion 中补充下一步行动。")
-            progressSummary(item)
-            HStack {
-                statistic("本周 Token", item.usageLinked ? item.detailValue : "未关联")
-                statistic("本周占比", item.usageLinked ? item.value : "—")
-            }
-        case .actions:
-            statement("当前目标", management("本周目标", in: item) ?? management("项目目标", in: item) ?? "未填写目标", lines: 1)
-            statement("下一步", management("下一步", in: item) ?? "未填写下一步")
-            HStack {
-                statistic("待办", management("待办任务", in: item) ?? "—")
-                statistic("受阻", management("受阻任务", in: item) ?? "—", tint: style.progress)
-                statistic("已完成", management("已完成", in: item) ?? "—")
-            }
-            if let summary = management("项目摘要", in: item) { statement("最新产出与进展", summary) }
-            HStack {
-                if let priority = management("优先级", in: item) { Text("优先级 " + priority) }
-                if let date = management("交付日期", in: item) { Text(date) }
-            }.font(.system(size: 10)).foregroundStyle(style.secondary)
-        case .investment:
-            HStack {
-                statistic("本周 Token", item.usageLinked ? item.detailValue : "未关联")
-                statistic("今日 Token", item.todayTokens.map(compactTokens) ?? "—")
-            }
-            factRows(item, labels: ["本周占比", "会话数量", "模型响应", "平均/响应"])
-            Text(item.usageLinked ? "外环：本周 Token 占比 · 内环：" + item.progressLabel : "未关联本地记录，不代表零用量。")
-                .font(.system(size: 10)).foregroundStyle(style.secondary).lineLimit(2)
-            if item.progressLabel == "行动完成率" {
-                Text("行动完成率仅代表任务清单，不能代替项目整体完成度。")
-                    .font(.system(size: 10)).foregroundStyle(style.secondary).lineLimit(2)
-            }
-        }
-    }
-
-    @ViewBuilder private func quotaContent(_ item: StripItem, page: StripDashboardPage) -> some View {
-        switch page {
-        case .overview:
-            HStack {
-                statistic(item.caption, item.detailValue)
-                statistic("今日 Token · 本机", item.todayTokens.map(compactTokens) ?? "—")
-            }
-            factRows(item, labels: ["下次重置", "5小时剩余", "本周超额"])
-            Text(item.footnote.replacingOccurrences(of: "\n", with: " · ")).font(.system(size: 11))
-                .foregroundStyle(style.secondary).lineLimit(2)
-        case .actions:
-            HStack { statistic(item.caption, item.detailValue) }
-            factRows(item, labels: ["当前已用", "5小时剩余", "下次重置", "5小时重置"])
-            Button { interaction.cycleQuota() } label: { Label("切换额度指标", systemImage: "arrow.triangle.2.circlepath") }
-                .buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(style.accent)
-            Text("滚轮只切换 Codex 图标指标，卡片内不切换额度。")
-                .font(.system(size: 10)).foregroundStyle(style.secondary).lineLimit(2)
-        case .investment:
-            factRows(item, labels: ["本周已用", "本周超额"])
-            statistic("今日 Token · 本机", item.todayTokens.map(compactTokens) ?? "—")
-            Text("累计与超额来自额度观测；今日 Token 来自本机日志，两者不能互相换算。环最多显示 100%，实际累计保留原值。")
-                .font(.system(size: 11)).foregroundStyle(style.secondary).lineLimit(4)
-        }
-    }
-
-    @ViewBuilder private func ledgerContent(_ item: StripItem, page: StripDashboardPage) -> some View {
-        if !item.members.isEmpty {
-            Text("其余 \(item.members.count) 个项目").font(.system(size: 13, weight: .medium))
-            ForEach(Array(item.members.prefix(4).enumerated()), id: \.offset) { _, member in
-                HStack {
-                    Text(member.display_name ?? member.name).lineLimit(1).help(member.display_name ?? member.name)
-                    Spacer()
-                    Text(item.managementList ? (member.project_status ?? "未设置状态") : String(format: "%.1f%%", member.percent))
-                        .foregroundStyle(style.secondary)
-                }.font(.system(size: 12))
-            }
-            Button("查看全部项目…") { model.openSettings() }.buttonStyle(.plain).font(.system(size: 12)).foregroundStyle(style.accent)
-        } else {
-            HStack {
-                statistic("本周 Token", item.detailValue)
-                statistic("今日 Token", item.todayTokens.map(compactTokens) ?? "—")
-            }
-            factRows(item, labels: page == .overview ? ["任务数量", "统计时间"] : ["任务数量", "模型响应", "记录质量", "扫描提示", "统计时间"])
-            Text(item.footnote.replacingOccurrences(of: "\n", with: " · ")).font(.system(size: 11)).foregroundStyle(style.secondary).lineLimit(2)
-            if page == .investment {
-                Text("本机保留记录中的投入，不代表订阅剩余额度或最终账单。")
-                    .font(.system(size: 10)).foregroundStyle(style.secondary).lineLimit(3)
-            }
-            if item.id == "empty" { Button("项目设置…") { model.openSettings() }.buttonStyle(.plain).font(.system(size: 12)) }
-        }
-    }
-
-    private func factRows(_ item: StripItem, labels: [String]) -> some View {
-        VStack(spacing: 10) {
-            ForEach(labels, id: \.self) { label in
-                if let value = record(label, in: item) {
-                    HStack(alignment: .top) {
-                        Text(label).foregroundStyle(style.secondary)
-                        Spacer(minLength: 10)
-                        Text(value.replacingOccurrences(of: "\n", with: " ")).fontWeight(.medium)
-                            .multilineTextAlignment(.trailing).lineLimit(2)
-                    }.font(.system(size: 12)).monospacedDigit()
+            VStack(alignment: .leading, spacing: layout.metrics ? 0 : StripDetailMetrics.sectionGap) {
+                ForEach(Array(layout.visibleSections.enumerated()), id: \.element.id) { index, section in
+                    if layout.metrics && index > 0 { Rectangle().fill(style.track).frame(height: 1) }
+                    sectionView(section, width: layout.contentWidth)
+                        .frame(height: section.height(width: layout.contentWidth), alignment: .top)
+                        .padding(.top, layout.metrics ? (index == 0 ? 1 : 9) : 0)
+                        .padding(.bottom, layout.metrics ? (index == layout.visibleSections.count - 1 ? 1 : 9) : 0)
                 }
             }
+            if layout.pages.count > 1 {
+                VStack(spacing: 12) {
+                    Rectangle().fill(style.track).frame(height: 1)
+                    HStack {
+                        Text("第 \(layout.selectedPage + 1) / \(layout.pages.count) 页")
+                            .font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
+                        Spacer()
+                        HStack(spacing: 6) {
+                            Button { interaction.selectSectionPage(layout.selectedPage - 1) } label: {
+                                Image(systemName: "chevron.left").font(.system(size: 12))
+                                    .frame(width: 30, height: 28).contentShape(Rectangle())
+                            }.buttonStyle(.plain).disabled(layout.selectedPage == 0).accessibilityLabel("上一页")
+                            Button { interaction.selectSectionPage(layout.selectedPage + 1) } label: {
+                                Image(systemName: "chevron.right").font(.system(size: 12))
+                                    .frame(width: 30, height: 28).contentShape(Rectangle())
+                            }.buttonStyle(.plain).disabled(layout.selectedPage == layout.pages.count - 1).accessibilityLabel("下一页")
+                        }.background(style.track, in: RoundedRectangle(cornerRadius: 7))
+                    }.frame(height: 28)
+                }.padding(.top, StripDetailMetrics.sectionGap)
+            }
+            if layout.showsFooter {
+                VStack(spacing: 12) {
+                    Rectangle().fill(style.track).frame(height: 1)
+                    Button { if let url = item.notionURL { model.openProject(url) } else { model.openSettings() } } label: {
+                        HStack {
+                            Text(item.notionURL == nil ? "关联 Notion 项目" : "在 Notion 查看项目")
+                            Spacer()
+                            Image(systemName: "arrow.up.right")
+                        }.font(.system(size: StripDetailMetrics.bodySize))
+                            .frame(maxWidth: .infinity, minHeight: StripDetailMetrics.bodyLine, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }.buttonStyle(.plain).foregroundStyle(style.secondary)
+                }.padding(.top, StripDetailMetrics.sectionGap)
+            }
+        }.padding(StripDetailMetrics.padding).frame(maxWidth: .infinity, alignment: .topLeading)
+            .foregroundStyle(style.primary)
+    }
+
+    private func detailText(_ value: String, size: CGFloat = StripDetailMetrics.bodySize,
+                            weight: Font.Weight = .regular, lineHeight: CGFloat = StripDetailMetrics.bodyLine) -> some View {
+        Text(value).font(.system(size: size, weight: weight))
+            .lineSpacing(max(0, lineHeight - ceil(NSLayoutManager().defaultLineHeight(for: NSFont.systemFont(ofSize: size)))))
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder private func sectionView(_ section: StripDetailSection, width: CGFloat) -> some View {
+        switch section.kind {
+        case .row:
+            HStack(alignment: .center, spacing: StripDetailMetrics.sectionGap) {
+                detailText(section.label, size: StripDetailMetrics.labelSize, lineHeight: StripDetailMetrics.labelLine)
+                    .foregroundStyle(style.secondary).frame(width: section.labelWidth(width: width), alignment: .leading)
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                    detailText(section.countUnit == nil ? section.value : String(section.value.dropLast(2)),
+                               size: section.valueSize, weight: section.textValue ? .regular : .semibold)
+                        .monospacedDigit().multilineTextAlignment(.trailing)
+                    if let unit = section.countUnit {
+                        Text(unit).font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary).fixedSize()
+                    }
+                }.frame(maxWidth: .infinity, alignment: .trailing)
+                    .foregroundStyle(section.id == "remaining" ? style.accent : style.primary)
+            }.frame(maxWidth: .infinity, minHeight: StripDetailMetrics.bodyLine)
+        case .status:
+            HStack {
+                Text(section.label).font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
+                Spacer()
+                HStack(spacing: 6) {
+                    Circle().fill(statusColor(section.value)).frame(width: 5, height: 5)
+                    detailText(section.value, size: StripDetailMetrics.labelSize, weight: .medium, lineHeight: StripDetailMetrics.labelLine)
+                }.foregroundStyle(statusColor(section.value))
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(statusColor(section.value).opacity(style == .pulse ? 0.14 : 0.10), in: RoundedRectangle(cornerRadius: 6))
+            }.frame(minHeight: 24)
+        case .statement:
+            VStack(alignment: .leading, spacing: StripDetailMetrics.fieldGap) {
+                Text(section.label).font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
+                    .frame(height: StripDetailMetrics.labelLine, alignment: .leading)
+                detailText(section.value).frame(height: StripDetailSection.textHeight(section.value, width: width), alignment: .topLeading)
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        case .progress:
+            VStack(alignment: .leading, spacing: StripDetailMetrics.fieldGap) {
+                HStack {
+                    Text("完成进度").font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
+                    Spacer()
+                    Text(section.percent == nil ? "待评估" : section.value)
+                        .font(.system(size: section.percent == nil ? StripDetailMetrics.bodySize : StripDetailMetrics.titleSize,
+                                      weight: section.percent == nil ? .regular : .semibold)).monospacedDigit()
+                        .foregroundStyle(section.percent == nil ? style.secondary : style.primary)
+                }.frame(height: StripDetailMetrics.bodyLine)
+                Capsule().fill(style.track).frame(height: 4).overlay(alignment: .leading) {
+                    if let percent = section.percent {
+                        Capsule().fill(style.progress).frame(width: width * CGFloat(percent / 100), height: 4)
+                    }
+                }.accessibilityLabel("完成进度").accessibilityValue(section.value)
+            }
+        case .manual:
+            VStack(alignment: .leading, spacing: StripDetailMetrics.fieldGap) {
+                Text("人工待办").font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
+                    .frame(height: StripDetailMetrics.labelLine, alignment: .leading)
+                let values = section.value.components(separatedBy: "|")
+                HStack(spacing: 8) {
+                    ForEach(Array(["待办", "受阻", "已完成"].enumerated()), id: \.offset) { index, label in
+                        if index > 0 { Spacer(minLength: 0) }
+                        HStack(alignment: .firstTextBaseline, spacing: 4) {
+                            Text(label).font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
+                            let value = values.indices.contains(index) ? values[index].replacingOccurrences(of: "项", with: "").trimmingCharacters(in: .whitespaces) : "—"
+                            Text(value).font(.system(size: StripDetailMetrics.titleSize, weight: .semibold)).monospacedDigit()
+                            Text("项").font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
+                        }.fixedSize()
+                    }
+                }.frame(height: StripDetailMetrics.bodyLine)
+            }
+        case .artifact:
+            VStack(alignment: .leading, spacing: StripDetailMetrics.fieldGap) {
+                Text(section.label).font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
+                    .frame(height: StripDetailMetrics.labelLine, alignment: .leading)
+                Button {
+                    if let value = section.url, let url = StripDetailSection.safeOutputURL(value) { NSWorkspace.shared.open(url) }
+                } label: {
+                    HStack(alignment: .top, spacing: 12) {
+                        detailText(section.value).frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "arrow.up.right").font(.system(size: 14)).frame(width: 14, height: StripDetailMetrics.bodyLine)
+                            .foregroundStyle(style.secondary)
+                    }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                }.buttonStyle(.plain).accessibilityLabel("查看正式产出：" + section.value)
+            }
         }
     }
 
-    private func projectAction(_ item: StripItem) -> some View {
-        Button {
-            if let url = item.notionURL { model.openProject(url) } else { model.openSettings() }
-        } label: {
-            Image(systemName: item.notionURL == nil ? "link" : "arrow.up.right").font(.system(size: 13))
-                .frame(width: 30, height: 30).background(style.primary.opacity(0.05), in: Circle())
-        }.buttonStyle(.plain).help(item.notionURL == nil ? "绑定 Notion 项目" : "打开 Notion 项目")
+    private func statusColor(_ value: String) -> Color {
+        if ["遇到卡点", "阻塞", "受阻", "有风险", "需关注"].contains(value) {
+            return style == .pulse ? Color(red: 0.97, green: 0.77, blue: 0.47) : Color(red: 0.55, green: 0.30, blue: 0.08)
+        }
+        if ["顺利", "健康", "完成", "已完成", "开发中"].contains(value) { return style.accent }
+        return style.secondary
     }
+
+
 }
 
 private extension View {

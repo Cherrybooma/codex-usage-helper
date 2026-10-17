@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "project": {
+    "name": "示例项目",
+    "icon": {
+      "type": "emoji",
+      "emoji": "🧭"
+    },
+    "vision": "把分散的信息整理成便于查找和持续维护的工具。",
+    "status": "计划中",
+    "health": "顺利",
+    "current_goal": "核对现有实现与正式产出，确认第一阶段交付范围。",
+    "next_step": "明确第一阶段的验收条件。",
+    "summary": "这是格式示例，请根据真实项目资料替换。",
+    "progress": null,
+    "artifacts": [],
+    "manual_actions": [],
+    "history": []
+  }
+}

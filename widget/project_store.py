@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import math
 from datetime import datetime
@@ -16,18 +17,18 @@ COUNTS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
           "request_records", "legacy_updates")
 PROJECT_MANAGEMENT_FIELDS = ("project_goal", "weekly_goal", "next_step", "project_priority",
                              "project_health", "target_date", "last_reviewed", "project_summary",
-                             "open_tasks", "blocked_tasks", "completed_tasks")
+                             "open_tasks", "blocked_tasks", "completed_tasks", "current_goal",
+                             "human_open_tasks", "human_blocked_tasks", "human_completed_tasks",
+                             "latest_output_title", "latest_output_url", "latest_progress_summary")
 
 
 def project_progress(meta: dict) -> dict:
+    """Project completion is an explicit assessment, never a task-count ratio."""
     value = meta.get("development_progress")
-    if (meta.get("progress_source") == "manual" and isinstance(value, (int, float))
+    source = meta.get("progress_source")
+    if (source in ("ai", "manual") and isinstance(value, (int, float))
             and not isinstance(value, bool) and 0 <= value <= 100 and math.isfinite(value)):
-        return {"development_progress": float(value), "progress_source": "manual"}
-    opened, completed = meta.get("open_tasks"), meta.get("completed_tasks")
-    if (all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in (opened, completed))
-            and opened + completed > 0):
-        return {"development_progress": completed * 100 / (opened + completed), "progress_source": "tasks"}
+        return {"development_progress": float(value), "progress_source": source}
     return {"development_progress": None, "progress_source": None}
 
 
@@ -123,6 +124,7 @@ class ProjectRegistry:
                 raise ValueError("项目身份配置版本不支持，请保留原文件。")
         else:
             self.data = {"version": 1, "datasets": {}, "projects": {}}
+        self._loaded_task_root = self.data.get("task_root")
         source = str(codex_home.expanduser().resolve())
         key = hashlib.sha256(source.encode()).hexdigest()
         if key not in self.data["datasets"]:
@@ -138,7 +140,32 @@ class ProjectRegistry:
         return known["task_id"]
 
     def save(self) -> None:
-        atomic_write(self.path, self.data)
+        # Import and scan are independent processes. Merge new identities under
+        # one lock; never silently replace an ID already used by either writer.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.with_suffix(".lock").open("a+") as lock:
+            Path(lock.name).chmod(0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self.path.exists():
+                latest = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(latest, dict) or latest.get("version") != 1 or not all(
+                        isinstance(latest.get(key), dict) for key in ("datasets", "projects")):
+                    raise ValueError("项目身份配置版本不支持，请保留原文件。")
+                for key, identity in self.data["datasets"].items():
+                    if key in latest["datasets"] and latest["datasets"][key] != identity:
+                        raise ValueError("项目身份已由另一进程建立，请使用最新配置重试。")
+                for key, project in self.data["projects"].items():
+                    if key in latest["projects"] and latest["projects"][key].get("task_id") != project.get("task_id"):
+                        raise ValueError("项目身份已由另一进程建立，请使用最新配置重试。")
+                if (latest.get("task_root") != self._loaded_task_root
+                        and self.data.get("task_root") is not None
+                        and self.data["task_root"] != latest.get("task_root")):
+                    raise ValueError("项目根目录已由另一进程更改，请使用最新配置重试。")
+                self.data = {**latest, **self.data, "version": 1,
+                             "datasets": {**latest["datasets"], **self.data["datasets"]},
+                             "projects": {**latest["projects"], **self.data["projects"]}}
+            atomic_write(self.path, self.data)
+            self._loaded_task_root = self.data.get("task_root")
 
     def session_key(self, thread_id: str) -> str:
         # This local-only key allows cross-folder/day distinct counts. It is
