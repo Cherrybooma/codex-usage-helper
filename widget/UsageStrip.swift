@@ -2,13 +2,38 @@ import AppKit
 import SwiftUI
 
 enum WidgetKind: String, Codable, CaseIterable {
-    case horizontal, vertical, box
+    case horizontal, vertical
     var title: String {
         switch self {
         case .horizontal: return "顶部横条"
         case .vertical: return "右侧竖条"
-        case .box: return "桌面小框"
         }
+    }
+}
+
+// Display preferences accept legacy names without reviving retired windows.
+// An explicit empty array still means the user hid all capsules.
+enum WidgetDisplayPreferences {
+    static func decode(_ data: Data) throws -> Set<WidgetKind> {
+        let saved = try JSONDecoder().decode(Set<String>.self, from: data)
+        let enabled = Set(saved.compactMap(WidgetKind.init(rawValue:)))
+        return enabled.isEmpty && !saved.isEmpty ? [.horizontal] : enabled
+    }
+
+    static func restore(root: URL) -> Set<WidgetKind> {
+        let file = root.appendingPathComponent("widget/data/display-settings.json")
+        guard let data = try? Data(contentsOf: file), let enabled = try? decode(data) else { return [.horizontal] }
+        if let saved = try? JSONDecoder().decode(Set<String>.self, from: data), saved != Set(enabled.map(\.rawValue)) {
+            try? save(enabled, root: root)
+        }
+        return enabled
+    }
+
+    static func save(_ enabled: Set<WidgetKind>, root: URL) throws {
+        let directory = root.appendingPathComponent("widget/data")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try JSONEncoder().encode(enabled.map(\.rawValue).sorted())
+            .write(to: directory.appendingPathComponent("display-settings.json"), options: .atomic)
     }
 }
 
@@ -142,7 +167,7 @@ private struct ProjectAvatarImage: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity).background(Color.primary.opacity(0.08))
             }
         }.task(id: value) { loader.load(value) }.onDisappear { loader.cancel() }
-            .help(loader.failed ? "图标加载失败，请在 Notion 更新头像" : "Notion 项目图标")
+            .help(loader.failed ? "图标加载失败，请在项目笔记更新头像" : "Markdown 项目图标")
     }
 }
 
@@ -159,15 +184,16 @@ struct StripItem: Identifiable {
     var managementFacts: [StripFact] = []
     var avatar: StripAvatar = .symbol("ellipsis")
     var projectStatus: String?
-    var notionURL: String?
-    var notionStale = false
+    var projectURL: String?
+    var managementStale = false
     var needsProjectIcon = false
     var usageLinked = true
-    var managementList = false
+    var showsManagement = true
     var primaryRing: Double?
     var secondaryRing: Double?
     var developmentProgress: Double?
     var progressLabel = "完成进度"
+    var progressAssessment: String?
     var todayTokens: Int?
     var ringStale = false
     var estimatedCost = "—"
@@ -204,6 +230,20 @@ struct StripItem: Identifiable {
         return value
     }
 
+    static func assessmentNote(source: String?, reviewedAt: String?) -> String? {
+        let label: String
+        switch source {
+        case "ai": label = "AI估计"
+        case "manual": label = "人工评估"
+        default: return nil
+        }
+        let date = reviewedAt.map(projectDate)
+        let knownDate = date.flatMap { value in
+            value.range(of: "^\\d{4}-\\d{2}-\\d{2}$", options: .regularExpression) != nil ? value : nil
+        }
+        return label + " · " + (knownDate ?? "评估日期待核对")
+    }
+
     static func statusLabel(_ value: String?) -> String? {
         switch value {
         case "正常": return "顺利"
@@ -218,22 +258,19 @@ struct StripItem: Identifiable {
         return String(format: (status == "lower_bound" || lowerBound == true) ? "≥$%.2f" : "≈$%.2f", amount)
     }
 
-    private static func notionIdentity(_ row: TaskRow) -> String? {
-        guard let value = row.notion_url, let url = URL(string: value) else { return nil }
-        let component = url.lastPathComponent.replacingOccurrences(of: "-", with: "")
-        let suffix = String(component.suffix(32)).lowercased()
-        if suffix.count == 32 && suffix.allSatisfy({ $0.isHexDigit }) { return "page:" + suffix }
-        return value.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    private static func projectIdentity(_ row: TaskRow) -> String? {
+        guard let id = row.project_id, !id.isEmpty else { return nil }
+        return "project:" + id
     }
 
     static func availableManagedProjects(_ snapshot: Snapshot?) -> [TaskRow] {
         var projects: [TaskRow] = [], indices: [String: Int] = [:]
-        // A Notion page is one project even when several local folders bind to it.
+        // Stable project identity is shared by all bound local folders.
         // Keep every binding before deduplication so aggregation cannot lose a folder.
         for row in (snapshot?.management_projects ?? []).sorted(by: { $0.id < $1.id }) {
             guard row.is_other != true, !["归档", "已归档"].contains(row.project_status ?? ""),
                   let id = row.task_id, !id.isEmpty else { continue }
-            let key = notionIdentity(row) ?? row.id
+            let key = projectIdentity(row) ?? row.id
             if let index = indices[key] {
                 projects[index].task_ids = Array(Set((projects[index].task_ids ?? []) + (row.task_ids ?? []) + [id])).sorted()
             } else {
@@ -248,7 +285,7 @@ struct StripItem: Identifiable {
 
     private static func matches(_ project: TaskRow, usage: TaskRow) -> Bool {
         if let id = usage.task_id, project.task_id == id || project.task_ids?.contains(id) == true { return true }
-        if let page = notionIdentity(project), page == notionIdentity(usage) { return true }
+        if let page = projectIdentity(project), page == projectIdentity(usage) { return true }
         return false
     }
 
@@ -291,7 +328,7 @@ struct StripItem: Identifiable {
             globalAmount = 5 * used / 100; globalStatus = "estimated"
         }
         let globalCost = costLabel(globalAmount, status: globalStatus, lowerBound: snapshot.estimated_cost_lower_bound)
-        let sourceRows = snapshot.all_usage_tasks ?? (snapshot.tasks.filter { $0.is_other != true } + snapshot.other_tasks)
+        let sourceRows = snapshot.all_usage_tasks ?? (snapshot.tasks.filter { $0.is_other != true } + (snapshot.other_tasks ?? []))
         var seen = Set<String>()
         let ranked = sourceRows.filter { $0.is_other != true && $0.total_tokens > 0 && seen.insert($0.id).inserted }.sorted {
             $0.total_tokens == $1.total_tokens ? $0.id < $1.id : $0.total_tokens > $1.total_tokens
@@ -338,14 +375,14 @@ struct StripItem: Identifiable {
             displayedUsageIDs.formUnion(usage.map(\.id))
             displayedManagedIDs.insert(metadata.task_id ?? "")
             let row = usage.first ?? metadata
-            // Notion enriches a task's identity and management; it never replaces its usage.
+            // Management enriches identity; it never replaces measured usage.
             let hasUsage = !usage.isEmpty
             let tokens = usage.reduce(0) { $0 + $1.total_tokens }
-            let title = metadata.display_name?.isEmpty == false ? metadata.display_name! : metadata.name
+            let title = managementEnabled && metadata.display_name?.isEmpty == false ? metadata.display_name! : metadata.name
             let percent = snapshot.total_tokens > 0 ? Double(tokens) * 100 / Double(snapshot.total_tokens) : 0
             var management: [StripFact] = []
             func add(_ label: String, _ value: String?) {
-                if let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                if managementEnabled, let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
                     management.append(StripFact(label: label, value: value))
                 }
             }
@@ -357,9 +394,9 @@ struct StripItem: Identifiable {
             if let count = metadata.human_blocked_tasks ?? row.human_blocked_tasks { add("人工受阻", "\(count) 项") }
             if let count = metadata.human_completed_tasks ?? row.human_completed_tasks { add("人工已完成", "\(count) 项") }
             add("最新产出与进度记录", metadata.latest_progress_summary ?? row.latest_progress_summary)
-            let development = projectProgress(metadata.development_progress ?? row.development_progress,
-                                             source: metadata.progress_source ?? row.progress_source)
-            let projectAvatar = StripAvatar.project(metadata)
+            let development = managementEnabled ? projectProgress(metadata.development_progress ?? row.development_progress,
+                                             source: metadata.progress_source ?? row.progress_source) : nil
+            let projectAvatar = managementEnabled ? StripAvatar.project(metadata) : .symbol("folder")
             let ownCost: Double?
             let costStatus: String?
             if let globalAmount, ["estimated", "lower_bound"].contains(globalStatus ?? "") {
@@ -374,15 +411,18 @@ struct StripItem: Identifiable {
                 title: title, detailValue: compactTokens(tokens), unit: "Token", footnote: "",
                 facts: [StripFact(label: "本周占比", value: String(format: "%.1f%%", percent))],
                 managementFacts: management, avatar: projectAvatar,
-                projectStatus: statusLabel(metadata.project_health?.isEmpty == false ? metadata.project_health : metadata.project_status ?? row.project_status),
-                notionURL: metadata.notion_url ?? row.notion_url, notionStale: metadata.notion_stale == true || row.notion_stale == true,
-                needsProjectIcon: projectAvatar == .symbol("folder"),
-                usageLinked: hasUsage,
+                projectStatus: managementEnabled ? statusLabel(metadata.project_health?.isEmpty == false ? metadata.project_health : metadata.project_status ?? row.project_status) : nil,
+                projectURL: managementEnabled ? (metadata.project_url ?? row.project_url) : nil,
+                managementStale: managementEnabled && (metadata.management_stale == true || row.management_stale == true),
+                needsProjectIcon: managementEnabled && projectAvatar == .symbol("folder"),
+                usageLinked: hasUsage, showsManagement: managementEnabled,
                 primaryRing: fraction(percent), secondaryRing: fraction(development), developmentProgress: development,
+                progressAssessment: development == nil ? nil : assessmentNote(source: metadata.progress_source ?? row.progress_source,
+                    reviewedAt: metadata.last_reviewed ?? row.last_reviewed),
                 todayTokens: today,
                 estimatedCost: costLabel(ownCost, status: costStatus, lowerBound: snapshot.estimated_cost_lower_bound),
-                latestOutputTitle: metadata.latest_output_title ?? row.latest_output_title,
-                latestOutputURL: metadata.latest_output_url ?? row.latest_output_url))
+                latestOutputTitle: managementEnabled ? (metadata.latest_output_title ?? row.latest_output_title) : nil,
+                latestOutputURL: managementEnabled ? (metadata.latest_output_url ?? row.latest_output_url) : nil))
         }
         let remainder = ranked.filter { !displayedUsageIDs.contains($0.id) }
         let managedRemainder = managed.filter { project in
@@ -393,7 +433,8 @@ struct StripItem: Identifiable {
             let percent = snapshot.total_tokens > 0 ? Double(tokens) * 100 / Double(snapshot.total_tokens) : 0
             result.append(StripItem(id: "remainder", caption: "其他", value: String(format: "%.1f%%", percent),
                 title: "其他任务", detailValue: compactTokens(tokens), unit: "Token", footnote: "",
-                members: remainder, avatar: .symbol("ellipsis"), primaryRing: fraction(percent), managedMembers: managedRemainder))
+                members: remainder, avatar: .symbol("ellipsis"), showsManagement: managementEnabled,
+                primaryRing: fraction(percent), managedMembers: managedRemainder))
         }
         if displayed.isEmpty && ranked.isEmpty && managedRemainder.isEmpty {
             result.append(StripItem(id: "empty", caption: "暂无项目", value: "—", title: "暂无项目",
@@ -414,6 +455,7 @@ struct StripDetailSection: Identifiable {
     let value: String
     var percent: Double?
     var url: String?
+    var note: String?
 
     static func content(for item: StripItem, locked: Bool, page: StripDashboardPage) -> [Self] {
         func management(_ label: String) -> String { item.managementFacts.first { $0.label == label }?.value ?? "—" }
@@ -422,17 +464,25 @@ struct StripDetailSection: Identifiable {
         func statement(_ id: String, _ label: String, _ value: String) -> Self { Self(id: id, kind: .statement, label: label, value: value) }
         let status = Self(id: "status", kind: .status, label: "项目状态", value: item.projectStatus ?? "未设置")
         let progress = Self(id: "progress", kind: .progress, label: "完成进度",
-                            value: item.developmentProgress.map { String(format: "%.0f%%", $0) } ?? "—", percent: item.developmentProgress)
+                            value: item.developmentProgress.map { String(format: "%.0f%%", $0) } ?? "—", percent: item.developmentProgress,
+                            note: item.progressAssessment)
         let share = row("share", "本周占比", item.value)
         if item.isProject {
             if !locked { return [status, statement("next", "下一步行动", management("下一步")), progress, share] }
             switch page {
             case .overview: return [status, statement("vision", "项目愿景", management("项目愿景")), progress, share]
             case .actions:
-                var result = [statement("goal", "当前目标", management("当前目标")),
-                    Self(id: "manual", kind: .manual, label: "人工待办",
-                         value: [management("人工待办"), management("人工受阻"), management("人工已完成")].joined(separator: "|")),
-                    statement("latest", "进度记录", management("最新产出与进度记录"))]
+                let goal = management("当前目标")
+                let latest = management("最新产出与进度记录")
+                func normalized(_ value: String) -> String {
+                    value.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                }
+                var result = [statement("goal", "当前目标", goal),
+                    Self(id: "manual", kind: .manual, label: "人工事项（未完成含准备中）",
+                         value: [management("人工待办"), management("人工受阻"), management("人工已完成")].joined(separator: "|"))]
+                if latest != "—" && normalized(latest) != normalized(goal) {
+                    result.append(statement("latest", "进度记录", latest))
+                }
                 if let title = item.latestOutputTitle, !title.isEmpty, let url = item.latestOutputURL,
                    safeOutputURL(url) != nil {
                     result.append(Self(id: "output", kind: .artifact, label: "最新产出", value: title, url: url))
@@ -454,12 +504,12 @@ struct StripDetailSection: Identifiable {
         }
         if item.id == "remainder" {
             return [row("share", "本周占比", item.value), row("week-tokens", "本周 Token", item.detailValue)] + item.members.map { member in
-                if let url = member.notion_url, safeOutputURL(url) != nil {
+                if item.showsManagement, let url = member.project_url, safeOutputURL(url) != nil {
                     return Self(id: member.id, kind: .artifact, label: "项目", value: (member.display_name ?? member.name) + " · " + String(format: "%.1f%%", member.percent), url: url)
                 }
-                return row(member.id, member.display_name ?? member.name, String(format: "%.1f%%", member.percent))
+                return row(member.id, item.showsManagement ? (member.display_name ?? member.name) : member.name, String(format: "%.1f%%", member.percent))
             } + item.managedMembers.map { member in
-                if let url = member.notion_url, safeOutputURL(url) != nil {
+                if item.showsManagement, let url = member.project_url, safeOutputURL(url) != nil {
                     return Self(id: member.id, kind: .artifact, label: "项目", value: member.display_name ?? member.name, url: url)
                 }
                 return row(member.id, member.display_name ?? member.name, member.project_health ?? member.project_status ?? "未设置")
@@ -469,6 +519,7 @@ struct StripDetailSection: Identifiable {
     }
 
     static func safeOutputURL(_ value: String) -> URL? {
+        if let url = ProjectDestination.obsidianURL(value) { return url }
         if let url = StripAvatar.safeRemoteURL(value) { return url }
         // Formal local outputs are documents, not executables or arbitrary URL schemes.
         let url = value.hasPrefix("/") ? URL(fileURLWithPath: value) : URL(string: value)
@@ -507,7 +558,7 @@ struct StripDetailSection: Identifiable {
                                               size: valueSize, weight: valueWeight))
         case .status: return max(24, Self.textHeight(value, width: width * 0.60 - 22, size: StripDetailMetrics.labelSize,
                                                    weight: .medium, lineHeight: StripDetailMetrics.labelLine) + 6)
-        case .progress: return 32
+        case .progress: return 32 + (note.map { StripDetailMetrics.fieldGap + Self.textHeight($0, width: width, size: StripDetailMetrics.labelSize, lineHeight: StripDetailMetrics.labelLine) } ?? 0)
         case .manual: return 46
         case .artifact: return StripDetailMetrics.labelLine + StripDetailMetrics.fieldGap + Self.textHeight(value, width: width - 26)
         case .statement: return StripDetailMetrics.labelLine + StripDetailMetrics.fieldGap + Self.textHeight(value, width: width)
@@ -522,7 +573,7 @@ struct StripDetailSection: Identifiable {
             var section = original
             if section.kind == .manual && section.height(width: width) > budget {
                 let values = section.value.components(separatedBy: "|")
-                for (index, label) in ["人工待办", "人工受阻", "人工已完成"].enumerated() {
+                for (index, label) in ["未完成人工事项（含准备中）", "人工受阻", "人工已完成"].enumerated() {
                     expanded.append(Self(id: section.id + ":\(index)", kind: .row, label: label,
                                          value: values.indices.contains(index) ? values[index] : "—"))
                 }
@@ -920,7 +971,7 @@ struct UsageStrip: View {
     let height: CGFloat
     var canvasWidth: CGFloat = 0
     var headerOffset: CGFloat = 0
-    var items: [StripItem] { StripItem.items(model.snapshot, failed: model.error != nil, metric: interaction.quotaMetric, managementEnabled: model.notionEnabled) }
+    var items: [StripItem] { StripItem.items(model.snapshot, failed: model.error != nil, metric: interaction.quotaMetric, managementEnabled: model.managementEnabled) }
     var width: CGFloat { canvasWidth > 0 ? canvasWidth : Self.canvasSize(itemCount: items.count, vertical: vertical).width }
     var canvas: CGSize { CGSize(width: width, height: height) }
     var style: WidgetStyle { model.widgetStyle }
@@ -953,7 +1004,7 @@ struct UsageStrip: View {
             .foregroundStyle(style.primary)
             .animation(reduceMotion ? nil : .smooth(duration: 0.22), value: interaction.expanded)
             .contextMenu {
-                Button("项目与 Notion 设置…") { model.openSettings() }
+                Button("项目与 Markdown 设置…") { model.openSettings() }
                 Menu("外观") {
                     ForEach(WidgetStyle.allCases) { theme in
                         Button { model.setWidgetStyle(theme) } label: {
@@ -1006,7 +1057,7 @@ struct UsageStrip: View {
                               stale: item.ringStale, decorative: item.id != "quota" && !item.isProject)
                 if item.isProject {
                     DashboardRing(fraction: item.secondaryRing, tint: style.progress, track: style.track, size: 41, line: 2,
-                                  stale: item.notionStale)
+                                  stale: item.managementStale)
                 }
                 avatar(item)
             }.frame(width: Self.interactionDiameter, height: Self.interactionDiameter)
@@ -1019,7 +1070,7 @@ struct UsageStrip: View {
             .help("\(item.title) · 悬停查看，点击保持")
             .contextMenu {
                 if item.isProject {
-                    if let url = item.notionURL { Button("打开 Notion 项目") { model.openProject(url) } }
+                    if let url = item.projectURL { Button("打开 Obsidian 项目") { model.openProject(url) } }
                     Button("项目设置…") { model.openSettings() }
                 }
             }
@@ -1087,9 +1138,9 @@ struct UsageStrip: View {
             if layout.showsFooter {
                 VStack(spacing: 12) {
                     Rectangle().fill(style.track).frame(height: 1)
-                    Button { if let url = item.notionURL { model.openProject(url) } else { model.openSettings() } } label: {
+                    Button { if let url = item.projectURL { model.openProject(url) } else { model.openSettings() } } label: {
                         HStack {
-                            Text(item.notionURL == nil ? "关联 Notion 项目" : "在 Notion 查看项目")
+                            Text(item.projectURL == nil ? "关联 Markdown 项目" : "在 Obsidian 查看项目")
                             Spacer()
                             Image(systemName: "arrow.up.right")
                         }.font(.system(size: StripDetailMetrics.bodySize))
@@ -1145,7 +1196,7 @@ struct UsageStrip: View {
         case .progress:
             VStack(alignment: .leading, spacing: StripDetailMetrics.fieldGap) {
                 HStack {
-                    Text("完成进度").font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
+                    Text(section.label).font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
                     Spacer()
                     Text(section.percent == nil ? "待评估" : section.value)
                         .font(.system(size: section.percent == nil ? StripDetailMetrics.bodySize : StripDetailMetrics.titleSize,
@@ -1156,15 +1207,20 @@ struct UsageStrip: View {
                     if let percent = section.percent {
                         Capsule().fill(style.progress).frame(width: width * CGFloat(percent / 100), height: 4)
                     }
-                }.accessibilityLabel("完成进度").accessibilityValue(section.value)
+                }.accessibilityLabel(section.label).accessibilityValue(section.value + (section.note.map { "，" + $0 } ?? ""))
+                if let note = section.note {
+                    detailText(note, size: StripDetailMetrics.labelSize, lineHeight: StripDetailMetrics.labelLine)
+                        .foregroundStyle(style.secondary)
+                        .frame(height: StripDetailSection.textHeight(note, width: width, size: StripDetailMetrics.labelSize, lineHeight: StripDetailMetrics.labelLine), alignment: .leading)
+                }
             }
         case .manual:
             VStack(alignment: .leading, spacing: StripDetailMetrics.fieldGap) {
-                Text("人工待办").font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
+                Text(section.label).font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)
                     .frame(height: StripDetailMetrics.labelLine, alignment: .leading)
                 let values = section.value.components(separatedBy: "|")
                 HStack(spacing: 8) {
-                    ForEach(Array(["待办", "受阻", "已完成"].enumerated()), id: \.offset) { index, label in
+                    ForEach(Array(["未完成", "受阻", "已完成"].enumerated()), id: \.offset) { index, label in
                         if index > 0 { Spacer(minLength: 0) }
                         HStack(alignment: .firstTextBaseline, spacing: 4) {
                             Text(label).font(.system(size: StripDetailMetrics.labelSize)).foregroundStyle(style.secondary)

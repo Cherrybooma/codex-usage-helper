@@ -1,9 +1,9 @@
-"""Local token aggregation, read-only official quota, opt-in Notion summaries.
+"""Local token aggregation, read-only official quota, local Markdown summaries.
 
 Never opens auth.json or reads credential environment variables. Authentication
 belongs to the already-installed official Codex app-server. The sole upstream
 method used here is account/rateLimits/read; no tasks or quota resets are sent.
-Notion sync runs in a separate invocation and sends allowlisted daily summaries.
+Markdown publishing runs in a separate invocation and writes local summaries.
 """
 from __future__ import annotations
 
@@ -30,45 +30,10 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from codex_usage import scan_usage
-from project_store import ProjectRegistry, aggregate, split_small, remember_daily, management_projects
+from project_store import ProjectRegistry, aggregate, remember_daily, management_projects
 
 DATA = Path(__file__).resolve().parent / "data"
 UTC = timezone.utc
-
-
-def group_tasks(projects: list[dict], task_root: Path) -> tuple[list[dict], list[dict]]:
-    buckets: dict[str, dict] = {}
-    task_root = task_root.expanduser().resolve()
-    for project in projects:
-        path = project["project"]
-        if path == "unknown":
-            name = "未知目录"
-        else:
-            try:
-                relative = Path(path).resolve().relative_to(task_root)
-                name = relative.parts[0] if relative.parts else "文稿根目录"
-            except ValueError:
-                name = "临时及其他目录"
-        row = buckets.setdefault(name, {"name": name, "total_tokens": 0,
-                                       "request_records": 0, "thread_ids": set()})
-        row["total_tokens"] += project["total_tokens"]
-        row["request_records"] += project["request_records"]
-        row["thread_ids"].update(project.get("thread_ids", []))
-    total = sum(row["total_tokens"] for row in buckets.values())
-    rows = sorted(buckets.values(), key=lambda row: (-row["total_tokens"], row["name"]))
-    for row in rows:
-        row["percent"] = row["total_tokens"] * 100 / total if total else 0
-        row["sessions_count"] = len(row.pop("thread_ids"))
-    # Use unrounded shares. A task at exactly 5% remains visible.
-    small = [row for row in rows if row["total_tokens"] * 100 < total * 5]
-    major = [row for row in rows if row["total_tokens"] * 100 >= total * 5]
-    if small:
-        other_tokens = sum(row["total_tokens"] for row in small)
-        major.append({"name": "其他", "total_tokens": other_tokens,
-                      "percent": other_tokens * 100 / total if total else 0,
-                      "request_records": sum(row["request_records"] for row in small),
-                      "members_count": len(small), "is_other": True})
-    return major, small
 
 
 def normalize_limits(raw: dict, observed_at: datetime, source: str) -> dict:
@@ -510,25 +475,32 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
     registry = ProjectRegistry(data, home)
     metadata = {}
     workspace = None
-    notion_status = {"connected": False, "state": "disconnected", "message": "尚未连接 Notion"}
+    management_status = {"connected": False, "state": "disconnected", "message": "尚未连接管理库"}
     try:
-        from notion_sync import NotionWorkspace, NotionError
-        workspace = NotionWorkspace(data)
-        # Cached project metadata only. Cloud I/O belongs to --sync-notion.
+        from markdown_store import MarkdownWorkspace, MarkdownError
+        settings_path = data / "app-settings.json"
+        settings = json.loads(settings_path.read_text()) if settings_path.is_file() else {}
+        configured = (data.resolve() == DATA.resolve() or (data / "markdown-config.json").is_file()
+                      or isinstance(settings, dict) and bool(settings.get("vault_path")))
+        if configured and isinstance(settings, dict) and settings.get("management_enabled", True) is True:
+            workspace = MarkdownWorkspace(data)
+        elif isinstance(settings, dict) and settings.get("management_enabled", True) is not True:
+            management_status = {"connected": False, "state": "disabled", "message": "项目管理已关闭"}
+        # An isolated/unconfigured data directory never reads the user's default Vault.
         for entry in registry.data["projects"].values():
-            item = workspace.project_for_task(entry["task_id"])
+            item = workspace.project_for_task(entry["task_id"]) if workspace else None
             if item:
                 metadata[entry["task_id"]] = item
-        notion_status = workspace.status()
+        management_status = workspace.status() if workspace else management_status
     except ImportError:
         pass
-    except (OSError, ValueError, RuntimeError, NotionError):
+    except (OSError, ValueError, RuntimeError, MarkdownError):
         workspace = None
-        notion_status = {"connected": False, "state": "error", "message": "Notion 配置暂不可读，本地统计正常"}
+        management_status = {"connected": False, "state": "error", "message": "管理资料暂不可读，本地统计正常"}
     grouping = registry.data.setdefault("grouping_roots", {})
     normalized_root = str(task_root.expanduser().resolve())
     previous_root = grouping.get(registry.dataset_id)
-    if previous_root and previous_root != normalized_root and (workspace is None or notion_status.get("binding_count", 0)):
+    if previous_root and previous_root != normalized_root and (workspace is None or management_status.get("binding_count", 0)):
         raise ValueError("已绑定账本的项目根目录不能直接改变；请先解除绑定或使用独立 data-dir。")
     grouping[registry.dataset_id] = normalized_root
     all_tasks, daily_rows, local_projects = aggregate(report, task_root, registry, metadata)
@@ -541,31 +513,30 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
         try:
             for entry in local_projects:
                 if entry["task_id"] not in metadata:
-                    item = workspace.project_for_task(entry["task_id"])
+                    item = workspace.project_for_task(entry["task_id"]) if workspace else None
                     if item:
                         metadata[entry["task_id"]] = item
-        except (OSError, ValueError, RuntimeError, NotionError):
-            notion_status = {"connected": False, "state": "error", "message": "Notion 配置暂不可读，本地统计正常"}
+        except (OSError, ValueError, RuntimeError, MarkdownError):
+            management_status = {"connected": False, "state": "error", "message": "Markdown 配置暂不可读，本地统计正常"}
         if metadata:
             all_tasks, daily_rows, local_projects = aggregate(report, task_root, registry, metadata)
     # Capsule tasks retain folder identity even when several folders share one
-    # Notion page. Daily Notion accounting still uses its existing project rollup.
-    folder_metadata = {task_id: {key: value for key, value in item.items() if key != "page_id"}
+    # management project. Daily accounting uses its stable project rollup.
+    folder_metadata = {task_id: {key: value for key, value in item.items() if key not in ("id", "project_id")}
                        for task_id, item in metadata.items()}
     folder_tasks, _, _ = aggregate(report, task_root, registry, folder_metadata)
     folder_tasks = [row for row in folder_tasks if row["total_tokens"] > 0]
-    major, small = split_small(all_tasks, report["totals"]["total_tokens"])
     managed = None
-    if workspace is not None and notion_status.get("connected"):
+    if workspace is not None and management_status.get("connected"):
         try:
             cached_projects = workspace.cached_projects()
             if cached_projects:
-                managed = management_projects(cached_projects, all_tasks, notion_status.get("bindings", {}), today_known=today_known)
-        except (OSError, ValueError, RuntimeError, NotionError):
+                managed = management_projects(cached_projects, all_tasks, management_status.get("bindings", {}), today_known=today_known)
+        except (OSError, ValueError, RuntimeError, MarkdownError):
             # Presentation failure cannot alter the token ledger or its denominator.
             managed = None
     saved_daily = remember_daily(data / "daily-ledger.sqlite3", daily_rows, registry.dataset_id)
-    atomic_json(data / "notion-daily.json", {"dataset_id": registry.dataset_id,
+    atomic_json(data / "markdown-daily.json", {"dataset_id": registry.dataset_id,
         "statistics_until": report["range"]["until_exclusive"], "rows": saved_daily})
     quota_file = data / "official-latest.json"
     quota = None
@@ -595,7 +566,7 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
         quota = {**quota, "age_seconds": round(age), "stale": age > 180 or
                  any(window["resets_at"] <= end.timestamp() for window in quota["windows"])}
     investment = estimated_investment(budget)
-    for rows in (all_tasks, major, small, folder_tasks, managed or []):
+    for rows in (all_tasks, folder_tasks, managed or []):
         attach_project_investment(rows, investment, report["totals"]["total_tokens"])
     try:
         accounting = accounting_snapshot(home, task_root, data, end)
@@ -606,12 +577,13 @@ def build_snapshot(home: Path, task_root: Path, data: Path, refresh_official: bo
             "request_records": report["totals"]["request_records"],
             "legacy_updates": report["totals"]["legacy_updates"],
             "today_tokens": today_tokens,
-            "tasks": major, "other_tasks": small,
+            "tasks": all_tasks,
             "all_usage_tasks": folder_tasks, "task_count": len(folder_tasks),
             **investment,
             "management_projects": managed,
             "dataset_id": registry.dataset_id, "available_projects": local_projects,
-            "notion": notion_status,
+            "management": management_status,
+            "management_provider": "markdown",
             "coverage": {name: report["coverage"][name] for name in
                          ("files_found", "files_scanned", "files_skipped", "malformed_lines")},
             "warnings_count": len(report["warnings"]),
@@ -628,21 +600,21 @@ def main():
     parser.add_argument("--offline", action="store_true", help="Use only saved official snapshot")
     parser.add_argument("--output", type=Path)
     action = parser.add_mutually_exclusive_group()
-    action.add_argument("--sync-notion", action="store_true", help="Sync project and independent period summaries")
+    action.add_argument("--sync-markdown", action="store_true", help="Publish local project and accounting summaries to Markdown")
     action.add_argument("--accounting-summary", action="store_true", help="Recompute natural-week and confirmed billing-month summaries locally")
-    parser.add_argument("--force-sync", action="store_true", help="Bypass the Notion sync interval")
-    parser.add_argument("--quota-window-audit", action="store_true", help="Explicitly sync optional quota-window audit rows; ordinary Notion sync keeps these locally")
+    parser.add_argument("--force-sync", action="store_true", help="Bypass the local summary publication interval")
+    parser.add_argument("--quota-window-audit", action="store_true", help="Explicitly sync optional quota-window audit rows; ordinary summary publishing keeps these locally")
     args = parser.parse_args()
     try:
         settings_file = args.data_dir / "app-settings.json"
         try:
             settings = json.loads(settings_file.read_text(encoding="utf-8")) if settings_file.is_file() else {}
         except (ValueError, OSError):
-            if not args.sync_notion:
+            if not (args.sync_markdown):
                 raise
             settings = {}
         if not isinstance(settings, dict):
-            if not args.sync_notion:
+            if not (args.sync_markdown):
                 raise ValueError("Invalid settings")
             settings = {}
         args.task_root = args.task_root or Path(settings.get("task_root") or Path.home() / "Documents")
@@ -654,54 +626,30 @@ def main():
             else:
                 print(json.dumps(result, ensure_ascii=False))
             return 0
-        if args.sync_notion:
-            # Opt-in is persisted independently of any cached connection or
-            # database configuration. Even a manual retry cannot bypass local
-            # mode and provoke a Keychain prompt or a remote request.
-            settings_file = args.data_dir / "app-settings.json"
-            try:
-                settings = json.loads(settings_file.read_text(encoding="utf-8")) if settings_file.is_file() else {}
-            except (ValueError, OSError):
-                settings = {}
-            if not isinstance(settings, dict) or settings.get("notion_sync_enabled") is not True:
-                print(json.dumps({"ok": False, "error": {"code": "local_mode",
-                    "message": "当前为本机模式，Notion 同步未开启；本地统计继续可用。"}}, ensure_ascii=False))
+        if args.sync_markdown:
+            from markdown_store import MarkdownWorkspace, MarkdownError
+            if settings.get("management_enabled", True) is not True:
+                print(json.dumps({"ok": False, "error": {"code": "local_mode", "message": "Markdown 项目管理已关闭，本机计量继续可用。"}}, ensure_ascii=False))
                 return 1
-            from notion_sync import NotionWorkspace, NotionError
             try:
-                workspace = NotionWorkspace(args.data_dir)
-                if not workspace.status().get("ready"):
-                    print(json.dumps({"ok": False, "error": {"message": "尚未配置 Notion；本地统计继续可用。"}}, ensure_ascii=False))
-                    return 1
-                workspace.projects(force=args.force_sync)
-                source = args.data_dir / "notion-daily.json"
-                saved = json.loads(source.read_text(encoding="utf-8")) if source.is_file() else {}
-                rows = saved.get("rows", [])
-                result = workspace.sync(rows, now=datetime.now(UTC), force=args.force_sync,
-                                        complete_dataset_ids=[saved["dataset_id"]] if saved.get("dataset_id") else [],
-                                        complete_until=saved.get("statistics_until"))
-            except NotionError as error:
-                print(json.dumps({"ok": False, "error": error.public()}, ensure_ascii=False))
+                workspace = MarkdownWorkspace(args.data_dir)
+                if not workspace.status().get("connected"):
+                    raise MarkdownError("not_connected", workspace.status().get("message"))
+                source = args.data_dir / "markdown-daily.json"
+                saved = json.loads(source.read_text()) if source.is_file() else {}
+                accounting = accounting_snapshot(args.codex_home, args.task_root, args.data_dir)
+                from publication_identity import publication_payloads
+                saved, accounting = publication_payloads(workspace.config, saved, accounting)
+                result = workspace.sync(saved.get("rows", []), now=datetime.now(UTC), force=args.force_sync,
+                    complete_dataset_ids=[saved["dataset_id"]] if saved.get("dataset_id") else [],
+                    complete_until=saved.get("statistics_until"))
+                period_result = workspace.sync_periods(accounting, sync_windows=args.quota_window_audit)
+                print(json.dumps({"ok": True, "result": result, "period_result": period_result}, ensure_ascii=False))
+                return 0
+            except (MarkdownError, ValueError, OSError, sqlite3.Error) as exc:
+                error = exc.public() if isinstance(exc, MarkdownError) else {"code": "publish_failed", "message": "Markdown 摘要发布失败，本机账本已保留。"}
+                print(json.dumps({"ok": False, "error": error}, ensure_ascii=False))
                 return 1
-            period_result = None
-            try:
-                from period_notion import PeriodNotionWorkspace, report_rows
-                periods = PeriodNotionWorkspace(args.data_dir)
-                if periods.status().get("ready"):
-                    accounting = accounting_snapshot(args.codex_home, args.task_root, args.data_dir)
-                    ledger_rows, window_rows = report_rows(accounting, accounting["dataset_id"])
-                    period_result = periods.sync(ledger_rows, window_rows,
-                        now=datetime.now(UTC), force=args.force_sync,
-                        sync_windows=args.quota_window_audit,
-                        billing_configured=accounting["monthly"]["status"] == "configured",
-                        active_monthly_schedule=accounting["monthly"].get("schedule_id"))
-            except (NotionError, ValueError, OSError, sqlite3.Error) as exc:
-                period_result = {"error": exc.public() if isinstance(exc, NotionError) else
-                                 {"message": "周期摘要同步失败，项目摘要已独立处理。"}}
-            okay = not result.get("error") and not result.get("projects_error") and not (period_result or {}).get("error")
-            error = result.get("error") or result.get("projects_error") or (period_result or {}).get("error")
-            print(json.dumps({"ok": okay, "result": result, "period_result": period_result, "error": error}, ensure_ascii=False))
-            return 0 if okay else 1
         result = build_snapshot(args.codex_home, args.task_root, args.data_dir, not args.offline)
         atomic_json(args.data_dir / "latest.json", result)
         if args.output:

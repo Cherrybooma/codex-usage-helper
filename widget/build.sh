@@ -25,7 +25,7 @@ case "$ARCHITECTURE" in
     *) printf 'Unsupported build architecture: %s\n' "$ARCHITECTURE" >&2; exit 1 ;;
 esac
 mkdir -p "$APP_DIR/Contents/MacOS" "$PROJECT_DIR/widget/build/module-cache"
-xcrun swiftc -parse-as-library -swift-version 5 -target "$ARCHITECTURE-apple-macosx15.0" "$WIDGET_DIR/UsageWidget.swift" "$WIDGET_DIR/UsageStrip.swift" "$WIDGET_DIR/NotionSettings.swift" -o "$APP_DIR/Contents/MacOS/UsageWidget" -framework AppKit -framework SwiftUI -framework Security -module-cache-path "$WIDGET_DIR/build/module-cache"
+xcrun swiftc -parse-as-library -swift-version 5 -target "$ARCHITECTURE-apple-macosx15.0" "$WIDGET_DIR/UsageWidget.swift" "$WIDGET_DIR/UsageStrip.swift" "$WIDGET_DIR/ProjectSettings.swift" -o "$APP_DIR/Contents/MacOS/UsageWidget" -framework AppKit -framework SwiftUI -module-cache-path "$WIDGET_DIR/build/module-cache"
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

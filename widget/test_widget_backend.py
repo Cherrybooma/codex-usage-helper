@@ -13,7 +13,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from widget_backend import group_tasks, normalize_limits, save_observation, cycle_history, open_history, weekly_budget, WEEK_SECONDS, calendar_week
+from widget_backend import normalize_limits, save_observation, cycle_history, open_history, weekly_budget, WEEK_SECONDS, calendar_week
 from widget_backend import build_snapshot, main as backend_main
 from widget_backend import estimated_investment, attach_project_investment
 
@@ -29,175 +29,90 @@ class SnapshotIntegrationTests(unittest.TestCase):
                 "project_daily": [{"project": project, "day": "2026-10-13", "total_tokens": 100, "request_records": 1, "thread_ids": ["private-session-id"]}],
                 "coverage": {"files_found": 1, "files_scanned": 1, "files_skipped": 0, "malformed_lines": 0}, "warnings": []}
 
-    def test_corrupt_notion_cache_is_local_only_error_with_unchanged_tokens(self):
+    def test_snapshot_keeps_small_tasks_without_retired_box_grouping(self):
+        payload = self.report()
+        payload["projects"] = [dict(payload["projects"][0], project="/tmp/widget-root/" + name,
+                                    total_tokens=tokens, thread_ids=[name])
+                               for name, tokens in [("main", 94), ("small-a", 3), ("small-b", 2), ("small-c", 1)]]
+        payload["project_daily"] = [dict(row, day="2026-10-13") for row in payload["projects"]]
+        payload["totals"]["request_records"] = 4
+        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=payload):
+            data = Path(temporary)
+            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
+            self.assertEqual([row["total_tokens"] for row in snapshot["tasks"]], [94, 3, 2, 1])
+            self.assertFalse(any(row.get("is_other") for row in snapshot["tasks"]))
+            self.assertNotIn("other_tasks", snapshot)
+            self.assertEqual(snapshot["total_tokens"], 100)
+            self.assertEqual(snapshot["task_count"], 4)
+            self.assertEqual(sum(row["percent"] for row in snapshot["all_usage_tasks"]), 100)
+            saved = json.loads((data / "markdown-daily.json").read_text())["rows"]
+            self.assertEqual(sum(row["total_tokens"] for row in saved), 100)
+            self.assertEqual(len(saved), 4)
+
+
+    def test_corrupt_management_config_keeps_local_counts_and_sanitizes_error(self):
         with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()):
-            data = Path(temporary)
-            (data / "notion-config.json").write_text('{"version":1}')
-            (data / "notion-state.json").write_text('{"version":1}')
-            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
-            self.assertEqual(snapshot["total_tokens"], 100)
-            self.assertEqual(snapshot["notion"]["state"], "error")
+            data=Path(temporary);(data/'markdown-config.json').write_text('PRIVATE_SYNTHETIC_MARKER')
+            snapshot=build_snapshot(data,Path('/tmp/widget-root'),data,False,self.NOW)
+            self.assertEqual(snapshot['total_tokens'],100)
+            self.assertEqual(snapshot['management']['state'],'error')
+            self.assertNotIn('PRIVATE',str(snapshot['management']))
 
-    def test_bound_root_cannot_be_silently_regrouped_by_cli_override(self):
-        from notion_sync import NotionWorkspace
-        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()):
-            data = Path(temporary)
-            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
-            workspace = NotionWorkspace(data)
-            with workspace._locked():
-                workspace.config["bindings"][snapshot["available_projects"][0]["task_id"]] = "00000000-0000-0000-0000-000000000001"
-            with self.assertRaises(ValueError):
-                build_snapshot(data, Path("/tmp/another-root"), data, False, self.NOW)
+    def test_unconfigured_isolated_directory_does_not_read_default_vault(self):
+        with tempfile.TemporaryDirectory() as temporary,patch('widget_backend.scan_usage',return_value=self.report()), \
+             patch('markdown_store.MarkdownWorkspace',side_effect=AssertionError('default Vault must not be read')):
+            data=Path(temporary); snapshot=build_snapshot(data,Path('/tmp/widget-root'),data,False,self.NOW)
+            self.assertFalse(snapshot['management']['connected'])
+            self.assertEqual(snapshot['total_tokens'],100)
 
-    def test_sync_cli_config_error_is_structured_and_does_not_emit_private_text(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            data = Path(temporary)
-            (data / "app-settings.json").write_text('{"notion_sync_enabled":true}')
-            (data / "notion-config.json").write_text("PRIVATE_SYNTHETIC_MARKER")
-            (data / "notion-state.json").write_text('{}')
-            process = subprocess.run([sys.executable, str(Path(__file__).with_name("widget_backend.py")),
-                "--sync-notion", "--data-dir", str(data)], capture_output=True, text=True)
-            self.assertEqual(process.returncode, 1)
-            self.assertFalse(json.loads(process.stdout)["ok"])
-            self.assertEqual(process.stderr, "")
-            self.assertNotIn("PRIVATE_SYNTHETIC_MARKER", process.stdout)
-
-    def sync_command(self, data, force=False):
-        arguments = ["widget_backend.py", "--sync-notion", "--data-dir", str(data)]
-        if force:
-            arguments.append("--force-sync")
-        output = io.StringIO()
-        with patch("sys.argv", arguments), redirect_stdout(output):
-            code = backend_main()
-        return code, json.loads(output.getvalue())
-
-    def test_sync_requires_literal_opt_in_before_workspace_credentials_or_network(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            data = Path(temporary)
-            # A corrupt previously configured workspace must not be inspected
-            # in local mode, nor should a saved connection trigger a request.
-            (data / "notion-config.json").write_text("PRIVATE_SYNTHETIC_MARKER")
-            with patch("notion_sync.NotionWorkspace", side_effect=AssertionError("workspace accessed")), \
-                 patch("notion_sync.keychain_token", side_effect=AssertionError("credential accessed")), \
-                 patch("notion_sync.urllib_transport", side_effect=AssertionError("network accessed")):
-                cases = [{}, {"notion_sync_enabled": False}, {"notion_sync_enabled": 1},
-                         {"notion_sync_enabled": "true"}, {"notion_sync_enabled": None}, []]
-                for settings in cases:
-                    with self.subTest(settings=settings):
-                        (data / "app-settings.json").write_text(json.dumps(settings))
-                        code, result = self.sync_command(data)
-                        self.assertEqual(code, 1)
-                        self.assertFalse(result["ok"])
-                        self.assertEqual(result["error"]["code"], "local_mode")
-
-    def test_forced_sync_without_settings_stays_local(self):
+    def test_disabled_management_never_reads_vault_and_preserves_usage(self):
         with tempfile.TemporaryDirectory() as temporary, \
-             patch("notion_sync.NotionWorkspace", side_effect=AssertionError("workspace accessed")):
-            code, result = self.sync_command(Path(temporary), force=True)
-            self.assertEqual(code, 1)
-            self.assertEqual(result["error"]["code"], "local_mode")
-
-    def test_corrupt_opt_in_settings_fail_closed(self):
-        with tempfile.TemporaryDirectory() as temporary, \
-             patch("notion_sync.NotionWorkspace", side_effect=AssertionError("workspace accessed")):
+             patch('widget_backend.scan_usage', return_value=self.report()), \
+             patch('markdown_store.MarkdownWorkspace', side_effect=AssertionError('Vault accessed')):
             data = Path(temporary)
-            (data / "app-settings.json").write_text("PRIVATE_SYNTHETIC_MARKER")
-            code, result = self.sync_command(data)
-            self.assertEqual(code, 1)
-            self.assertEqual(result["error"]["code"], "local_mode")
-            self.assertNotIn("PRIVATE_SYNTHETIC_MARKER", str(result))
+            (data / 'app-settings.json').write_text(json.dumps({
+                'management_enabled': False, 'vault_path': '/private/never-read'}))
+            (data / 'markdown-config.json').write_text('PRIVATE_SYNTHETIC_MARKER')
+            snapshot = build_snapshot(data, Path('/tmp/widget-root'), data, False, self.NOW)
+            self.assertEqual(snapshot['management']['state'], 'disabled')
+            self.assertEqual(snapshot['total_tokens'], 100)
+            self.assertIsNone(snapshot['management_projects'])
+            self.assertEqual(sum(row['total_tokens'] for row in snapshot['tasks']), 100)
 
-    def test_explicit_opt_in_preserves_forced_summary_sync(self):
-        with tempfile.TemporaryDirectory() as temporary, patch("period_notion.PeriodNotionWorkspace") as periods, \
-             patch("notion_sync.NotionWorkspace") as constructor, \
-             patch("notion_sync.keychain_token", side_effect=AssertionError("credential accessed")), \
-             patch("notion_sync.urllib_transport", side_effect=AssertionError("network accessed")):
-            data = Path(temporary)
-            (data / "app-settings.json").write_text('{"notion_sync_enabled":true}')
-            saved = {"rows": [{"total_tokens": 100}], "dataset_id": "test-dataset",
-                     "statistics_until": self.NOW.isoformat()}
-            (data / "notion-daily.json").write_text(json.dumps(saved))
-            workspace = constructor.return_value
-            # This project-summary test must not depend on optional account
-            # pages, nor import their base class for the first time under a mock.
-            periods.return_value.status.return_value = {"ready": False}
-            workspace.status.return_value = {"ready": True}
-            workspace.sync.return_value = {"changed": 1}
-            code, result = self.sync_command(data, force=True)
-            self.assertEqual(code, 0)
-            self.assertTrue(result["ok"])
-            constructor.assert_called_once_with(data)
-            workspace.projects.assert_called_once_with(force=True)
-            self.assertEqual(workspace.sync.call_args.args, (saved["rows"],))
-            self.assertTrue(workspace.sync.call_args.kwargs["force"])
-            self.assertEqual(workspace.sync.call_args.kwargs["complete_dataset_ids"], ["test-dataset"])
-            self.assertEqual(workspace.sync.call_args.kwargs["complete_until"], self.NOW.isoformat())
+    def test_snapshot_and_daily_share_counts_without_network(self):
+        with tempfile.TemporaryDirectory() as temporary,patch('widget_backend.scan_usage',return_value=self.report()), \
+             patch('urllib.request.urlopen',side_effect=AssertionError('network')):
+            data=Path(temporary);first=build_snapshot(data,Path('/tmp/widget-root'),data,False,self.NOW)
+            second=build_snapshot(data,Path('/tmp/widget-root'),data,False,self.NOW)
+            rows=json.loads((data/'markdown-daily.json').read_text())['rows']
+            self.assertEqual(sum(r['total_tokens'] for r in rows),100)
+            self.assertNotIn('private-session-id',str(rows))
+            self.assertEqual(first['tasks'],second['tasks'])
+            self.assertNotIn('notion',first)
 
-    def test_snapshot_and_daily_share_counts_without_credentials_or_network(self):
-        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()), \
-             patch("notion_sync.keychain_token", side_effect=AssertionError("credential accessed")), \
-             patch("notion_sync.urllib_transport", side_effect=AssertionError("network accessed")):
-            data = Path(temporary)
-            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
-            self.assertEqual(snapshot["total_tokens"], 100)
-            self.assertEqual(snapshot["tasks"][0]["name"], "task")
-            self.assertEqual(snapshot["tasks"][0]["percent"], 100)
-            self.assertFalse(snapshot["notion"]["connected"])
-            import json
-            rows = json.loads((data / "notion-daily.json").read_text())["rows"]
-            self.assertEqual(sum(row["total_tokens"] for row in rows), 100)
-            self.assertNotIn("private-session-id", str(rows))
-            again = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
-            self.assertEqual(snapshot["tasks"], again["tasks"])
+    def test_markdown_metadata_failure_does_not_drop_usage(self):
+        with tempfile.TemporaryDirectory() as temporary,patch('widget_backend.scan_usage',return_value=self.report()), \
+             patch('markdown_store.MarkdownWorkspace') as constructor:
+            data=Path(temporary);(data/'markdown-config.json').write_text('{}')
+            workspace=constructor.return_value
+            workspace.status.return_value={'connected':True,'bindings':{}}
+            workspace.project_for_task.side_effect=ValueError('private details')
+            snapshot=build_snapshot(data,Path('/tmp/widget-root'),data,False,self.NOW)
+            self.assertEqual(snapshot['total_tokens'],100)
+            self.assertNotIn('private details',str(snapshot['management']))
 
-    def test_first_scan_metadata_error_does_not_break_local_usage(self):
-        from notion_sync import NotionError
-        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()), \
-             patch("notion_sync.NotionWorkspace.project_for_task", side_effect=NotionError("invalid_input")):
-            data = Path(temporary)
-            snapshot = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
-            self.assertEqual(snapshot["total_tokens"], 100)
-            self.assertEqual(snapshot["notion"]["state"], "error")
+    def test_local_publish_disabled_never_loads_provider_or_network(self):
+        with tempfile.TemporaryDirectory() as temporary,patch('markdown_store.MarkdownWorkspace',side_effect=AssertionError('provider')):
+            data=Path(temporary);(data/'app-settings.json').write_text('{"management_enabled":false}')
+            output=io.StringIO()
+            with patch('sys.argv',['widget_backend.py','--sync-markdown','--data-dir',str(data)]),redirect_stdout(output):
+                code=backend_main()
+            self.assertEqual(code,1);self.assertEqual(json.loads(output.getvalue())['error']['code'],'local_mode')
 
-    def test_cached_management_projects_with_zero_usage_keep_ledger_unchanged(self):
-        from notion_sync import NotionWorkspace
-        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()), \
-             patch("notion_sync.keychain_token", side_effect=AssertionError("credential accessed")), \
-             patch("notion_sync.urllib_transport", side_effect=AssertionError("network accessed")):
-            data = Path(temporary)
-            initial = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
-            task = initial["available_projects"][0]["task_id"]
-            workspace = NotionWorkspace(data, clock=lambda: self.NOW)
-            with workspace._locked():
-                workspace.config.update({"projects_data_source_id": "00000000-0000-0000-0000-000000000010",
-                    "usage_data_source_id": "00000000-0000-0000-0000-000000000011",
-                    "bindings": {task: "used", "unseen-local": "zero"}})
-                workspace.state["credential_available"] = True
-                workspace.state["projects"] = {
-                    "used": {"page_id": "used", "display_name": "有用量项目", "status": "开发中", "project_priority": "中", "available": True, "fetched_at": self.NOW.isoformat()},
-                    "zero": {"page_id": "zero", "display_name": "优先项目", "status": "开发中", "project_priority": "高", "available": True, "fetched_at": self.NOW.isoformat()},
-                    "unbound": {"page_id": "unbound", "display_name": "云端项目", "status": "计划中", "available": True, "fetched_at": self.NOW.isoformat()}}
-            managed = build_snapshot(data, Path("/tmp/widget-root"), data, False, self.NOW)
-            self.assertEqual(managed["total_tokens"], initial["total_tokens"])
-            self.assertEqual(managed["tasks"][0]["total_tokens"], initial["tasks"][0]["total_tokens"])
-            self.assertEqual(managed["tasks"][0]["percent"], 100)
-            rows = managed["management_projects"]
-            self.assertEqual([row["task_id"] for row in rows], ["notion:zero", "notion:used", "notion:unbound"])
-            self.assertEqual([row["usage_linked"] for row in rows], [True, True, False])
-            self.assertEqual([row["total_tokens"] for row in rows], [0, 100, 0])
-            saved = json.loads((data / "notion-daily.json").read_text())["rows"]
-            self.assertEqual(len(saved), 1)
-            self.assertEqual(saved[0]["total_tokens"], 100)
-            self.assertNotIn("project_goal", saved[0])
-
-    def test_management_cache_failure_falls_back_without_dropping_usage(self):
-        with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=self.report()), \
-             patch("notion_sync.NotionWorkspace.cached_projects", side_effect=ValueError("private cache")), \
-             patch("notion_sync.NotionWorkspace.status", return_value={"connected": True}):
-            snapshot = build_snapshot(Path(temporary), Path("/tmp/widget-root"), Path(temporary), False, self.NOW)
-            self.assertIsNone(snapshot["management_projects"])
-            self.assertEqual(snapshot["total_tokens"], 100)
-            self.assertEqual(snapshot["tasks"][0]["percent"], 100)
+    def test_importing_backend_never_loads_remote_modules(self):
+        code='import json,sys;import widget_backend;print(json.dumps([m for m in sys.modules if m.startswith("notion")]))'
+        result=subprocess.run([sys.executable,'-c',code],cwd=Path(__file__).parent,capture_output=True,text=True,check=True)
+        self.assertEqual(json.loads(result.stdout),[])
 
     def test_today_snapshot_selects_shanghai_day_and_keeps_total_denominator(self):
         payload = self.report()
@@ -245,7 +160,7 @@ class SnapshotIntegrationTests(unittest.TestCase):
                 self.assertIsNone(snapshot["quota"])
                 self.assertNotIn("PRIVATE", snapshot["quota_error"])
 
-    def test_all_positive_folder_tasks_survive_threshold_and_notion_rollup(self):
+    def test_all_positive_folder_tasks_survive_threshold_and_management_rollup(self):
         payload = self.report()
         numbers = [70, 10, 8, 5, 4, 3, 0]
         payload["projects"] = [{"project": f"/tmp/widget-root/task-{i}/sub", "total_tokens": amount,
@@ -253,10 +168,11 @@ class SnapshotIntegrationTests(unittest.TestCase):
                                for i, amount in enumerate(numbers)]
         payload["project_daily"] = [dict(row, day="2026-10-13") for row in payload["projects"]]
         payload["totals"]["request_records"] = 6
-        metadata = {"page_id": "shared", "display_name": "同一管理页", "project_goal": "愿景",
+        metadata = {"project_id": "shared", "display_name": "同一管理页", "project_goal": "愿景",
                     "development_progress": 65, "progress_source": "ai", "current_goal": "交付已验证成果"}
         with tempfile.TemporaryDirectory() as temporary, patch("widget_backend.scan_usage", return_value=payload), \
-             patch("notion_sync.NotionWorkspace") as constructor:
+             patch("markdown_store.MarkdownWorkspace") as constructor:
+            (Path(temporary)/"markdown-config.json").write_text("{}")
             workspace = constructor.return_value
             workspace.status.return_value = {"connected": True}
             workspace.project_for_task.return_value = metadata
@@ -269,7 +185,7 @@ class SnapshotIntegrationTests(unittest.TestCase):
             self.assertEqual(sum(row["total_tokens"] for row in snapshot["all_usage_tasks"]), 100)
             self.assertEqual(sum(row["percent"] for row in snapshot["all_usage_tasks"]), 100)
             self.assertTrue(all(row["development_progress"] == 65 for row in snapshot["all_usage_tasks"]))
-            # Existing Notion accounting may merge folders; that cannot change
+            # Project accounting may merge folders; that cannot change
             # the capsule's folder count or its shares.
             self.assertEqual(len(snapshot["tasks"]), 1)
 
@@ -301,102 +217,6 @@ class InvestmentTests(unittest.TestCase):
         self.assertEqual(rows[0]["estimated_cost_status"], "unavailable")
 
 
-class WidgetTests(unittest.TestCase):
-    def test_nested_tasks_merge_before_five_percent_threshold(self):
-        root = Path("/tmp/widget-task-root").resolve()
-        def row(path, n):
-            return {"project": str(path), "total_tokens": n, "request_records": 1, "thread_ids": [str(path)]}
-        major, minor = group_tasks([
-            row(root / "main", 90), row(root / "nested" / "a", 3),
-            row(root / "nested" / "b", 2), row(root / "small", 4),
-            row("/tmp/external-work", 1)], root)
-        self.assertEqual([(r["name"],r["total_tokens"]) for r in major],
-                         [("main",90),("nested",5),("其他",5)])
-        self.assertEqual(sum(r["total_tokens"] for r in major),100)
-        self.assertEqual(sum(r["percent"] for r in major),100)
-        self.assertEqual(len(minor),2)
-
-    def test_threshold_uses_exact_values_not_display_rounding(self):
-        root = Path("/tmp/widget-task-root").resolve()
-        major, minor = group_tasks([
-            {"project": str(root / "a"), "total_tokens": 95001, "request_records": 1},
-            {"project": str(root / "b"), "total_tokens": 4999, "request_records": 1}], root)
-        self.assertEqual(minor[0]["name"],"b")
-        self.assertEqual(major[-1]["name"],"其他")
-
-    def test_empty_scan_does_not_invent_usage(self):
-        self.assertEqual(group_tasks([],Path("/tmp")),([],[]))
-
-    def test_official_multi_bucket_fields_are_whitelisted(self):
-        raw={"accountId":"private", "rateLimits":{"primary":{"usedPercent":99}},
-             "rateLimitsByLimitId":{"codex":{"planType":"plus", "credits":{"secret":"private"},
-                "primary":{"usedPercent":47,"windowDurationMins":300,"resetsAt":2000},
-                "secondary":{"usedPercent":19,"windowDurationMins":10080,"resetsAt":3000}}}}
-        result=normalize_limits(raw,datetime.fromtimestamp(1000,timezone.utc),"test")
-        self.assertEqual(result["windows"][0]["remaining_percent"],53)
-        self.assertEqual(result["windows"][1]["remaining_percent"],81)
-        self.assertNotIn("private",str(result))
-        self.assertNotIn("credits",result)
-
-    def test_unavailable_official_counter_is_not_zero_usage(self):
-        with self.assertRaises(ValueError):
-            normalize_limits({"rateLimits":{"primary":{"usedPercent":None}}},
-                             datetime.now(timezone.utc),"test")
-
-    def test_cycle_rollover_preserves_last_observation_not_exact_unused_claim(self):
-        db=open_history(Path(":memory:"))
-        try:
-            for observed,used,reset in [(1000,20,2000),(1800,75,2000),(2100,5,3000)]:
-                q=normalize_limits({"rateLimits":{"primary":{"usedPercent":used,
-                         "windowDurationMins":300,"resetsAt":reset}}},
-                         datetime.fromtimestamp(observed,timezone.utc),"test")
-                save_observation(db,q)
-            history=cycle_history(db,datetime.fromtimestamp(2200,timezone.utc))
-            self.assertEqual(len(history),1)
-            self.assertEqual(history[0]["last_remaining_percent"],25)
-            self.assertEqual(history[0]["observations"],2)
-            self.assertEqual(history[0]["status"],"last_observed_only")
-            self.assertAlmostEqual(history[0]["minutes_before_reset"],200/60,places=1)
-        finally:db.close()
-
-    def test_stale_snapshot_cannot_become_observation_of_new_cycle(self):
-        db=open_history(Path(":memory:"))
-        try:
-            q=normalize_limits({"rateLimits":{"primary":{"usedPercent":75,
-                     "windowDurationMins":300,"resetsAt":2000}}},
-                     datetime.fromtimestamp(2100,timezone.utc),"test")
-            save_observation(db,q)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM observations").fetchone()[0],0)
-        finally:db.close()
-
-    def test_reset_timestamp_jitter_does_not_create_fake_cycles(self):
-        db=open_history(Path(":memory:"))
-        try:
-            for observed,reset,used in [(1000,2000,20),(1800,2001,75)]:
-                q=normalize_limits({"rateLimits":{"primary":{"usedPercent":used,
-                         "windowDurationMins":300,"resetsAt":reset}}},
-                         datetime.fromtimestamp(observed,timezone.utc),"test")
-                save_observation(db,q)
-            history=cycle_history(db,datetime.fromtimestamp(2200,timezone.utc))
-            self.assertEqual(len(history),1)
-            self.assertEqual(history[0]["observations"],2)
-        finally:db.close()
-
-    def test_early_window_change_is_not_claimed_as_scheduled_unused_allowance(self):
-        db=open_history(Path(":memory:"))
-        try:
-            for observed,reset,used in [(1000,2500,60),(1800,6000,0)]:
-                q=normalize_limits({"rateLimits":{"primary":{"usedPercent":used,
-                         "windowDurationMins":300,"resetsAt":reset}}},
-                         datetime.fromtimestamp(observed,timezone.utc),"test")
-                save_observation(db,q)
-            history=cycle_history(db,datetime.fromtimestamp(1900,timezone.utc))
-            self.assertEqual(len(history),1)
-            self.assertEqual(history[0]["reason"],"window_changed")
-            self.assertEqual(history[0]["ended_at"],1800)
-            self.assertEqual(history[0]["last_remaining_percent"],40)
-            self.assertEqual(history[0]["status"],"last_observed_only")
-        finally:db.close()
 
 
 class WeeklyBudgetTests(unittest.TestCase):

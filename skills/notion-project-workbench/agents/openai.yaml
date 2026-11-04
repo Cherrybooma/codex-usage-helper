@@ -1,4 +1,0 @@
-interface:
-  display_name: "Notion 项目工作台"
-  short_description: "导入已有项目并绑定胶囊，维护愿景、人工事项、正式产出、进展和 Token 投入"
-  default_prompt: "用 $notion-project-workbench 从当前项目的实际资料整理项目工作台，核实产出和完成进度，导入 Notion 并绑定用量小助手；已有工作台则复用并维护开发历史。"

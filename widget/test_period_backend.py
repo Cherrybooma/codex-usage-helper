@@ -61,7 +61,8 @@ class PeriodBackendTests(unittest.TestCase):
     def test_malformed_cache_recovers_without_auth_or_cloud(self):
         (self.data / 'accounting.json').write_text('[]')
         with patch('period_accounting.build_period_report', side_effect=self.fake_report), \
-                patch('notion_credentials.configured_token', side_effect=AssertionError('no credentials')):
+                patch.dict(sys.modules, {'notion_credentials': None, 'notion_sync': None, 'period_notion': None}), \
+                patch('urllib.request.urlopen', side_effect=AssertionError('no cloud requests')):
             self.assertEqual(self.snapshot()['weekly']['current']['totals']['total_tokens'], 17)
 
     def test_naive_cutoff_rejected(self):

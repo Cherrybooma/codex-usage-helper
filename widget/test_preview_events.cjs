@@ -1,5 +1,5 @@
 // A small DOM/event simulation. Reads the actual preview listeners; no browser,
-// Notion account, session logs, network requests or third-party dependency.
+// account credentials, session logs, network requests or third-party dependency.
 const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');

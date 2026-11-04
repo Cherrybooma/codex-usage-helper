@@ -1,0 +1,4 @@
+interface:
+  display_name: "Obsidian 项目管理"
+  short_description: "复用中央 Markdown 库，整理已有项目、关联正式成果并绑定桌面胶囊"
+  default_prompt: "用 $obsidian-project-manager 整理当前项目，复用中央管理库的固定身份与规则，通过当前用量小助手工程维护目标、进展、成果和下一步，并核验桌面绑定。"

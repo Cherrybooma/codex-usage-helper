@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import Security
 import UniformTypeIdentifiers
 
 enum WidgetPreferences {
@@ -13,11 +12,14 @@ enum WidgetPreferences {
         return settings
     }
 
-    static func notionEnabled(in settings: [String: Any]) -> Bool {
-        // Reject strings and numeric values: syncing requires an explicit opt-in.
-        guard let value = settings["notion_sync_enabled"] as? NSNumber,
-              CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
+    static func managementEnabled(in settings: [String: Any]) -> Bool {
+        guard let raw = settings["management_enabled"] else { return true }
+        guard let value = raw as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
         return value.boolValue
+    }
+
+    static func defaultVault(root: URL) -> URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/项目管理obsidian", isDirectory: true)
     }
 
     static func update(root: URL, values: [String: Any]) throws {
@@ -76,7 +78,7 @@ enum WidgetApplicationMenu {
         let menu = NSMenu()
         let application = NSMenuItem()
         application.submenu = NSMenu(title: "用量小助手")
-        let settings = application.submenu!.addItem(withTitle: "项目与 Notion 设置…",
+        let settings = application.submenu!.addItem(withTitle: "项目与 Markdown 设置…",
             action: #selector(AppDelegate.openSettings), keyEquivalent: ",")
         settings.target = settingsTarget
         let accounting = application.submenu!.addItem(withTitle: "周期核算…",
@@ -99,30 +101,6 @@ enum WidgetApplicationMenu {
         }
         menu.addItem(edit)
         return menu
-    }
-}
-
-// Only this application's dedicated credential is written. Nothing is read
-// from Codex authentication files or another application's Keychain item.
-enum NotionCredential {
-    static let service = "local.codex.usage-widget.notion"
-    static func save(_ value: String) throws {
-        let token = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else { return }
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service, kSecAttrAccount as String: "integration"]
-        let data = Data(token.utf8)
-        var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecItemNotFound {
-            var item = query
-            item[kSecValueData as String] = data
-            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            status = SecItemAdd(item as CFDictionary, nil)
-        }
-        guard status == errSecSuccess else {
-            throw NSError(domain: "UsageWidget", code: Int(status),
-                userInfo: [NSLocalizedDescriptionKey: "凭据未保存到钥匙串，请检查系统授权。"])
-        }
     }
 }
 
@@ -156,15 +134,14 @@ func runWidgetProcess(python: URL, root: URL, arguments: [String], input: Data? 
     return data
 }
 
-struct NotionChoice: Identifiable {
+struct ProjectChoice: Identifiable {
     let id: String
     let name: String
     let iconMissing: Bool
 }
 
 enum ProjectImportSelection {
-    static func command(manifestURL: URL, folder: URL, taskRoot: URL,
-                        parentPage: String, existingHome: Bool) throws -> [String: Any] {
+    static func command(manifestURL: URL, folder: URL, taskRoot: URL) throws -> [String: Any] {
         let root = taskRoot.resolvingSymlinksInPath().standardizedFileURL
         let selected = folder.resolvingSymlinksInPath().standardizedFileURL
         var directory: ObjCBool = false
@@ -181,9 +158,6 @@ enum ProjectImportSelection {
                 userInfo: [NSLocalizedDescriptionKey: "请选择 Skill 生成的项目清单 JSON，文件不能超过 256 KB。"])
         }
         var command: [String: Any] = ["manifest": manifest, "folder": selected.path, "task_root": root.path]
-        if !parentPage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            command[existingHome ? "management_home" : "parent_page"] = parentPage
-        }
         command["codex_home"] = ProcessInfo.processInfo.environment["CODEX_HOME"]
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
         return command
@@ -193,15 +167,26 @@ enum ProjectImportSelection {
 @MainActor
 final class ProjectSettingsModel: ObservableObject {
     @Published var taskRoot: String
-    @Published var parentPage = ""
-    @Published var token = ""
-    @Published var tokenSourceFile = ""
+    @Published var vaultPath: String
+    @Published var createGoal = ""
     @Published var busy = false
     @Published var message = ""
-    @Published var choices: [NotionChoice] = []
-    @Published var selectedTask = ""
-    @Published var selectedPage = ""
-    @Published var statusText = "尚未连接 Notion"
+    @Published var choices: [ProjectChoice] = []
+    @Published var selectedTask = "" {
+        didSet {
+            if oldValue != selectedTask {
+                projectSelectionEdited = false
+                followSelectedBinding()
+            }
+        }
+    }
+    @Published var selectedProject = "" {
+        didSet { if !updatingProjectSelection && oldValue != selectedProject { projectSelectionEdited = true } }
+    }
+    private var bindings: [String: String]?
+    private var projectSelectionEdited = false
+    private var updatingProjectSelection = false
+    @Published var statusText = "正在读取 Markdown 管理库"
     @Published var projectsURL: String?
     @Published var usageURL: String?
     @Published var tasksURL: String?
@@ -217,7 +202,6 @@ final class ProjectSettingsModel: ObservableObject {
     @Published var createLogoURL = ""
     @Published var importManifestPath = ""
     @Published var importFolderPath = ""
-    @Published var importParentIsHome = true
     weak var usage: UsageModel?
     let root: URL
     let python: URL
@@ -226,20 +210,39 @@ final class ProjectSettingsModel: ObservableObject {
         self.usage = usage; root = usage.root; python = usage.python
         let settings = try? WidgetPreferences.read(root: root)
         taskRoot = settings?["task_root"] as? String ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents").path
-        tokenSourceFile = settings?["notion_token_source_file"] as? String ?? ""
+        vaultPath = settings?["vault_path"] as? String ?? WidgetPreferences.defaultVault(root: root).path
         if let anchor = BillingAnchorSettings.decode(settings?["billing_anchor"] as? String) {
             hasBillingAnchor = true
             billingAnchorDate = anchor
             billingAnchorPrecision = BillingAnchorPrecision(rawValue: settings?["billing_anchor_precision"] as? String ?? "") ?? .datetime
         }
-        let configFile = root.appendingPathComponent("widget/data/notion-config.json")
-        if let data = try? Data(contentsOf: configFile),
-           let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let parent = config["parent_page_id"] as? String { parentPage = "https://www.notion.so/" + parent.replacingOccurrences(of: "-", with: "") }
-            accountingURL = config["accounting_page_url"] as? String
-        }
+
     }
     var tasks: [LocalProject] { usage?.snapshot?.available_projects ?? [] }
+
+    func boundProject(for taskID: String) -> String? {
+        // A returned bindings map is authoritative, including explicit unbinding.
+        if let bindings { return bindings[taskID] }
+        return tasks.first(where: { $0.task_id == taskID })?.project_id
+    }
+
+    private func followSelectedBinding() {
+        let actual = boundProject(for: selectedTask) ?? ""
+        let validSelection = selectedProject.isEmpty || choices.contains { $0.id == selectedProject }
+        if projectSelectionEdited && validSelection && selectedProject != actual { return }
+        updatingProjectSelection = true
+        selectedProject = choices.contains { $0.id == actual } ? actual : ""
+        updatingProjectSelection = false
+        projectSelectionEdited = false
+    }
+
+    func refreshTaskSelection() {
+        if selectedTask.isEmpty || !tasks.contains(where: { $0.task_id == selectedTask }) {
+            selectedTask = tasks.first?.task_id ?? ""
+        }
+        followSelectedBinding()
+    }
+
     var newProjectIcon: [String: Any]? {
         if createIconMode == "emoji" {
             let value = createEmoji.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -257,7 +260,7 @@ final class ProjectSettingsModel: ObservableObject {
               components.port.map({ 1...65535 ~= $0 }) ?? true else { return nil }
         return ["type": "external", "external": ["url": value]]
     }
-    var selectedPageNeedsIcon: Bool { choices.first(where: { $0.id == selectedPage })?.iconMissing == true }
+    var selectedProjectNeedsIcon: Bool { choices.first(where: { $0.id == selectedProject })?.iconMissing == true }
     var accountingWeek: [String: Any]? { (accountingReport?["weekly"] as? [String: Any])?["current"] as? [String: Any] }
     var accountingMonth: [String: Any]? { (accountingReport?["monthly"] as? [String: Any])?["current"] as? [String: Any] }
     var monthlyNeedsAnchor: Bool { (accountingReport?["monthly"] as? [String: Any])?["status"] as? String == "needs_anchor" }
@@ -340,7 +343,7 @@ final class ProjectSettingsModel: ObservableObject {
         guard FileManager.default.fileExists(atPath: path, isDirectory: &directory), directory.boolValue else {
             message = "请选择已存在的项目根目录。"; return
         }
-        let configFile = root.appendingPathComponent("widget/data/notion-config.json")
+        let configFile = root.appendingPathComponent("widget/data/markdown-config.json")
         if let data = try? Data(contentsOf: configFile),
            let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let bindings = config["bindings"] as? [String: String], !bindings.isEmpty {
@@ -348,7 +351,7 @@ final class ProjectSettingsModel: ObservableObject {
             let settings = (try? Data(contentsOf: settingsFile)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             let prior = settings?["task_root"] as? String ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents").path
             if URL(fileURLWithPath: path).standardizedFileURL != URL(fileURLWithPath: prior).standardizedFileURL {
-                message = "已绑定 Notion 后更改根目录会改变历史归集。请先解除项目绑定，再选择新根目录并重新绑定；原用量记录保留审计。"
+                message = "已绑定项目后更改工程根目录会改变历史归集。请先解除绑定，再选择新根目录；历史用量保留。"
                 return
             }
         }
@@ -366,44 +369,70 @@ final class ProjectSettingsModel: ObservableObject {
         picker.allowsMultipleSelection = false
         if picker.runModal() == .OK, let url = picker.url { taskRoot = url.path; saveRoot() }
     }
-    func apply(_ status: [String: Any]) {
-        statusText = status["message"] as? String ?? "尚未连接 Notion"
-        projectsURL = status["projects_url"] as? String
-        usageURL = status["usage_url"] as? String
-        tasksURL = status["tasks_url"] as? String
+    func apply(_ status: [String: Any], resetProjectSelection: Bool = false) {
+        if resetProjectSelection { projectSelectionEdited = false }
+        if let currentBindings = status["bindings"] as? [String: String] { bindings = currentBindings }
+        statusText = status["message"] as? String ?? statusText
+        projectsURL = status["projects_url"] as? String ?? projectsURL
+        usageURL = status["usage_url"] as? String ?? usageURL
+        tasksURL = status["tasks_url"] as? String ?? tasksURL
         accountingURL = status["accounting_url"] as? String ?? accountingURL
-        choices = (status["projects"] as? [[String: Any]] ?? [])
-            .filter { $0["available"] as? Bool != false }
-            .compactMap { item in
-                guard let id = item["page_id"] as? String, let name = item["display_name"] as? String else { return nil }
+        if let path = status["vault_path"] as? String { vaultPath = path }
+        if let rows = status["projects"] as? [[String: Any]] {
+            choices = rows.filter { $0["available"] as? Bool != false }.compactMap { item in
+                guard let id = (item["project_id"] ?? item["id"]) as? String,
+                      let name = (item["display_name"] ?? item["name"]) as? String else { return nil }
                 let missing = item["icon_missing"] as? Bool ?? ((item["icon_value"] as? String)?.isEmpty != false)
-                return NotionChoice(id: id, name: name, iconMissing: missing)
+                return ProjectChoice(id: id, name: name, iconMissing: missing)
             }.sorted { $0.name < $1.name }
-        if selectedTask.isEmpty { selectedTask = tasks.first?.task_id ?? "" }
-        if selectedPage.isEmpty { selectedPage = choices.first?.id ?? "" }
+        }
+        refreshTaskSelection()
     }
+
     func perform(_ command: [String: Any]) {
         guard !busy else { return }
-        guard command["command"] as? String == "status" || usage?.notionEnabled == true else {
-            message = "当前为本机模式；Notion 连接可稍后开启。"; return
+        guard command["command"] as? String == "status" || usage?.managementEnabled == true else {
+            message = "仅计量模式；请先开启 Markdown 项目管理。"; return
         }
         busy = true; message = ""
         let executable = python, folder = root
         Task {
             let result: Result<Data, Error> = await Task.detached(priority: .utility) {
                 do {
-                    let input = try JSONSerialization.data(withJSONObject: command)
-                    return .success(try runWidgetProcess(python: executable, root: folder,
-                        arguments: [folder.appendingPathComponent("widget/notion_sync.py").path,
-                                    "--data-dir", folder.appendingPathComponent("widget/data").path], input: input, timeout: 120))
+                    func call(_ payload: [String: Any]) throws -> [String: Any] {
+                        let input = try JSONSerialization.data(withJSONObject: payload)
+                        let data = try runWidgetProcess(python: executable, root: folder,
+                            arguments: [folder.appendingPathComponent("widget/markdown_store.py").path,
+                                        "--data-dir", folder.appendingPathComponent("widget/data").path], input: input, timeout: 120)
+                        guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                            throw NSError(domain: "UsageWidget", code: 6,
+                                userInfo: [NSLocalizedDescriptionKey: "管理数据无法解析，保留原文件。"])
+                        }
+                        return result
+                    }
+                    var response = try call(command)
+                    if response["ok"] as? Bool == true {
+                        let state = try call(["command": "status"])
+                        let projects = try call(["command": "projects"])
+                        var status = state["status"] as? [String: Any] ?? [:]
+                        if projects["ok"] as? Bool == true { status["projects"] = projects["projects"] }
+                        response["status"] = status
+                    }
+                    return .success(try JSONSerialization.data(withJSONObject: response))
                 } catch { return .failure(error) }
             }.value
             switch result {
             case .success(let data):
                 if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    if let status = json["status"] as? [String: Any] { apply(status) }
-                    if json["ok"] as? Bool == true { message = command["command"] as? String == "status" ? "" : "操作完成。" }
-                    else { message = (json["error"] as? [String: Any])?["message"] as? String ?? "连接未完成，请检查授权和父页面权限。" }
+                    if let status = json["status"] as? [String: Any] {
+                        let mutation = ["bind", "unbind", "create", "import"].contains(command["command"] as? String ?? "")
+                        apply(status, resetProjectSelection: json["ok"] as? Bool == true && mutation)
+                    }
+                    if json["ok"] as? Bool == true {
+                        message = command["command"] as? String == "status" ? "" : "Markdown 项目资料已更新。"
+                    } else {
+                        message = (json["error"] as? [String: Any])?["message"] as? String ?? "操作未完成，请检查管理库路径和笔记格式。"
+                    }
                 } else { message = "操作结果无法解析，保留原设置。" }
             case .failure(let error): message = error.localizedDescription
             }
@@ -411,36 +440,25 @@ final class ProjectSettingsModel: ObservableObject {
             usage?.refresh()
         }
     }
+
     func connect() {
-        guard !busy, usage?.notionEnabled == true else { return }
-        do {
-            if tokenSourceFile.isEmpty { try NotionCredential.save(token) }
-            token = ""
-        }
-        catch { message = error.localizedDescription; return }
-        perform(["command": "setup", "parent_page": parentPage])
+        guard !busy, usage?.managementEnabled == true else { return }
+        perform(["command": "setup", "vault_path": (vaultPath as NSString).expandingTildeInPath,
+                 "task_root": (taskRoot as NSString).expandingTildeInPath])
     }
-    func chooseTokenSource() {
+
+    func chooseVault() {
         let picker = NSOpenPanel()
-        picker.canChooseDirectories = false; picker.canChooseFiles = true
+        picker.canChooseDirectories = true; picker.canChooseFiles = false
         picker.allowsMultipleSelection = false
-        if let type = UTType(filenameExtension: "pages") { picker.allowedContentTypes = [type] }
-        if picker.runModal() == .OK, let url = picker.url {
-            setTokenSource(url.path)
-        }
+        picker.directoryURL = URL(fileURLWithPath: (vaultPath as NSString).expandingTildeInPath)
+        if picker.runModal() == .OK, let url = picker.url { vaultPath = url.path; connect() }
     }
-    func setTokenSource(_ path: String) {
-        guard !busy, usage?.notionSyncing != true else { return }
-        do {
-            try WidgetPreferences.update(root: root, values: ["notion_token_source_file": path.isEmpty ? NSNull() : path as Any])
-            tokenSourceFile = path; token = ""
-            message = "密钥来源已保存；点击连接以验证权限。"
-        } catch { message = "密钥来源未保存，保留原设置。" }
-    }
+
     func create() {
         guard let task = tasks.first(where: { $0.task_id == selectedTask }) else { return }
         guard let icon = newProjectIcon else { message = "请先选择一个 emoji 头像或填写有效 HTTPS Logo 地址。"; return }
-        perform(["command": "create_project", "task_id": task.task_id, "name": task.name, "icon": icon])
+        perform(["command": "create", "task_id": task.task_id, "name": task.name, "icon": icon, "goal": createGoal])
     }
     func chooseImportManifest() {
         let picker = NSOpenPanel()
@@ -456,61 +474,30 @@ final class ProjectSettingsModel: ObservableObject {
         if picker.runModal() == .OK, let url = picker.url { importFolderPath = url.path }
     }
     func importProject() {
-        guard !busy, usage?.notionEnabled == true, usage?.notionSyncing != true else { return }
-        let command: [String: Any]
+        guard !busy, usage?.managementEnabled == true, usage?.managementSyncing != true else { return }
         do {
             let saved = try WidgetPreferences.read(root: root)
             let savedRoot = saved["task_root"] as? String
                 ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents").path
             guard URL(fileURLWithPath: (taskRoot as NSString).expandingTildeInPath).resolvingSymlinksInPath().standardizedFileURL
                     == URL(fileURLWithPath: savedRoot).resolvingSymlinksInPath().standardizedFileURL else {
-                message = "请先保存项目根目录，再导入项目。"; return
+                message = "请先保存工程根目录，再导入项目。"; return
             }
-            command = try ProjectImportSelection.command(manifestURL: URL(fileURLWithPath: importManifestPath),
+            var command = try ProjectImportSelection.command(manifestURL: URL(fileURLWithPath: importManifestPath),
                 folder: URL(fileURLWithPath: importFolderPath),
-                taskRoot: URL(fileURLWithPath: (taskRoot as NSString).expandingTildeInPath),
-                parentPage: parentPage, existingHome: importParentIsHome)
-            if tokenSourceFile.isEmpty { try NotionCredential.save(token) }
-            token = ""
-        } catch { message = error.localizedDescription; return }
-        busy = true; message = "正在导入项目…"
-        let executable = python, folder = root
-        Task {
-            let result: Result<Data, Error> = await Task.detached(priority: .utility) {
-                do {
-                    let input = try JSONSerialization.data(withJSONObject: command)
-                    return .success(try runWidgetProcess(python: executable, root: folder,
-                        arguments: [folder.appendingPathComponent("widget/project_import.py").path,
-                                    "--data-dir", folder.appendingPathComponent("widget/data").path],
-                        input: input, timeout: 240))
-                } catch { return .failure(error) }
-            }.value
-            var imported = false
-            switch result {
-            case .success(let data):
-                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    if let status = json["status"] as? [String: Any] { apply(status) }
-                    if json["ok"] as? Bool == true {
-                        imported = true
-                        message = "项目已导入并绑定；胶囊按本周用量显示前四项，其余归入其他。"
-                    } else {
-                        message = (json["error"] as? [String: Any])?["message"] as? String ?? "导入尚未完成，可以用同一清单重试。"
-                    }
-                } else { message = "导入结果无法确认；保留原记录，使用同一清单重试。" }
-            case .failure(let error): message = error.localizedDescription
-            }
-            busy = false
-            if imported { usage?.syncNotion(force: true) }
-            usage?.refresh()
-        }
+                taskRoot: URL(fileURLWithPath: (taskRoot as NSString).expandingTildeInPath))
+            command["command"] = "import"
+            perform(command)
+        } catch { message = error.localizedDescription }
     }
+
     func bind() {
-        guard !selectedTask.isEmpty, !selectedPage.isEmpty else { return }
-        guard !selectedPageNeedsIcon else {
-            message = "这个项目还没有头像。请先在 Notion 设置头像，再刷新并绑定；此处不会替你修改云端项目。"
+        guard !selectedTask.isEmpty, !selectedProject.isEmpty else { return }
+        guard !selectedProjectNeedsIcon else {
+            message = "这个项目还没有头像。请先在项目笔记的 icon 属性设置 emoji 或 HTTPS 图片，再刷新绑定。"
             return
         }
-        perform(["command": "bind", "task_id": selectedTask, "page_id": selectedPage])
+        perform(["command": "bind", "task_id": selectedTask, "project_id": selectedProject])
     }
 }
 
@@ -519,13 +506,13 @@ struct ProjectSettingsView: View {
     @ObservedObject var usage: UsageModel
     var body: some View {
         Form {
-            Section("运行方式") {
-                Toggle("启用 Notion 同步", isOn: Binding(get: { usage.notionEnabled },
-                    set: { usage.setNotionEnabled($0) }))
-                    .disabled(model.busy || usage.notionSyncing)
-                Text(usage.notionEnabled ? "本机负责计量，Notion 保存已绑定项目的每日摘要。" : "本机模式：无需 Token。项目统计、历史账本和桌面组件照常运行。")
+            Section("项目管理") {
+                Toggle("启用 Markdown 项目管理", isOn: Binding(get: { usage.managementEnabled },
+                    set: { usage.setManagementEnabled($0) }))
+                    .disabled(model.busy || usage.managementSyncing)
+                Text(usage.managementEnabled ? "项目资料保存在 Obsidian 管理库；工程和代码仍放在文稿/项目名。" : "仅计量模式：本机 Token 和额度继续运行。")
                     .font(.callout).foregroundStyle(.secondary)
-                if let message = usage.notionSyncMessage { Text(message).font(.callout).foregroundStyle(.secondary) }
+                if let message = usage.managementSyncMessage { Text(message).font(.callout).foregroundStyle(.secondary) }
             }
             Section("周期核算") {
                 LabeledContent("项目周报", value: "自然周 · 周一至周日")
@@ -579,7 +566,7 @@ struct ProjectSettingsView: View {
                 if !model.accountingMessage.isEmpty { Text(model.accountingMessage).font(.callout).textSelection(.enabled) }
             }
             Section("本地项目") {
-                Text("每个直接子文件夹作为一个任务。未绑定、暂停和归档的项目仍计入用量。")
+                Text("按工程文件夹归集本机投入，项目资料通过下方绑定关联。")
                     .font(.callout).foregroundStyle(.secondary)
                 HStack {
                     TextField("项目根目录", text: $model.taskRoot)
@@ -587,38 +574,29 @@ struct ProjectSettingsView: View {
                     Button("保存") { model.saveRoot() }.disabled(model.busy)
                 }
             }
-            if usage.notionEnabled {
-                Section("连接 Notion") {
-                    Text(model.statusText).font(.callout)
+            if usage.managementEnabled {
+                Section("Obsidian 管理库") {
+                    Text(model.statusText).font(.callout).textSelection(.enabled)
                     HStack {
-                        Text(model.tokenSourceFile.isEmpty ? "密钥来源：系统钥匙串" : "密钥来源：" + URL(fileURLWithPath: model.tokenSourceFile).lastPathComponent)
-                            .font(.callout).lineLimit(1)
-                        Button("选择 Pages 文件…") { model.chooseTokenSource() }
-                        if !model.tokenSourceFile.isEmpty { Button("改用钥匙串") { model.setTokenSource("") } }
-                    }.disabled(model.busy || usage.notionSyncing)
-                    if model.tokenSourceFile.isEmpty {
-                        SecureField("Notion Integration Token（仅存系统钥匙串）", text: $model.token)
-                    } else {
-                        Text("从所选文件提取 Token 用于 Notion 认证；不会上传 Pages 文件。")
-                            .font(.callout).foregroundStyle(.secondary)
+                        TextField("管理库文件夹", text: $model.vaultPath)
+                        Button("选择…") { model.chooseVault() }
                     }
-                    TextField("已分享给 Integration 的父页面链接", text: $model.parentPage)
                     HStack {
-                        Button("初始化项目工作台") { model.connect() }
-                        Button("刷新项目状态") { model.perform(["command": "projects", "force": true]) }
-                        if let url = model.projectsURL { Button("打开项目库") { usage.openProject(url) } }
-                        if let url = model.tasksURL { Button("打开任务库") { usage.openProject(url) } }
-                        if let url = model.usageURL { Button("打开用量库") { usage.openProject(url) } }
+                        Button("保存并连接") { model.connect() }
+                        Button("刷新项目") { model.perform(["command": "projects"]) }
+                        if let url = model.projectsURL { Button("打开项目总览") { usage.openProject(url) } }
+                        if let url = model.tasksURL { Button("打开人工事项") { usage.openProject(url) } }
+                        if let url = model.usageURL { Button("打开用量账本") { usage.openProject(url) } }
                     }.disabled(model.busy)
-                    Text("在 Notion 中创建内部 Integration，授予读取、插入和更新内容权限，再把父页面分享给它。首次同步从本周开始。")
+                    Text("直接读取本地 Markdown。移动端连接尚未配置。")
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                Section("绑定项目") {
-                    Picker("本地任务", selection: $model.selectedTask) {
+                Section("绑定工程与项目资料") {
+                    Picker("本地工程", selection: $model.selectedTask) {
                         Text("请选择").tag("")
-                        ForEach(model.tasks) { task in Text(task.name + (task.notion_page_id == nil ? " · 未绑定" : " · 已绑定")).tag(task.task_id) }
+                        ForEach(model.tasks) { task in Text(task.name + (model.boundProject(for: task.task_id) == nil ? " · 未绑定" : " · 已绑定")).tag(task.task_id) }
                     }.disabled(model.busy)
-                    Picker("Notion 项目", selection: $model.selectedPage) {
+                    Picker("Markdown 项目", selection: $model.selectedProject) {
                         Text("请选择").tag("")
                         ForEach(model.choices) { page in Text(page.name + (page.iconMissing ? " · 需设置头像" : "")).tag(page.id) }
                     }.disabled(model.busy)
@@ -630,7 +608,7 @@ struct ProjectSettingsView: View {
                         HStack {
                             TextField("输入一个项目 emoji", text: $model.createEmoji)
                             Menu("选择头像") {
-                                ForEach(["📦", "🎙️", "🛠️", "📝", "🌱", "🚀"], id: \.self) { value in
+                                ForEach(["⏱️", "📦", "🎙️", "🛠️", "📝", "🌱", "🚀"], id: \.self) { value in
                                     Button(value) { model.createEmoji = value }
                                 }
                             }
@@ -638,18 +616,17 @@ struct ProjectSettingsView: View {
                     } else {
                         TextField("项目 Logo 的 HTTPS 地址", text: $model.createLogoURL).disabled(model.busy)
                     }
+                    TextField("新项目总目标（可在项目笔记中继续完善）", text: $model.createGoal)
                     HStack {
-                        Button("绑定所选项目") { model.bind() }.disabled(model.selectedTask.isEmpty || model.selectedPage.isEmpty || model.selectedPageNeedsIcon)
-                        Button("按任务名新建并绑定") { model.create() }.disabled(model.selectedTask.isEmpty || model.newProjectIcon == nil)
+                        Button("绑定所选项目") { model.bind() }.disabled(model.selectedTask.isEmpty || model.selectedProject.isEmpty || model.selectedProjectNeedsIcon)
+                        Button("按工程名新建并绑定") { model.create() }.disabled(model.selectedTask.isEmpty || model.newProjectIcon == nil)
                         Button("解除绑定") { model.perform(["command": "unbind", "task_id": model.selectedTask]) }.disabled(model.selectedTask.isEmpty)
                     }.disabled(model.busy)
-                    Text("改名后绑定仍然保留。文件夹移动后可以把新位置绑定到同一个 Notion 项目；不会自动创建项目。")
-                        .font(.callout).foregroundStyle(.secondary)
-                    Text("项目头像会用于桌面胶囊。新建时必须选择头像；已有项目没有头像时，请在 Notion 设置后再绑定。")
+                    Text("工程在文稿目录的独立文件夹中，管理资料统一保存在此 Obsidian 库。改名保留稳定身份；不会自动导入所有文件夹。")
                         .font(.callout).foregroundStyle(.secondary)
                 }
-                Section("一键导入已有项目") {
-                    Text("先让 Codex 调用 notion-project-workbench 整理项目清单，再选择清单和本机文件夹。")
+                Section("导入已有项目清单") {
+                    Text("让 AI 按管理规则核对真实材料并生成项目清单，再选择清单和对应工程文件夹。")
                         .font(.callout).foregroundStyle(.secondary)
                     HStack {
                         Text(model.importManifestPath.isEmpty ? "尚未选择项目清单" : URL(fileURLWithPath: model.importManifestPath).lastPathComponent)
@@ -658,23 +635,21 @@ struct ProjectSettingsView: View {
                         Button("选择项目清单…") { model.chooseImportManifest() }
                     }
                     HStack {
-                        Text(model.importFolderPath.isEmpty ? "尚未选择项目文件夹" : URL(fileURLWithPath: model.importFolderPath).lastPathComponent)
+                        Text(model.importFolderPath.isEmpty ? "尚未选择工程文件夹" : URL(fileURLWithPath: model.importFolderPath).lastPathComponent)
                             .font(.callout).lineLimit(1)
                         Spacer()
-                        Button("选择项目文件夹…") { model.chooseImportFolder() }
+                        Button("选择工程文件夹…") { model.chooseImportFolder() }
                     }
-                    Toggle("上面的父页面是已有项目管理主页面", isOn: $model.importParentIsHome)
-                    Text("已有连接会复用原工作台。首次连接时，关闭此选项会在所选父页面下新建项目管理主页面。")
-                        .font(.callout).foregroundStyle(.secondary)
-                    Button("一键导入项目") { model.importProject() }
+                    Button("导入并绑定") { model.importProject() }
                         .disabled(model.importManifestPath.isEmpty || model.importFolderPath.isEmpty)
-                }.disabled(model.busy || usage.notionSyncing)
-                Section("摘要同步") {
+                }.disabled(model.busy || usage.managementSyncing)
+                Section("本地摘要发布") {
                     HStack {
-                        Button(usage.notionSyncing ? "同步中…" : "立即同步摘要") { usage.syncNotion(force: true) }.disabled(usage.notionSyncing)
-                        Text(usage.notionSyncMessage ?? "每 5 分钟同步；离线仍可查看本地用量。").font(.callout).foregroundStyle(.secondary)
+                        Button(usage.managementSyncing ? "更新中…" : "立即更新 Markdown 摘要") { usage.syncManagement(force: true) }.disabled(usage.managementSyncing)
+                        Text(usage.managementSyncMessage ?? "管理状态每分钟读取，账本摘要每 5 分钟检查。")
+                            .font(.callout).foregroundStyle(.secondary)
                     }
-                    Text("同步仅发送项目关联、日期、计数与统计质量。对话、代码、工具输出、目录及会话 ID 留在本机。")
+                    Text("只发布核算摘要，不把每次刷新写成开发历史。日账本和额度观测继续保存在本机。")
                         .font(.callout).foregroundStyle(.secondary)
                 }
             }
@@ -698,6 +673,7 @@ struct ProjectSettingsView: View {
             if !model.message.isEmpty { Text(model.message).font(.callout).textSelection(.enabled) }
         }.formStyle(.grouped).padding(12).frame(width: 640, height: 620)
             .onAppear { model.perform(["command": "status"]); model.refreshAccounting() }
+            .onChange(of: usage.snapshot?.generated_at) { _, _ in model.refreshTaskSelection() }
     }
 }
 
@@ -707,7 +683,7 @@ final class ProjectSettingsController: NSWindowController, NSWindowDelegate {
         let model = ProjectSettingsModel(usage: usage)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 620),
             styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        window.title = "用量小助手 · 项目、周期与 Notion"
+        window.title = "用量小助手 · Markdown、工程与周期"
         window.contentView = NSHostingView(rootView: ProjectSettingsView(model: model, usage: usage))
         window.isReleasedWhenClosed = false
         window.center()

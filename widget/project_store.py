@@ -41,10 +41,13 @@ def management_metadata(meta: dict) -> dict:
         else:
             values[field] = value if isinstance(value, str) and value else None
     return {**values, **project_progress(meta),
-            "notion_icon_missing": meta.get("icon_missing"),
+            "project_id": meta.get("project_id") or meta.get("id"),
+            "provider": meta.get("provider"),
+            "project_url": meta.get("url"), "management_stale": bool(meta.get("stale", False)),
+            "phase": meta.get("phase"), "work_state": meta.get("work_state"),
+            "icon_missing": meta.get("icon_missing"),
             "project_status": meta.get("status"),
-            "icon_type": meta.get("icon_type"), "icon_value": meta.get("icon_value"),
-            "notion_url": meta.get("url"), "notion_stale": bool(meta.get("stale", False))}
+            "icon_type": meta.get("icon_type"), "icon_value": meta.get("icon_value")}
 
 
 def management_projects(projects: list[dict], usage_rows: list[dict], bindings: dict, *, today_known=True) -> list[dict]:
@@ -54,8 +57,8 @@ def management_projects(projects: list[dict], usage_rows: list[dict], bindings: 
     outbox. Missing local attribution remains explicit, even though numeric
     fields keep the native TaskRow schema compatible.
     """
-    by_page = {row["task_id"][7:]: row for row in usage_rows
-               if row.get("task_id", "").startswith("notion:")}
+    by_project = {row["task_id"].split(":", 1)[1]: row for row in usage_rows
+               if row.get("task_id", "").startswith("project:")}
     available = [meta for meta in projects if meta.get("available", True)
                  and meta.get("status") not in ("归档", "已归档")]
     if any(meta.get("status") in ("开发中", "计划中") for meta in available):
@@ -64,10 +67,10 @@ def management_projects(projects: list[dict], usage_rows: list[dict], bindings: 
     priority_order = {"高": 0, "中": 1, "低": 2}
     result = []
     for meta in available:
-        page_id = meta["page_id"]
-        linked = sorted(task_id for task_id, page in bindings.items() if page == page_id)
-        row = dict(by_page.get(page_id) or {
-            "task_id": "notion:" + page_id, "name": meta.get("display_name") or "未命名项目",
+        project_id = meta.get("project_id") or meta["id"]
+        linked = sorted(task_id for task_id, page in bindings.items() if page == project_id)
+        row = dict(by_project.get(project_id) or {
+            "task_id": "project:" + project_id, "name": meta.get("display_name") or "未命名项目",
             **{field: 0 for field in COUNTS}, "percent": 0,
             "sessions_count": 0 if linked else None, "task_ids": linked,
             "today_tokens": 0 if linked and today_known else None})
@@ -169,7 +172,7 @@ class ProjectRegistry:
 
     def session_key(self, thread_id: str) -> str:
         # This local-only key allows cross-folder/day distinct counts. It is
-        # never a Notion property and does not expose a raw session identifier.
+        # never an exported property and does not expose a raw session identifier.
         return hashlib.sha256((self.dataset_id + ":" + thread_id).encode()).hexdigest()
 
 
@@ -191,15 +194,16 @@ def aggregate(report: dict, task_root: Path, registry: ProjectRegistry,
 
     def row_for(task_id: str, name: str) -> dict:
         meta = metadata.get(task_id, {})
-        page_id = meta.get("page_id")
-        display_key = "notion:" + page_id if page_id else task_id
+        project_id = meta.get("project_id") or meta.get("id")
+        prefix = "project:"
+        display_key = prefix + project_id if project_id else task_id
         if display_key not in weekly:
             weekly[display_key] = {
                 "task_id": display_key, "name": name,
                 "display_name": meta.get("display_name") or name,
                 "project_status": meta.get("status"),
                 "icon_type": meta.get("icon_type"), "icon_value": meta.get("icon_value"),
-                "notion_url": meta.get("url"), "notion_stale": bool(meta.get("stale", False)),
+                "project_url": meta.get("url"), "management_stale": bool(meta.get("stale", False)),
                 **management_metadata(meta),
                 **{field: 0 for field in COUNTS}, "_sessions": set(), "task_ids": [],
                 "today_tokens": 0 if today_known else None,
@@ -210,7 +214,7 @@ def aggregate(report: dict, task_root: Path, registry: ProjectRegistry,
             row["task_ids"].append(task_id)
         sources[task_id] = {"task_id": task_id, "name": name,
                            "display_name": meta.get("display_name") or name,
-                           "notion_page_id": page_id, "project_status": meta.get("status")}
+                           "project_id": project_id, "project_status": meta.get("status")}
         return row
 
     for project in report["projects"]:
@@ -253,17 +257,6 @@ def aggregate(report: dict, task_root: Path, registry: ProjectRegistry,
         row["statistics_until"] = report["range"]["until_exclusive"]
     registry.save()
     return rows, sorted(daily.values(), key=lambda row: (row["day"], row["task_id"])), sorted(sources.values(), key=lambda row: row["name"])
-
-
-def split_small(rows: list[dict], total: int) -> tuple[list[dict], list[dict]]:
-    small = [row for row in rows if row["total_tokens"] * 100 < total * 5]
-    major = [row for row in rows if row["total_tokens"] * 100 >= total * 5]
-    if small:
-        counts = {field: sum(row.get(field, 0) for row in small) for field in COUNTS}
-        major.append({"name": "其他", **counts, "percent": counts["total_tokens"] * 100 / total if total else 0,
-                      "today_tokens": sum(row["today_tokens"] for row in small) if all(row.get("today_tokens") is not None for row in small) else None,
-                      "members_count": len(small), "is_other": True})
-    return major, small
 
 
 def remember_daily(path: Path, rows: list[dict], dataset_id: str) -> list[dict]:

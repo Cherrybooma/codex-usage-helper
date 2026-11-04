@@ -8,7 +8,7 @@ Usage: sh setup.sh [--cli-only]
 
 Create or validate .venv, then install optional compressed-log/timezone support.
 On macOS, also build the desktop application unless --cli-only is supplied.
-The application is not started, and Notion/Skill settings are not changed.
+The application is not started; project records, the vault and Skill settings are not changed.
 
 Requires Python 3.10+. Set USAGE_HELPER_PYTHON to an interpreter path to choose it.
 Desktop builds require macOS 15+ and development tools with macOS 26+ SDK.

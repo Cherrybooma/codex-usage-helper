@@ -10,16 +10,16 @@ struct TaskRow: Decodable, Identifiable {
     let percent: Double
     let request_records: Int
     let is_other: Bool?
-    let members_count: Int?
     let sessions_count: Int?
     let task_id: String?
     let display_name: String?
     let project_status: String?
     let icon_type: String?
     let icon_value: String?
-    let notion_url: String?
-    let notion_stale: Bool?
-    let notion_icon_missing: Bool?
+    let project_id: String?
+    let project_url: String?
+    let management_stale: Bool?
+    let icon_missing: Bool?
     let project_goal: String?
     let weekly_goal: String?
     let next_step: String?
@@ -52,7 +52,7 @@ struct LocalProject: Decodable, Identifiable {
     let task_id: String
     let name: String
     let display_name: String?
-    let notion_page_id: String?
+    let project_id: String?
     let project_status: String?
 }
 
@@ -61,7 +61,7 @@ struct SnapshotRange: Decodable {
     let until_exclusive: String?
 }
 
-struct NotionConnectionStatus: Decodable {
+struct ManagementConnectionStatus: Decodable {
     let connected: Bool?
     let state: String?
     let message: String?
@@ -99,18 +99,6 @@ struct WeeklyBudget: Decodable {
     let usage_quality: String?
 }
 
-extension WeeklyBudget {
-    var stripUsageLabel: String {
-        observed_total_percent.map { String(format: "≈%.1f%%", $0) } ?? "待核实"
-    }
-    var stripExcessLabel: String {
-        if let total = observed_total_percent, total <= 100 { return "未超额" }
-        guard let excess = excess_percent else { return "待核实" }
-        if excess > 0 { return String(format: status == "incomplete" ? "≥%.1f%%" : "+%.1f%%", excess) }
-        return "未超额"
-    }
-}
-
 struct Snapshot: Decodable {
     let generated_at: String
     let total_tokens: Int
@@ -118,7 +106,8 @@ struct Snapshot: Decodable {
     let request_records: Int
     let legacy_updates: Int
     let tasks: [TaskRow]
-    let other_tasks: [TaskRow]
+    // Read legacy snapshots without losing small projects during an upgrade.
+    let other_tasks: [TaskRow]?
     let all_usage_tasks: [TaskRow]?
     let task_count: Int?
     let estimated_cost_usd: Double?
@@ -132,18 +121,53 @@ struct Snapshot: Decodable {
     let warnings_count: Int?
     let dataset_id: String?
     let available_projects: [LocalProject]?
-    let notion: NotionConnectionStatus?
+    let management: ManagementConnectionStatus?
 }
 
-enum Palette {
-    static let accent = Color(red: 0.78, green: 0.42, blue: 0.23)
-    static let track = Color.primary.opacity(0.07)
-    static func surface(_ scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color(red: 0.16, green: 0.16, blue: 0.14) :
-                          Color(red: 0.98, green: 0.97, blue: 0.95)
+enum SnapshotCache {
+    static func decode(_ data: Data) -> Snapshot? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        // Presentation caches are disposable; source ledgers and project IDs are not.
+        // An old Notion cache cannot masquerade as the newly selected local provider.
+        if json["notion"] != nil && json["management_provider"] as? String != "markdown" { return nil }
+        return try? JSONDecoder().decode(Snapshot.self, from: data)
     }
-    static func warmAccent(_ scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color(red: 0.96, green: 0.65, blue: 0.43) : accent
+}
+
+/// Cross-application navigation is read/open only: URI actions that append or
+/// overwrite a note are deliberately rejected by this desktop viewer.
+enum ProjectDestination {
+    static func obsidianURL(_ value: String) -> URL? {
+        guard value.count <= 8192,
+              value.rangeOfCharacter(from: .controlCharacters) == nil,
+              let parts = URLComponents(string: value), parts.scheme?.lowercased() == "obsidian",
+              parts.host == "open", parts.path.isEmpty || parts.path == "/",
+              parts.user == nil, parts.password == nil, parts.port == nil,
+              parts.fragment == nil, let query = parts.queryItems else { return nil }
+        let keys = query.map(\.name)
+        guard Set(keys).count == keys.count, Set(keys).isSubset(of: ["vault", "file", "path", "paneType"]),
+              query.allSatisfy({ $0.value?.isEmpty == false && $0.value?.rangeOfCharacter(from: .controlCharacters) == nil }) else { return nil }
+        let values = Dictionary(uniqueKeysWithValues: query.map { ($0.name, $0.value!) })
+        if let pane = values["paneType"], !["tab", "split", "window"].contains(pane) { return nil }
+        if let path = values["path"] {
+            guard values["vault"] == nil, values["file"] == nil, path.hasPrefix("/"),
+                  !path.split(separator: "/").contains("..") else { return nil }
+        } else {
+            guard let vault = values["vault"], !vault.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            if let file = values["file"] {
+                guard !file.hasPrefix("/"), !file.split(separator: "/").contains("..") else { return nil }
+            }
+        }
+        return parts.url
+    }
+
+    static func url(_ value: String) -> URL? {
+        if let url = obsidianURL(value) { return url }
+        // Existing published HTTPS evidence remains readable after migration.
+        guard let parts = URLComponents(string: value), parts.scheme == "https",
+              parts.host?.isEmpty == false, parts.user == nil, parts.password == nil,
+              value.rangeOfCharacter(from: .whitespacesAndNewlines.union(.controlCharacters)) == nil else { return nil }
+        return parts.url
     }
 }
 
@@ -184,36 +208,47 @@ func timestampLabel(_ value: String) -> String {
     return format.string(from: date)
 }
 
+enum ManagementSyncResponse {
+    static let fallback = "Markdown 更新未完成，本地记录已保留。"
+
+    static func message(_ data: Data) -> String {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return fallback }
+        if json["ok"] as? Bool == true { return "Markdown 管理状态和账本摘要已更新。" }
+        if let error = json["error"] as? [String: Any],
+           let message = error["message"] as? String,
+           !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return message
+        }
+        return fallback
+    }
+}
+
 @MainActor
 final class UsageModel: ObservableObject {
     @Published var snapshot: Snapshot?
     @Published var refreshing = false
     @Published var error: String?
-    @Published var compact = false
-    @Published var pinned = false
-    @Published var tab = 0
-    @Published var showOther = false
-    @Published var notionSyncing = false
-    @Published var notionSyncMessage: String?
-    @Published private(set) var notionEnabled = false
+    @Published var managementSyncing = false
+    @Published var managementSyncMessage: String?
+    @Published private(set) var managementEnabled = false
     @Published private(set) var widgetStyle: WidgetStyle = .glass
     @Published var enabledWidgets: Set<WidgetKind> = [.horizontal]
     var onVisibility: (() -> Void)?
     var onUpdated: (() -> Void)?
-    var onResize: (() -> Void)?
-    var onPin: ((Bool) -> Void)?
     let root: URL
     let python: URL
     var timer: Timer?
-    var notionTimer: Timer?
+    var managementTimer: Timer?
     var settingsController: ProjectSettingsController?
 
     init(root: URL) {
         self.root = root
         python = root.appendingPathComponent(".venv/bin/python3")
-        let settings = (try? WidgetPreferences.read(root: root)) ?? [:]
-        notionEnabled = WidgetPreferences.notionEnabled(in: settings)
+        let saved = try? WidgetPreferences.read(root: root)
+        let settings = saved ?? [:]
+        managementEnabled = saved.map { WidgetPreferences.managementEnabled(in: $0) } ?? false
         widgetStyle = WidgetStyle(rawValue: settings["widget_style"] as? String ?? "") ?? .glass
+        enabledWidgets = WidgetDisplayPreferences.restore(root: root)
     }
 
     func start() {
@@ -221,7 +256,7 @@ final class UsageModel: ObservableObject {
         Task { [weak self] in
             let cached: Snapshot? = await Task.detached(priority: .utility) {
                 guard let data = try? Data(contentsOf: cacheURL) else { return nil }
-                return try? JSONDecoder().decode(Snapshot.self, from: data)
+                return SnapshotCache.decode(data)
             }.value
             // A delayed cache read must not replace a newer completed refresh.
             if self?.snapshot == nil, let cached {
@@ -233,8 +268,8 @@ final class UsageModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
-        notionTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.syncNotion() }
+        managementTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.syncManagement() }
         }
     }
 
@@ -247,50 +282,47 @@ final class UsageModel: ObservableObject {
     }
 
     func openProject(_ value: String) {
-        guard let url = URL(string: value), url.scheme == "https", let host = url.host,
-              host == "notion.so" || host.hasSuffix(".notion.so") || host == "notion.site" || host.hasSuffix(".notion.site") || host == "notion.com" || host.hasSuffix(".notion.com") else { return }
+        guard let url = ProjectDestination.url(value) else { return }
         NSWorkspace.shared.open(url)
     }
 
-    func syncNotion(force: Bool = false) {
-        guard notionEnabled else {
-            notionSyncMessage = "本机模式；Notion 同步已关闭。"
+    func syncManagement(force: Bool = false) {
+        guard managementEnabled else {
+            managementSyncMessage = "仅计量模式；Markdown 项目管理已关闭。"
             return
         }
-        guard !notionSyncing else { return }
-        if !force && snapshot?.notion?.connected != true { return }
-        notionSyncing = true
-        notionSyncMessage = nil
+        guard !managementSyncing else { return }
+        if !force && snapshot?.management?.connected != true { return }
+        managementSyncing = true
+        managementSyncMessage = nil
         let executable = python, folder = root
         Task {
             let result: Result<Data, Error> = await Task.detached(priority: .utility) {
                 do {
-                    var args = [folder.appendingPathComponent("widget/widget_backend.py").path, "--sync-notion"]
+                    var args = [folder.appendingPathComponent("widget/widget_backend.py").path, "--sync-markdown"]
                     if force { args.append("--force-sync") }
                     return .success(try runWidgetProcess(python: executable, root: folder, arguments: args, timeout: 180))
                 } catch { return .failure(error) }
             }.value
             switch result {
             case .success(let data):
-                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], json["ok"] as? Bool == true {
-                    notionSyncMessage = "摘要同步已检查；未绑定项目保留在本机。"
-                } else { notionSyncMessage = "同步未完成，本地记录已保留。" }
-            case .failure: notionSyncMessage = "同步未完成，本地记录已保留。"
+                managementSyncMessage = ManagementSyncResponse.message(data)
+            case .failure: managementSyncMessage = "Markdown 更新未完成，本地记录已保留。"
             }
-            notionSyncing = false
+            managementSyncing = false
             refresh()
         }
     }
 
-    func setNotionEnabled(_ enabled: Bool) {
-        // An in-flight request may already have reached Notion; finish it first.
-        guard !notionSyncing else { return }
+    func setManagementEnabled(_ enabled: Bool) {
+        // Finish an in-flight local publication before switching modes.
+        guard !managementSyncing else { return }
         do {
-            try WidgetPreferences.update(root: root, values: ["notion_sync_enabled": enabled])
-            notionEnabled = enabled
-            notionSyncMessage = enabled ? "已开启；连接完成后每 5 分钟同步摘要。" : "本机模式；Notion 同步已关闭。"
+            try WidgetPreferences.update(root: root, values: ["management_enabled": enabled])
+            managementEnabled = enabled
+            managementSyncMessage = enabled ? "已开启；每 5 分钟更新 Markdown 摘要。" : "仅计量模式；Markdown 项目管理已关闭。"
             onUpdated?()
-        } catch { notionSyncMessage = "运行方式未保存，保留原设置。" }
+        } catch { managementSyncMessage = "运行方式未保存，保留原设置。" }
     }
 
     func setWidgetStyle(_ style: WidgetStyle) {
@@ -304,11 +336,7 @@ final class UsageModel: ObservableObject {
     func toggleWidget(_ kind: WidgetKind) {
         if enabledWidgets.contains(kind) { enabledWidgets.remove(kind) }
         else { enabledWidgets.insert(kind) }
-        let folder = root.appendingPathComponent("widget/data")
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        if let data = try? JSONEncoder().encode(enabledWidgets) {
-            try? data.write(to: folder.appendingPathComponent("display-settings.json"), options: .atomic)
-        }
+        try? WidgetDisplayPreferences.save(enabledWidgets, root: root)
         onVisibility?()
     }
 
@@ -337,227 +365,6 @@ final class UsageModel: ObservableObject {
     }
 }
 
-struct UsageBar: View {
-    @Environment(\.colorScheme) var colorScheme
-    let percent: Double
-    var subtle = false
-    var body: some View {
-        ZStack(alignment: .leading) {
-            Capsule().fill(Palette.track)
-            Capsule().fill(Palette.warmAccent(colorScheme).opacity(subtle ? 0.5 : 0.85))
-                .frame(width: max(0, min(100, percent)) * 3.04)
-        }.frame(width: 304, height: subtle ? 3 : 5)
-        .accessibilityLabel("\(String(format: "%.1f", percent))%")
-    }
-}
-
-struct UsageView: View {
-    @Environment(\.colorScheme) var colorScheme
-    @ObservedObject var model: UsageModel
-    var accent: Color { Palette.warmAccent(colorScheme) }
-    var hide: () -> Void
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "chart.bar.xaxis").foregroundStyle(accent)
-                Text("用量小助手").font(.system(size: 15, weight: .semibold))
-                Spacer()
-                Button {
-                    model.compact.toggle(); model.onResize?()
-                } label: { Image(systemName: model.compact ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left") }
-                .help(model.compact ? "展开明细" : "紧凑速览")
-                Button { model.pinned.toggle(); model.onPin?(model.pinned) } label: {
-                    Image(systemName: model.pinned ? "pin.fill" : "pin")
-                        .foregroundStyle(model.pinned ? accent : Color.secondary)
-                }.help(model.pinned ? "恢复桌面显示" : "置顶显示")
-                Button(action: hide) { Image(systemName: "xmark") }.help("隐藏到菜单栏")
-            }.buttonStyle(.plain).padding(.bottom, 20)
-            if let value = model.snapshot {
-                if model.compact { compactBody(value) }
-                else {
-                    Picker("视图", selection: $model.tab) {
-                        Text("项目用量").tag(0)
-                        Text("本周超额").tag(1)
-                    }.pickerStyle(.segmented).labelsHidden().padding(.bottom, 20)
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 16) {
-                            if model.tab == 0 { projectBody(value) }
-                            else { budgetBody(value) }
-                        }.padding(.bottom, 4)
-                    }.frame(maxHeight: .infinity)
-                }
-                footer(value)
-            } else {
-                VStack(alignment: .leading, spacing: 12) {
-                    ProgressView().controlSize(.small)
-                    Text("正在读取本机记录…").foregroundStyle(.secondary)
-                    if let error = model.error { Text(error).font(.caption) }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            }
-        }
-        .padding(24)
-        .frame(width: 368, height: model.compact ? 244 : 624)
-        .background(Palette.surface(colorScheme).opacity(0.96), in: RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Color.primary.opacity(0.08)))
-        .tint(accent)
-        .font(.system(size: 13))
-        .onChange(of: model.compact) { _, _ in model.onResize?() }
-    }
-
-    func projectBody(_ snapshot: Snapshot) -> some View {
-        VStack(alignment: .leading, spacing: 20) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("本周 · 本机记录").foregroundStyle(.secondary).font(.system(size: 12))
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(compactTokens(snapshot.total_tokens))
-                        .font(.system(size: 34, weight: .medium, design: .rounded)).monospacedDigit()
-                    Text("tokens").foregroundStyle(.secondary).font(.system(size: 12))
-                }
-                Text("\(snapshot.request_records.formatted()) 个响应 · 按文稿任务文件夹归集")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-            VStack(alignment: .leading, spacing: 16) {
-                if snapshot.tasks.isEmpty {
-                    Text("窗口内暂无可识别用量").foregroundStyle(.secondary)
-                }
-                ForEach(snapshot.tasks) { row in
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            if row.is_other == true {
-                                Button { model.showOther.toggle() } label: {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: model.showOther ? "chevron.down" : "chevron.right").font(.system(size: 10))
-                                        Text("其他 · \(row.members_count ?? 0) 项")
-                                    }
-                                }.buttonStyle(.plain)
-                            } else { Text(row.name).lineLimit(1) }
-                            Spacer(minLength: 8)
-                            Text(String(format: "%.2f%%", row.percent)).monospacedDigit().fontWeight(.medium)
-                        }
-                        UsageBar(percent: row.percent, subtle: row.is_other == true)
-                        if row.is_other == true && model.showOther {
-                            ForEach(snapshot.other_tasks) { member in
-                                HStack {
-                                    Text(member.name).lineLimit(1)
-                                    Spacer()
-                                    Text(String(format: "%.2f%%", member.percent)).monospacedDigit()
-                                }.foregroundStyle(.secondary).font(.system(size: 12))
-                            }
-                        }
-                    }.help("\(row.total_tokens.formatted()) tokens · \(row.request_records) 个响应")
-                }
-            }
-            Divider()
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Label("本周超额", systemImage: "chart.line.uptrend.xyaxis")
-                    Spacer()
-                    Text(budgetHeadline(snapshot.weekly_budget)).help("按已记录用量判断；记录不完整时，完整账户用量仍待核实。").foregroundStyle(accent)
-                        .monospacedDigit().font(.system(size: 12, weight: .medium))
-                }
-                Text("低于 5% 合并到其他，可点击展开。")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-            if snapshot.legacy_updates > 0 {
-                Text("含 \(snapshot.legacy_updates) 条旧累计差分估算")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    func budgetHeadline(_ budget: WeeklyBudget?) -> String {
-        guard let budget else { return "尚无记录" }
-        if let total = budget.observed_total_percent, total <= 100 { return "未超额" }
-        guard let excess = budget.excess_percent else { return "记录待核实" }
-        if excess > 0 { return String(format: "超出约 %.1f%%", excess) }
-        return "未超额"
-    }
-
-    func budgetBody(_ snapshot: Snapshot) -> some View {
-        VStack(alignment: .leading, spacing: 20) {
-            if let budget = snapshot.weekly_budget {
-                VStack(alignment: .leading, spacing: 6) {
-                    if let excess = budget.excess_percent, excess > 0 {
-                        Text(budget.status == "incomplete" ? "至少超出约" : "已超出约")
-                            .font(.system(size: 16, weight: .medium))
-                        Text(String(format: "%.1f%%", excess))
-                            .font(.system(size: 42, weight: .medium, design: .rounded))
-                            .foregroundStyle(accent).monospacedDigit()
-                    } else {
-                        Text(budgetHeadline(budget))
-                            .font(.system(size: 24, weight: .medium))
-                        Text(budget.status == "incomplete" ? "按已记录用量统计 · 记录不完整" : "按已记录用量统计")
-                            .font(.system(size: 12)).foregroundStyle(.secondary)
-                    }
-                }
-                if let total = budget.observed_total_percent {
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Text("累计使用")
-                            Spacer()
-                            Text(String(format: "约 %.1f%%", total)).fontWeight(.medium).monospacedDigit()
-                        }
-                        // Each complete rail represents one normal allowance.
-                        // Keep the second rail visible after crossing 100%.
-                        UsageBar(percent: total)
-                        if total > 100 { UsageBar(percent: total - 100, subtle: true) }
-                        Text("100% 以上为超额部分")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
-                }
-                if let start = budget.period_start, let end = budget.period_end {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("统计时间").fontWeight(.medium)
-                        Text("\(localDate(start)) — \(localDate(end - 1))")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
-                }
-                Divider()
-                if !budget.notes.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Label("记录尚不完整", systemImage: "clock.badge.questionmark")
-                            .fontWeight(.medium)
-                        Text("累计只包含已记录的用量。")
-                            .font(.system(size: 12)).foregroundStyle(.secondary)
-                            .help(budget.notes.joined(separator: "\n"))
-                    }
-                }
-                Text("每周一开始统计，周日结束。\n额度重置后继续累计；超额不代表额外收费。")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            } else {
-                Text("正在建立本周观测…").foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    func compactBody(_ snapshot: Snapshot) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(compactTokens(snapshot.total_tokens)).font(.system(size: 30, weight: .medium, design: .rounded))
-                Text("tokens / 本周").font(.system(size: 12)).foregroundStyle(.secondary)
-            }
-            if let first = snapshot.tasks.first {
-                HStack { Text(first.name); Spacer(); Text(String(format: "%.2f%%", first.percent)).monospacedDigit() }
-                UsageBar(percent: first.percent)
-            }
-            Text("本周 · \(budgetHeadline(snapshot.weekly_budget))")
-                .font(.system(size: 12)).foregroundStyle(.secondary)
-        }
-    }
-
-    func footer(_ snapshot: Snapshot) -> some View {
-        HStack {
-            Circle().fill(model.error == nil ? Color.green.opacity(0.6) : Color.orange).frame(width: 5, height: 5)
-            Text(model.error ?? "\(timestampLabel(snapshot.generated_at)) 更新 · 每分钟刷新")
-                .lineLimit(1).font(.system(size: 11)).foregroundStyle(.secondary)
-            Spacer()
-            Button { model.refresh() } label: {
-                Image(systemName: "arrow.clockwise").font(.system(size: 12))
-            }.buttonStyle(.plain).disabled(model.refreshing).help("刷新本机记录与累计用量")
-        }.padding(.top, 16)
-    }
-}
-
 class FloatingPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
@@ -579,7 +386,6 @@ class FloatingPanel: NSPanel {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var panel: FloatingPanel!
     var strips: [WidgetKind: FloatingPanel] = [:]
     var interactions: [WidgetKind: StripInteraction] = [:]
     var model: UsageModel!
@@ -600,26 +406,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         NSApp.mainMenu = WidgetApplicationMenu.make(settingsTarget: self)
         model = UsageModel(root: root)
-        if let data = try? Data(contentsOf: root.appendingPathComponent("widget/data/positions.json")),
-           let saved = try? JSONDecoder().decode([String: [String: Double]].self, from: data) { positions = saved }
-        if let data = try? Data(contentsOf: root.appendingPathComponent("widget/data/display-settings.json")),
-           let saved = try? JSONDecoder().decode(Set<WidgetKind>.self, from: data) {
-            model.enabledWidgets = saved
-        }
-        panel = makePanel(width: 368, height: 624)
-        panel.title = "用量小助手 · 桌面小框"
-        panel.contentView = NSHostingView(rootView: UsageView(model: model, hide: { [weak self] in
-            self?.model.toggleWidget(.box)
-        }))
-        if let frame = NSScreen.main?.visibleFrame {
-            panel.setFrameOrigin(NSPoint(x: max(frame.minX, frame.maxX - 560), y: frame.maxY - 648))
-        }
-        restorePosition(panel, kind: .box)
+        restorePositions()
         for kind in [WidgetKind.horizontal, .vertical] {
             let state = StripInteraction()
             let strip = makePanel(width: 108, height: 108)
             strip.title = "用量小助手 · \(kind.title)"
-            // Match the approved pale-glass preview; the original box retains system appearance.
+            // Start with the approved pale-glass capsule appearance.
             strip.appearance = NSAppearance(named: .aqua)
             strip.hasShadow = false
             strip.isMovableByWindowBackground = false
@@ -659,16 +451,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.representedObject = "theme:" + style.rawValue
         }
         menu.addItem(themeItem)
-        menu.addItem(withTitle: "项目与 Notion 设置…", action: #selector(openSettings), keyEquivalent: ",")
+        menu.addItem(withTitle: "项目与 Markdown 设置…", action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(withTitle: "周期核算…", action: #selector(openSettings), keyEquivalent: "")
-        menu.addItem(withTitle: "同步 Notion 摘要", action: #selector(syncNotion), keyEquivalent: "")
+        menu.addItem(withTitle: "更新 Markdown 摘要", action: #selector(syncManagement), keyEquivalent: "")
         menu.addItem(withTitle: "刷新", action: #selector(refresh), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "退出用量小助手", action: #selector(quit), keyEquivalent: "q")
         for item in menu.items { item.target = self }
         statusItem.menu = menu
-        model.onResize = { [weak self] in self?.resize() }
-        model.onPin = { [weak self] pinned in self?.setPinned(pinned) }
         model.onVisibility = { [weak self] in self?.updateVisibility() }
         model.onUpdated = { [weak self] in
             self?.updateStatus()
@@ -732,7 +522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let window = strips[kind], let state = interactions[kind] else { return }
         resizingStrips = true
         defer { resizingStrips = false }
-        let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric, managementEnabled: model.notionEnabled)
+        let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric, managementEnabled: model.managementEnabled)
         let vertical = kind == .vertical
         let natural = UsageStrip.canvasSize(itemCount: items.count, vertical: vertical)
         // Reserve a fixed overlay budget so hover never moves its anchor.
@@ -772,7 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let mouse = NSEvent.mouseLocation
         for (kind, window) in strips {
             guard let state = interactions[kind], window.isVisible else { continue }
-            let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric, managementEnabled: model.notionEnabled)
+            let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric, managementEnabled: model.managementEnabled)
             let x = mouse.x - window.frame.minX
             let y = window.frame.maxY - mouse.y
             let point = CGPoint(x: x, y: y)
@@ -797,7 +587,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func stripHitTarget(_ kind: WidgetKind, at point: CGPoint) -> StripHitTarget {
         guard let window = strips[kind], let state = interactions[kind], model != nil else { return .outside }
-        let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric, managementEnabled: model.notionEnabled)
+        let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: state.quotaMetric, managementEnabled: model.managementEnabled)
         let canvas = window.frame.size
         let vertical = kind == .vertical
         let offset = headerOffsets[kind] ?? 0
@@ -810,32 +600,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             headerOffset: offset, detail: detail, detailIndex: selectedIndex)
     }
 
-    func restorePosition(_ window: NSWindow, kind: WidgetKind) {
-        guard let saved = positions[kind.rawValue] else { return }
-        let screen = NSScreen.screens.first { Double(($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0) == saved["screen"] } ?? NSScreen.main
-        guard let bounds = screen?.visibleFrame else { return }
-        let x = bounds.minX + min(1, max(0, saved["x"] ?? 0.5)) * max(0, bounds.width - window.frame.width)
-        let top = bounds.maxY - min(1, max(0, saved["top"] ?? 0)) * max(0, bounds.height - window.frame.height)
-        window.setFrameOrigin(NSPoint(x: x, y: top - window.frame.height))
-    }
-
     @objc func windowMoved(_ notification: Notification) {
         guard !resizingStrips else { return }
         guard let window = notification.object as? NSWindow, let screen = window.screen else { return }
-        let kind: WidgetKind?
-        if window === panel { kind = .box }
-        else { kind = strips.first(where: { $0.value === window })?.key }
-        guard let kind else { return }
+        guard let kind = strips.first(where: { $0.value === window })?.key else { return }
         let bounds = screen.visibleFrame
         var saved = ["screen": Double((screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0),
             "x": (window.frame.minX - bounds.minX) / max(1, bounds.width - window.frame.width),
             "top": (bounds.maxY - window.frame.maxY) / max(1, bounds.height - window.frame.height)]
-        if kind != .box {
-            let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: interactions[kind]?.quotaMetric ?? .weeklyUsed, managementEnabled: model.notionEnabled)
-            let anchorTop = window.frame.maxY - (headerOffsets[kind] ?? 0)
-            saved["anchor_top"] = (bounds.maxY - anchorTop) / max(1, bounds.height - UsageStrip.naturalSize(itemCount: items.count, vertical: kind == .vertical).height)
-        }
+        let items = StripItem.items(model.snapshot, failed: model.error != nil, metric: interactions[kind]?.quotaMetric ?? .weeklyUsed, managementEnabled: model.managementEnabled)
+        let anchorTop = window.frame.maxY - (headerOffsets[kind] ?? 0)
+        saved["anchor_top"] = (bounds.maxY - anchorTop) / max(1, bounds.height - UsageStrip.naturalSize(itemCount: items.count, vertical: kind == .vertical).height)
         positions[kind.rawValue] = saved
+        savePositions()
+    }
+
+    func restorePositions() {
+        if let data = try? Data(contentsOf: root.appendingPathComponent("widget/data/positions.json")),
+           let saved = try? JSONDecoder().decode([String: [String: Double]].self, from: data) {
+            positions = saved.filter { WidgetKind(rawValue: $0.key) != nil }
+            if positions.count != saved.count { savePositions() }
+        }
+    }
+
+    func savePositions() {
         if let data = try? JSONEncoder().encode(positions) {
             try? data.write(to: root.appendingPathComponent("widget/data/positions.json"), options: .atomic)
         }
@@ -843,7 +631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func updateVisibility() {
         for kind in WidgetKind.allCases {
-            guard let window = kind == .box ? panel : strips[kind] else { continue }
+            guard let window = strips[kind] else { continue }
             if model.enabledWidgets.contains(kind) { window.orderFrontRegardless() }
             else { interactions[kind]?.dismiss(); window.orderOut(nil) }
         }
@@ -856,10 +644,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func recordWindowState() {
-        guard model != nil, panel != nil else { return }
+        guard model != nil else { return }
         var windows: [[String: Any]] = []
         for kind in WidgetKind.allCases {
-            guard let window = kind == .box ? panel : strips[kind] else { continue }
+            guard let window = strips[kind] else { continue }
             windows.append(["kind": kind.rawValue, "level": window.level.rawValue,
                 "is_visible": window.isVisible, "occlusion_visible": window.occlusionState.contains(.visible),
                 "stationary": window.collectionBehavior.contains(.stationary),
@@ -867,7 +655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "expanded": interactions[kind]?.expanded ?? "", "locked": interactions[kind]?.locked ?? false])
         }
         let value: [String: Any] = ["recorded_at": ISO8601DateFormatter().string(from: Date()), "widget_style": model.widgetStyle.rawValue,
-            "desktop_level": desktopLevel().rawValue, "pinned": model.pinned,
+            "desktop_level": desktopLevel().rawValue,
             "enabled": model.enabledWidgets.map(\.rawValue).sorted(), "windows": windows]
         let destination = root.appendingPathComponent("widget/data/window-state.json")
         diagnosticsQueue.async {
@@ -881,20 +669,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
     }
 
-    func setPinned(_ pinned: Bool) {
-        panel.level = pinned ? .floating : desktopLevel()
-        panel.collectionBehavior = pinned ? [.canJoinAllSpaces, .fullScreenAuxiliary] :
-                                            [.canJoinAllSpaces, .stationary, .ignoresCycle]
-        if panel.isVisible { panel.orderFrontRegardless() }
-        recordWindowState()
-    }
-
-    func resize() {
-        let top = panel.frame.maxY
-        let height: CGFloat = model.compact ? 244 : 624
-        panel.setFrame(NSRect(x: panel.frame.minX, y: top - height, width: 368, height: height), display: true, animate: true)
-    }
-
     func updateStatus() {
         for parent in statusItem.menu?.items ?? [] {
             for item in parent.submenu?.items ?? [] {
@@ -903,8 +677,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
-        if let syncItem = statusItem.menu?.items.first(where: { $0.action == #selector(syncNotion) }) {
-            syncItem.isEnabled = model.notionEnabled && !model.notionSyncing
+        if let syncItem = statusItem.menu?.items.first(where: { $0.action == #selector(syncManagement) }) {
+            syncItem.isEnabled = model.managementEnabled && !model.managementSyncing
         }
         if let snapshot = model.snapshot,
            let week = snapshot.quota?.windows.first(where: { $0.duration_mins == 10080 }) {
@@ -925,7 +699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func refresh() { model.refresh() }
     @objc func openSettings() { model.openSettings() }
-    @objc func syncNotion() { model.syncNotion(force: true) }
+    @objc func syncManagement() { model.syncManagement(force: true) }
     @objc func quit() { NSApp.terminate(nil) }
 }
 

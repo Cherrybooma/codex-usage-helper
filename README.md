@@ -1,10 +1,10 @@
 # 用量小助手 · Codex Usage Helper
 
-**在桌面看项目进展，在 Notion 管理项目，把 Codex 的 Token 投入记清楚。**
+**在桌面看项目进展，在 Markdown / Obsidian 管理项目，把 Codex 的 Token 投入记清楚。**
 
-用量小助手由三部分组成：跨平台的本地日志扫描器、macOS 桌面胶囊，以及可安装到 Codex 的 Notion 项目管理 Skill。可以只在本机看用量，也可以连接自己的 Notion，让项目愿景、当前目标、人工待办、正式产出和 Token 账本放在一起。
+用量小助手包含跨平台本地日志扫描器、macOS 桌面胶囊和 Markdown 项目管理工具。项目愿景、当前事项、人工确认、成果引用和关键历史保存在已有 Obsidian 管理库；胶囊读取这些资料，并关联本机 Token 投入。正常运行无需 Notion 账号、Token、钥匙串或云端接口。
 
-当前只支持 **Codex**。本项目与 OpenAI、Notion 均无官方隶属关系。
+当前只支持 **Codex**。本项目与 OpenAI、Obsidian 均无官方隶属关系。
 
 > Token 统计覆盖本机仍保留的会话记录，不代表完整账户用量、订阅剩余额度或最终账单。官方额度、Token 数量和估算金额采用不同口径，不能互相倒推。
 
@@ -15,9 +15,9 @@
 - **本地 Token 账本**：按项目、会话、模型、日期汇总；支持 JSON 导出、归档日志、压缩日志和 Git worktree。
 - **桌面项目看板**：胶囊只显示图标，圆圈内悬停看摘要、点击看详情，圆圈外的胶囊背景可以拖动。普通窗口可以盖住组件。
 - **统一的详情排版**：12／14／16 三档字号，指标按行排列，长内容分页，不出现卡内滚动条。
-- **三种主题和展示位置**：液态玻璃、Pulse 暗色、经典白色；顶部横条、右侧竖条、桌面小框可独立开关。
-- **Notion 项目管理**：愿景、人工确认事项、当前进展与下一步、开发历史、Token 投入；阶段进展关联正式产出。
-- **已有项目导入 Skill**：从实际文档和成果整理项目，复用已有工作台，绑定本机文件夹与胶囊。
+- **三种主题、两种胶囊位置**：液态玻璃、Pulse 暗色、经典白色；顶部横条与右侧竖条可独立开关，也可同时开启。
+- **本地项目管理**：复用 Markdown 项目卡、任务、历史、正式反馈与成果引用，Obsidian 与胶囊读取同一份资料。
+- **AI 协助维护**：沿用现有 Obsidian 项目管理 Skill、规则和模板；按固定项目 ID 维护，不靠项目名称重建身份。
 - **周与月核算**：按上海自然周记录，用自己确认的会员续费日期划分月账期；保留计量覆盖情况和估算标记。
 
 ## 选择使用方式
@@ -26,9 +26,9 @@
 | --- | --- | --- |
 | 只统计本机 Codex Token | [命令行扫描器](#只使用命令行扫描器) | Python 3.10+，macOS／Linux／Windows |
 | 在桌面查看项目与用量 | [macOS 桌面组件](#macos-桌面组件) | macOS 15+、Python 3.10+，构建需要 macOS 26 SDK |
-| 用 AI 整理项目并接入 Notion | [Notion 连接](#连接自己的-notion可选)和 [Skill 安装](#安装-skill并用于其他项目) | 自己的 Notion 工作区、连接权限和 Codex |
+| 用 AI 整理项目并显示到胶囊 | [接入现有管理库](#接入现有-markdown--obsidian-管理库) | 本地 Markdown 管理库；Obsidian 用于查看笔记和看板 |
 
-发布内容是可自行运行的源码，**没有预置作者的 Notion、凭据、项目绑定和用量数据**。下载后使用自己的本机记录和工作区。
+发布内容是可自行运行的源码，**没有预置作者的项目资料、绑定或用量数据**。本次合并继续使用现有中央库，不初始化新库或导入示例项目。
 
 ## 获取源码
 
@@ -79,7 +79,7 @@ sh widget/build.sh
 
 ### 2. 选择自己的项目目录
 
-启动后，从菜单栏或组件右键菜单打开 **“项目与 Notion 设置…”**。默认本机模式，无需 Notion Token。
+启动后，从菜单栏或组件右键菜单打开 **“项目与 Markdown 设置…”**，选择已有 Obsidian 管理库与本机项目目录。
 
 任务目录默认 `~/Documents`，按其**第一级子文件夹**归集任务。例如选择 `~/Projects` 后：
 
@@ -101,83 +101,70 @@ Projects/
 | 项目：悬停 | 项目状态、下一步行动、完成进度、本周 Token 占比 |
 | 项目：点击 | 概览／行动／投入，含愿景、当前目标、人工待办、产出和用量 |
 
-前两个入口固定。后面最多四个项目位，从已接入的 Notion 管理项目中按真实本周 Token 降序选取；零用量项目可补足空位，每次刷新重新排序，其他项目归入“其他”。没有可用管理项目时回退为本机有用量文件夹的前四项。**导入项目不等于永久固定在前四位**。
+前两个入口固定。后面最多四个项目位，从已接入的 Markdown 管理项目中按真实本周 Token 降序选取；零用量项目可补足空位，每次刷新重新排序，其他项目归入“其他”。没有可用管理项目时回退为本机有用量文件夹的前四项。**导入项目不等于永久固定在前四位**。
 
-图标外环表示项目本周 Token 占比，内环表示已维护的完成进度；未知进度只显示轨道。项目图标来自 Notion 页面 icon，不将用量当作项目完成度。
+图标外环表示项目本周 Token 占比，内环表示已维护的完成进度；未知进度只显示轨道。项目图标来自 Markdown 项目属性，不将用量当作项目完成度。
 
 圆圈内悬停打开摘要，点击保持详情；再次点击、外部点击或 Esc 收起。标签整个区域可以点击，详情内长内容通过分页查看。圆圈外的胶囊背景与间隙按住拖动，外部透明区域不阻挡鼠标。
 
-顶部横条、右侧竖条、桌面小框和三种视觉样式都从菜单选择。默认处于桌面层；若组件被其他窗口遮住，回到桌面即可看到。选择“退出用量小助手”才会停止后台刷新。
+顶部横条、右侧竖条和三种视觉样式都从菜单选择。两种胶囊可同时开启，点击项目图标展开详情卡片。默认处于桌面层；若组件被其他窗口遮住，回到桌面即可看到。选择“退出用量小助手”才会停止后台刷新。
 
-本机统计约每 60 秒刷新，Notion 同步在启用后约每 5 分钟独立运行。官方额度需要本机已安装并登录官方 Codex CLI 或桌面应用；接口不可用时保持未知或显示有标记的旧缓存，不影响本地 Token 扫描。
+本机统计约每 60 秒刷新，Markdown 账本摘要在启用后约每 5 分钟独立发布；管理资料直接读取本地文件。官方额度需要本机已安装并登录官方 Codex CLI 或桌面应用；接口不可用时保持未知或显示有标记的旧缓存，不影响本地 Token 扫描。
 
 详见 [桌面组件文档](widget/README.md)。
 
-## 连接自己的 Notion（可选）
+## 接入现有 Markdown / Obsidian 管理库
 
-1. 在自己的 Notion 工作区准备一个父页面，并创建可读取、插入、更新内容的内部连接。
-2. 将父页面共享给该连接。
-3. 打开 **“项目与 Notion 设置…”**，开启 Notion 同步，填入连接 Token 与父页面链接，再初始化项目工作台。
-4. 为项目设置 emoji 或 HTTPS Logo；选择“绑定已有项目”，或使用下面的 Skill 导入一个项目。
+本机当前分工如下；路径可以在设置中核对：
 
-凭据默认保存在本机 macOS Keychain 的专用项。也可在设置中明确选择自己的 Pages 密钥文件作为来源；不会搜索其他文件，不上传整个文件，也不保存明文 Token 副本。**不要把 Token 发到聊天、写入项目清单或提交到 GitHub。**
+| 内容 | 位置 |
+| --- | --- |
+| 唯一源码维护入口、计量数据库与发布程序 | `用量小助手/codex-usage-scanner/` |
+| 人看的管理资料 | `~/Documents/项目管理obsidian/` |
+| 沿用的统一规则、模板与已安装 Skill 参考资料 | `~/Documents/项目管理系统/规则/`、`模板/` |
 
-Notion 工作台包含五部分：项目愿景、待人工确认、当前进展与下一步、历史开发记录、Token 投入。当前进展需要关联可核查的正式产出。AI 负责在你调用 Skill 时整理和维护；桌面后台只读取管理状态与同步已计量摘要，**不会持续读代码、自行判断完成情况或自动改写项目目标**。
+从菜单打开“项目与 Markdown 设置…”，选择已有管理库，按项目固定 ID 绑定本机文件夹。已有项目卡直接读取，不因名称相同重建身份；无法确定的旧 Notion 对应关系保持未绑定，需核实后再连。绑定只改变项目关联，不修改 Token 计量。
 
-双向数据流为：
-
-```text
-Notion 项目状态、目标、图标、进度、人工事项 → 本机胶囊
-本机已计量的项目每日 Token 摘要             → Notion 账本
-```
-
-关闭 Notion 同步后，本地扫描继续；已有工作台不会被删除。日常同步只处理变化摘要，额度高频观测留在本机，不为每次刷新新建一页。详细字段、重试和周期配置见 [Notion 说明](docs/notion.md)、[项目管理说明](docs/project-management.md)。
-
-## 安装 Skill，并用于其他项目
-
-仓库包含可复用的 **`notion-project-workbench`** Skill。它不是克隆仓库后自动安装，需要复制到自己的 Codex Skill 目录。
-
-在本仓库根目录执行：
+项目卡保存目标、人工事项和目前要做的事；任务、反馈、历史与成果引用保存在项目子目录。成果保留真实工程路径、版本或 HTTPS 地址，原文件继续留在各自工程，不复制进管理库。Obsidian 是笔记展示工具，计量和 Markdown 读取不要求它持续运行；打开 `obsidian://` 入口需要本机安装 Obsidian。
 
 ```sh
-TASK_SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
-mkdir -p "$TASK_SKILLS_DIR"
-if [ -e "$TASK_SKILLS_DIR/notion-project-workbench" ]; then
-  printf '%s\n' '已有同名 Skill：请先备份并移走旧目录，再运行复制命令。'
-else
-  cp -R skills/notion-project-workbench "$TASK_SKILLS_DIR/"
-fi
+./pm --help
+./pm check
+./pm overview
+./pm new-project --help
+./pm register-artifact --help
 ```
 
-如果目标位置已有自己修改过的同名 Skill，先备份，再复制新版。复制后重新打开 Codex 项目或重启客户端，使其发现新技能。
+`./pm` 使用当前工程的 Python 与数据目录，默认读取中央管理库。`PROJECT_PM_VAULT` 可显式选择其他库；不设置时不创建新库。命令提供 `new-project`、`add-task`、`register-artifact`、`record-event`、`submit-feedback`、`apply-feedback`、`export` 等操作，先查看各命令帮助再使用。检查和总览不会创建项目。已有资料按固定 ID、版本和摘要核对，项目改名保留身份。
 
-然后在任意**要管理的项目**里打开 Codex，直接说：
+AI 管理继续使用现有 **`obsidian-project-manager`** Skill；可复用的仓库版见 [Skill 入口](skills/obsidian-project-manager/SKILL.md)。让 AI 读取中央规则及对应项目卡，再调用**当前工程的 `./pm`**；旧 Skill 若仍指向“项目管理系统”内的程序，需要将程序入口更新为当前工程，规则、模板和中央管理库继续共用。`PROJECT_PM_RULES_ROOT` 可显式指定中央规则目录。不要同时维护两份程序。Skill 按调用执行，后台不自行改变目标、批准验收或开始开发。
 
-> 用 $notion-project-workbench 整理当前项目。先检查 Notion 是否已有工作台，有则复用并更新，没有再创建；保留已有人工内容和历史。根据实际文档和产出整理愿景、当前目标、下一步、人工事项、重要历史和 Token 投入，并绑定用量小助手。用量小助手源码位于我指定的安装目录。
+仓库版 Skill 不会自动覆盖已安装版本。需要安装或更新时，将 `skills/obsidian-project-manager` 复制到自己的 Codex Skill 目录；已有同名目录先检查并备份，保留个人修改。重新打开 Codex 后使用：
 
-首次调用时告诉它用量小助手的实际源码目录；本机导入需要使用同一份 `widget/data`，以复用应用的连接与绑定。不要把其他项目的当前目录误当成扫描器目录。
+> 用 $obsidian-project-manager 整理当前项目，复用已有中央管理库，使用用量小助手当前工程的 pm，保留固定项目身份、人工正文与历史；核验成果入口和胶囊绑定。
 
-Skill 会先核查项目事实，生成 `project-import.json` 并验证产出；已有管理主页就在其中复用／创建项目，没有时在已授权父页面下建立“项目管理”。也可在原生设置的 **“一键导入已有项目”**中选择清单与项目文件夹执行。
+### 迁移与发布原则
 
-### 已有工作台会重复创建吗？
+本次逐模块复用“项目管理系统”的 Markdown 读取、项目关联、成果入口、设置与测试。后续源码只在当前工程维护；参考目录保留规则、模板和历史实现供核对；迁移后的参考 `pm` 转发到当前工程，旧调用入口不再分叉维护。不要直接启动旧 `.app` 或旧计量脚本发布同一管理库。
 
-| 情况 | 行为 |
-| --- | --- |
-| 本机文件夹已经绑定 Notion 页面 | 复用原页面，维护当前状态、目标、进度和正式产出 |
-| Notion 已有项目，但尚未绑定 | 先核对已有页面身份并建立绑定，再更新 |
-| 确实不存在该项目 | 新建工作台并绑定 |
+当前工程原有 `widget/data` 是历史计量、来源身份和项目关联的依据，**不以副本运行数据替换**。已有 Markdown 项目保留固定 ID 和人工正文；相同固定账本键使用绝对数值更新，不重复累加。唯一账本发布入口是当前工程的 `widget/widget_backend.py --sync-markdown`。周、月和每日是同批记录的不同视图，不能再相加。
 
-**不会凭项目同名自动认领页面。** 已有工作台位于其他数据库，或尚未绑定时，需要先确认目标页面；跳过这一步直接创建仍可能造成重复。程序依靠稳定的本机文件夹身份和 Notion 页面 ID，不能仅凭名称保证全局去重。
+旧 Notion 集成代码、凭据读取器、同步器和项目 Skill 已移除。旧云端页面与本机迁移审计资料保留；迁移工具只核对旧项目绑定，不读取凭据或请求云端接口。详细约定见 [本地项目管理](docs/project-management.md)。
 
-已有正文、人工内容、原生视图和历史保留；当前管理信息按本次核实结果更新。开发历史追加事件，已完成任务不删除。相同清单重试会复用稳定键；Notion 没有数据库唯一约束，创建结果不确定或发现重复键时暂停确认，不能宣称并发操作绝不会重复。
+### 可选本机只读接口
 
-Skill 调用本身需要可写的 Notion 授权。本机后台连接与聊天里的 Notion 连接器相互独立，连接器授权不能直接交给桌面进程。只完成 Notion 写入、没有本机绑定，不算胶囊已接入。导入项目也不改变任何真实 Token 总数。
+胶囊直接读取 Markdown，无需先启动 HTTP 服务。确有其他本机程序需要观察数据时，可显式启动／停止只读接口：
 
-可复制的格式示例见 [project-import.json](examples/project-import.json)，请先替换为真实项目事实。完整流程和 `--dry-run` 验证方式见 [Skill](skills/notion-project-workbench/SKILL.md)及[导入说明](skills/notion-project-workbench/references/import.md)。
+```sh
+sh 启动数据接口.command
+sh 停止数据接口.command
+```
+
+默认只监听 `127.0.0.1:8766`；没有远程访问、任意文件下载或写入接口。不安装开机服务，也不自动启动 AI。
 
 ## 只使用命令行扫描器
 
-扫描器在 Python 3.10+ 的 macOS、Linux、Windows 上运行，不需要 Swift、桌面应用或 Notion。
+扫描器在 Python 3.10+ 的 macOS、Linux、Windows 上运行，不需要 Swift、桌面应用或项目管理库。
 
 ```sh
 # 查看参数；最近滚动 7 天按项目汇总
@@ -223,7 +210,7 @@ macOS／Linux 也可运行 `sh setup.sh --cli-only` 只建立扫描环境，然�
 
 同仓库 worktree 默认合并。归档副本、重复响应、fork 继承、历史重写和新旧格式混合有去重／基线处理；无法确认的旧历史保持估算或跳过并警告。`coverage`、`warnings` 用于区分“没有用量”和“没有完整识别记录”。
 
-胶囊显示前四项目和“其他”只改变呈现，不改变总量。本周任务数是**全部有用量文件夹**的数量，不是可见图标数；占比以全部本机已记录 Token 为分母。桌面小框仍保留“低于 5% 合并到其他”的分组。
+胶囊显示前四项目和“其他”只改变呈现，不改变总量。本周任务数是**全部有用量文件夹**的数量，不是可见图标数；占比以全部本机已记录 Token 为分母。
 
 具体处理与边界见 [统计说明](docs/statistics.md)。
 
@@ -246,17 +233,17 @@ macOS／Linux 也可运行 `sh setup.sh --cli-only` 只建立扫描环境，然�
 
 例如累计 140% 对应约 $7；某项目占 50% 对应约 $3.50。这是订阅投入的估算分摊，**不是官方 Token 单价、真实扣款、API 账单或超额收费**。不能从 Token 数倒推出剩余官方额度，也不假设订阅每周固定包含多少 Token。
 
-周期核算菜单可填写自己的续费锚点。未知时月账期保持待配置；只知道日期时使用上海时间当天 00:00，标为日期精度估算。周、月重新分组同一批计量事件，不能再相加。已配置的 Notion 周／月账本可同步摘要；不会因导入项目自动新增独立额度页面。见 [周期核算说明](docs/period-proposal.md)。
+周期核算菜单可填写自己的续费锚点。未知时月账期保持待配置；只知道日期时使用上海时间当天 00:00，标为日期精度估算。周、月重新分组同一批计量事件，不能再相加。周／月摘要可发布到中央库的账本目录；高频观测继续保存在本机数据库，按需才导出额度窗口。见 [周期核算说明](docs/period-proposal.md)。
 
 ## 数据与隐私
 
 - 日志扫描在本机执行，不修改 Codex 会话，不直接读取 `auth.json` 或认证环境变量。
 - 报告不包含提示词、代码、回复或工具输出，但可能包含私人目录、会话 ID；请自行检查后再分享。
-- Notion 仅同步已授权的项目管理信息、绑定项目的每日用量摘要，以及已配置周期账本的计数与简短项目／模型汇总；不上传原始日志、源码、绝对本机路径、会话／响应 ID 或密钥。
+- 项目管理与可读账本在本机 Markdown 文件中维护；不上传原始日志、源码、对话或密钥。成果引用可包含私人本机路径，分享笔记前自行检查。
 - `widget/data/` 保存本机缓存、项目身份、绑定、额度历史与设置；`.venv/`、构建产物、`validation/` 和本地密钥文件均被 Git 忽略，不属于公开源码。
 - 重复扫描以绝对摘要替换原数值，不把多次扫描相加；多设备重复日志合并尚未支持。
 
-分享源码时不要把自己的 `widget/data`、真实报告、Codex 目录或密钥一起打包。删除本机数据会丢失绑定、累计观测与匿名来源身份；备份后再操作，避免重新同步产生另一套来源摘要。
+分享源码时不要把自己的 `widget/data`、真实报告、Codex 目录或密钥一起打包。删除本机数据会丢失绑定、累计观测与匿名来源身份；备份后再操作，避免重新发布产生另一套来源摘要。
 
 ## 演示与开发检查
 
@@ -272,9 +259,10 @@ Python 检查使用临时模拟日志、临时 Git 仓库和隔离 API 模拟服
 
 ```sh
 .venv/bin/python3 -m unittest -v test_codex_usage.py widget/test_widget_backend.py \
-  widget/test_project_store.py widget/test_notion_sync.py widget/test_notion_credentials.py \
+  widget/test_project_store.py widget/test_markdown_store.py widget/test_management_workflow.py \
+  widget/test_markdown_migration.py widget/test_publication_identity.py \
   widget/test_period_accounting.py widget/test_period_backend.py \
-  widget/test_quota_accounting.py widget/test_period_notion.py widget/test_project_import.py
+  widget/test_quota_accounting.py widget/test_project_import.py
 ```
 
 Swift 数据与交互检查（需要上述开发工具）：
@@ -282,14 +270,14 @@ Swift 数据与交互检查（需要上述开发工具）：
 ```sh
 mkdir -p widget/build/module-cache
 xcrun swiftc -parse-as-library -swift-version 5 -D WIDGET_CHECKS \
-  widget/UsageWidget.swift widget/UsageStrip.swift widget/NotionSettings.swift widget/test_strip.swift \
-  -o widget/build/strip-checks -framework AppKit -framework SwiftUI -framework Security \
+  widget/UsageWidget.swift widget/UsageStrip.swift widget/ProjectSettings.swift widget/test_strip.swift \
+  -o widget/build/strip-checks -framework AppKit -framework SwiftUI \
   -module-cache-path widget/build/module-cache
 widget/build/strip-checks
 
 xcrun swiftc -parse-as-library -swift-version 5 -D WIDGET_CHECKS \
-  widget/UsageWidget.swift widget/UsageStrip.swift widget/NotionSettings.swift widget/test_period_settings.swift \
-  -o widget/build/period-settings-checks -framework AppKit -framework SwiftUI -framework Security \
+  widget/UsageWidget.swift widget/UsageStrip.swift widget/ProjectSettings.swift widget/test_period_settings.swift \
+  -o widget/build/period-settings-checks -framework AppKit -framework SwiftUI \
   -module-cache-path widget/build/module-cache
 widget/build/period-settings-checks
 ```
@@ -300,7 +288,7 @@ HTML 事件路径回归检查需要 Node.js：
 node widget/test_preview_events.cjs
 ```
 
-测试通过只说明这些用例覆盖的行为，不能替代自己机器上的真实日志和 Notion 连接验证。
+测试通过只说明这些用例覆盖的行为，不能替代自己机器上的真实日志、项目绑定和成果入口验证。
 
 如需自行制作源码包，在 Git 检出目录提交所需改动后运行：
 
@@ -315,25 +303,25 @@ sh scripts/package-source.sh HEAD
 ```text
 codex_usage.py                 跨平台日志扫描器
 test_codex_usage.py            扫描器测试
-widget/UsageWidget.swift       macOS 应用与桌面小框
+widget/UsageWidget.swift       macOS 应用生命周期与共享数据模型
 widget/UsageStrip.swift        胶囊、详情卡与交互
-widget/NotionSettings.swift    原生设置和凭据入口
+widget/ProjectSettings.swift   原生 Markdown、项目与周期设置
 widget/widget_backend.py       本周归集、官方额度与同步入口
 widget/project_import.py       项目清单验证、导入与绑定
-widget/notion_sync.py          Notion 管理状态与项目日摘要同步
+widget/markdown_store.py       Markdown 读取、固定身份绑定与账本投影
+widget/project_manager.py      AI 项目管理命令
+widget/management_api.py       可选本机只读观察接口
 widget/project_store.py        稳定项目身份与每日事实
 widget/period_accounting.py    自然周与会员月的事件核算
 widget/quota_accounting.py     额度观测与质量判断
-widget/period_notion.py        已配置周期账本同步
-skills/notion-project-workbench/  可安装的项目管理 Skill
+pm                            当前工程的项目管理入口
 ```
 
 - [桌面组件文档](widget/README.md)
 - [完整统计口径](docs/statistics.md)
-- [Notion 连接与同步](docs/notion.md)
 - [项目管理结构](docs/project-management.md)
+- [Markdown 项目管理 Skill](skills/obsidian-project-manager/SKILL.md)
 - [周期核算规则](docs/period-proposal.md)
-- [Skill 与导入流程](skills/notion-project-workbench/SKILL.md)
 - [第三方资产说明](THIRD_PARTY_NOTICES.md)
 
 ## 许可
@@ -344,4 +332,4 @@ skills/notion-project-workbench/  可安装的项目管理 Skill
 
 只支持 Codex；不能恢复删除的日志，也不覆盖其他设备、其他系统用户或云端任务的完整消费。日志格式和官方接口变化可能需要适配；旧累计格式始终有估算边界。
 
-桌面组件目前以本地构建运行，尚未提供签名公证的独立安装包。macOS 26 的原生玻璃效果、多屏切换和所有桌面鼠标场景仍需要更多实机验证。项目管理 Skill 按调用执行，没有默认持续运行的 AI 项目经理；Notion 连接是可选项，本机模式可独立使用。
+桌面组件目前以本地构建运行，尚未提供签名公证的独立安装包。macOS 26 的原生玻璃效果、多屏切换和所有桌面鼠标场景仍需要更多实机验证。项目管理 Skill 按调用执行，没有默认持续运行的 AI 项目经理。Markdown 的固定属性子集、成果引用和有限只读 API 均有边界，见管理说明。

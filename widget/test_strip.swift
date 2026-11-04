@@ -27,34 +27,144 @@ struct StripChecks {
         let temporaryRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: temporaryRoot) }
         let local = UsageModel(root: temporaryRoot)
-        check(!local.notionEnabled, "未配置时默认本机模式")
+        check(local.managementEnabled, "未配置时默认开启本地 Markdown 项目管理")
+        local.setManagementEnabled(false)
         check(local.widgetStyle == .glass, "未配置外观时使用系统玻璃材质")
-        local.syncNotion(force: true)
-        check(!local.notionSyncing && local.notionSyncMessage?.contains("本机模式") == true, "手动强制同步在本机模式也不会启动进程")
+        local.syncManagement(force: true)
+        check(!local.managementSyncing && local.managementSyncMessage?.contains("仅计量模式") == true, "手动强制同步在本机模式也不会启动进程")
         let disabledSettings = ProjectSettingsModel(usage: local)
-        disabledSettings.perform(["command": "setup", "parent_page": "fixture"])
-        check(!disabledSettings.busy && disabledSettings.message.contains("本机模式"), "本机模式不能从设置绕过连接开关")
-        local.setNotionEnabled(true)
+        disabledSettings.perform(["command": "setup", "vault_path": "/tmp/fixture"])
+        check(!disabledSettings.busy && disabledSettings.message.contains("仅计量模式"), "本机模式不能从设置绕过连接开关")
+        local.setManagementEnabled(true)
         try WidgetPreferences.update(root: temporaryRoot, values: ["task_root": "/tmp/example", "future_setting": "keep"])
         let reloaded = UsageModel(root: temporaryRoot)
-        check(reloaded.notionEnabled, "启用同步后设置持久化，保存项目根目录不会抹掉开关")
-        reloaded.setNotionEnabled(false)
+        check(reloaded.managementEnabled, "启用同步后设置持久化，保存项目根目录不会抹掉开关")
+        reloaded.setManagementEnabled(false)
         reloaded.setWidgetStyle(.pulse)
         check(UsageModel(root: temporaryRoot).widgetStyle == .pulse, "原生外观选择持久化，重启后保留 Pulse 暗色")
         let preferences = try WidgetPreferences.read(root: temporaryRoot)
         check(preferences["task_root"] as? String == "/tmp/example" && preferences["future_setting"] as? String == "keep", "关闭同步保留目录及其他本地设置")
-        check(!UsageModel(root: temporaryRoot).notionEnabled, "重启后保留本机模式")
+        check(!UsageModel(root: temporaryRoot).managementEnabled, "重启后保留本机模式")
         let invalidValues: [Any] = [1, "true", NSNull()]
-        check(invalidValues.allSatisfy { !WidgetPreferences.notionEnabled(in: ["notion_sync_enabled": $0]) }, "数值或字符串不能被误当成同步授权")
+        check(invalidValues.allSatisfy { !WidgetPreferences.managementEnabled(in: ["management_enabled": $0]) }, "数值或字符串不能被误当成同步授权")
         let settingsFile = temporaryRoot.appendingPathComponent("widget/data/app-settings.json")
         let broken = Data("[]".utf8)
         try broken.write(to: settingsFile)
         let brokenModel = UsageModel(root: temporaryRoot)
-        brokenModel.setNotionEnabled(true)
-        check(!brokenModel.notionEnabled && (try? Data(contentsOf: settingsFile)) == broken, "设置损坏时不覆盖原文件或启用同步")
+        brokenModel.setManagementEnabled(true)
+        check(!brokenModel.managementEnabled && (try? Data(contentsOf: settingsFile)) == broken, "设置损坏时不覆盖原文件或启用同步")
         brokenModel.setWidgetStyle(.white)
         check(brokenModel.widgetStyle == .glass && (try? Data(contentsOf: settingsFile)) == broken, "损坏设置不能因换主题被覆盖")
 
+        check(WidgetKind.allCases == [.horizontal, .vertical], "展示与右键菜单的数据源只剩横条和竖条")
+        let displayFile = temporaryRoot.appendingPathComponent("widget/data/display-settings.json")
+        for (raw, expected) in [("[\"vertical\",\"box\"]", Set<WidgetKind>([.vertical])),
+                                ("[\"horizontal\",\"vertical\",\"box\"]", [.horizontal, .vertical]),
+                                ("[\"box\"]", [.horizontal]), ("[]", []),
+                                ("[\"future-widget\",\"vertical\"]", [.vertical])] {
+            try Data(raw.utf8).write(to: displayFile)
+            let restored = UsageModel(root: temporaryRoot)
+            check(restored.enabledWidgets == expected, "旧展示设置迁移不丢失有效开关：\(raw)")
+            let saved = try JSONDecoder().decode(Set<String>.self, from: Data(contentsOf: displayFile))
+            check(saved == Set(expected.map(\.rawValue)), "保存的展示设置不再包含已退役窗口：\(raw)")
+        }
+        let invalidDisplay = Data("{broken".utf8)
+        try invalidDisplay.write(to: displayFile)
+        let fallbackDisplay = UsageModel(root: temporaryRoot).enabledWidgets
+        let preservedDisplay = try Data(contentsOf: displayFile)
+        check(fallbackDisplay == [.horizontal] && preservedDisplay == invalidDisplay,
+              "损坏展示设置安全回退横条且不覆盖原文件")
+        try WidgetDisplayPreferences.save([], root: temporaryRoot)
+        let hidden = UsageModel(root: temporaryRoot)
+        var visibilityChanges = 0
+        hidden.onVisibility = { visibilityChanges += 1 }
+        hidden.toggleWidget(.vertical)
+        check(UsageModel(root: temporaryRoot).enabledWidgets == [.vertical] && visibilityChanges == 1,
+              "隐藏全部后仍可独立开启竖条并保存")
+        hidden.toggleWidget(.horizontal)
+        check(UsageModel(root: temporaryRoot).enabledWidgets == [.horizontal, .vertical] && visibilityChanges == 2,
+              "两个胶囊可同时开启并通知窗口刷新")
+        hidden.toggleWidget(.vertical); hidden.toggleWidget(.horizontal)
+        check(UsageModel(root: temporaryRoot).enabledWidgets.isEmpty,
+              "关闭所有胶囊不会因退役窗口迁移而重新显示")
+        let positionsFile = temporaryRoot.appendingPathComponent("widget/data/positions.json")
+        let oldPositions = ["horizontal": ["x": 0.2, "anchor_top": 0.4],
+                            "vertical": ["x": 0.8, "anchor_top": 0.1],
+                            "box": ["x": 0.5], "future-widget": ["x": 0.3]]
+        try JSONEncoder().encode(oldPositions).write(to: positionsFile)
+        let positionOwner = AppDelegate(root: temporaryRoot)
+        positionOwner.restorePositions()
+        let savedPositions = try JSONDecoder().decode([String: [String: Double]].self, from: Data(contentsOf: positionsFile))
+        check(savedPositions == oldPositions.filter { ["horizontal", "vertical"].contains($0.key) }
+              && positionOwner.positions == savedPositions,
+              "清理旧窗口位置但完整保留两个胶囊的位置和锚点")
+
+        let publicationError = Data("{\"ok\":false,\"error\":{\"code\":\"publisher_conflict\",\"message\":\"已有其他账本发布程序，请从主工程更新。\",\"details\":\"private-technical-fixture\"}}".utf8)
+        check(ManagementSyncResponse.message(publicationError) == "已有其他账本发布程序，请从主工程更新。",
+              "本地发布失败显示具体公开原因，不展示技术details")
+        check(ManagementSyncResponse.message(Data("not-json".utf8)) == ManagementSyncResponse.fallback,
+              "无法解析发布结果时保留本机记录并显示通用提示")
+        check(WidgetPreferences.managementEnabled(in: [:]), "Markdown 管理缺省启用，无需远端授权")
+        check(invalidValues.allSatisfy { !WidgetPreferences.managementEnabled(in: ["management_enabled": $0]) }, "无效管理开关不被当作布尔值")
+        check(WidgetPreferences.defaultVault(root: URL(fileURLWithPath: "/tmp/任意目录/工程")).path == FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/项目管理obsidian").path, "Vault 默认指向文稿下中央管理库，不随源码嵌套目录改变")
+        let noteURI = "obsidian://open?vault=%E7%AE%A1%E7%90%86%E5%BA%93&file=%E9%A1%B9%E7%9B%AE%2F%E6%97%B6%E4%BB%B7%2F%E9%A1%B9%E7%9B%AE.md"
+        check(ProjectDestination.obsidianURL(noteURI) != nil, "项目可打开编码后的 Obsidian 笔记")
+        check(StripDetailSection.safeOutputURL(noteURI) != nil, "正式产出支持 Obsidian 笔记入口")
+        check(ProjectDestination.obsidianURL("obsidian://open?path=%2Ftmp%2Fvault%2Fnote.md") != nil, "允许打开绝对笔记路径")
+        check(ProjectDestination.obsidianURL("obsidian://open?vault=Vault") != nil, "允许只打开管理库")
+        check(ProjectDestination.obsidianURL("obsidian://new?vault=Vault&file=note.md&overwrite=true") == nil, "查看入口不允许创建或覆盖笔记")
+        check(ProjectDestination.obsidianURL("obsidian://open?vault=Vault&file=note.md&append=changed") == nil, "查看入口不允许附加写入")
+        check(ProjectDestination.obsidianURL("obsidian://open?vault=Vault&file=..%2Fsecret.md") == nil, "相对笔记路径不能越出管理库")
+        check(ProjectDestination.obsidianURL("obsidian://open?vault=Vault&vault=Other&file=note.md") == nil, "重复参数不能产生歧义")
+        check(ProjectDestination.obsidianURL("obsidian://open?vault=Vault&file=note.md%0Acommand") == nil, "URI 解码后拒绝控制字符")
+        check(ProjectDestination.obsidianURL("obsidian://open?path=%2Ftmp%2F..%2Fsecret.md") == nil, "绝对路径不接受上级跳转")
+        check(ProjectDestination.obsidianURL("obsidian://open?vault=Vault&path=%2Ftmp%2Fnote.md") == nil, "两种目标定位方式不能混用")
+        check(StripDetailSection.safeOutputURL("javascript:alert(1)") == nil, "正式产出不开放任意协议")
+        let markdownData = Data("""
+        {"generated_at":"2026-10-24T06:00:00Z","total_tokens":100,"request_records":2,"legacy_updates":0,
+         "tasks":[
+          {"task_id":"folder-a","project_id":"p-shijia-v2","name":"工程A","total_tokens":60,"percent":60,"request_records":1},
+          {"task_id":"folder-b","project_id":"p-shijia-v2","name":"工程B","total_tokens":40,"percent":40,"request_records":1}],
+         "other_tasks":[],"management_projects":[
+          {"task_id":"project:p-shijia-v2","project_id":"p-shijia-v2","task_ids":["folder-a"],"name":"时价","total_tokens":0,"percent":0,"request_records":0,
+           "icon_type":"emoji","icon_value":"⏱️","project_url":"obsidian://open?vault=Vault&file=old.md"},
+          {"task_id":"project:p-shijia-v2-copy","project_id":"p-shijia-v2","task_ids":["folder-b"],"name":"时价改名后","total_tokens":0,"percent":0,"request_records":0,
+           "icon_type":"emoji","icon_value":"⏱️","project_url":"obsidian://open?vault=Vault&file=new.md"}]}
+        """.utf8)
+        let markdownSnapshot = try JSONDecoder().decode(Snapshot.self, from: markdownData)
+        check(StripItem.availableManagedProjects(markdownSnapshot).count == 1, "Markdown 项目改名或移动后按稳定 project_id 去重")
+        let markdownProjects = StripItem.items(markdownSnapshot).filter(\.isProject)
+        check(markdownProjects.count == 1 && markdownProjects[0].detailValue == "100", "同一 Markdown 项目绑定多工程时合并真实用量")
+        check(!StripItem.items(markdownSnapshot).contains { $0.id == "remainder" }, "Markdown 稳定身份匹配后不在其他重复计入")
+        let historicalAssessmentData = Data("""
+        {"generated_at":"2026-10-24T18:00:00Z","total_tokens":100,"request_records":2,"legacy_updates":0,
+         "tasks":[{"task_id":"shijia-folder","name":"时间管理app","total_tokens":100,"percent":100,"request_records":2}],
+         "other_tasks":[],"management_projects":[
+          {"task_id":"project:p-shijia-v2","project_id":"p-shijia-v2","task_ids":["shijia-folder"],"name":"时价",
+           "total_tokens":0,"percent":0,"request_records":0,"icon_type":"emoji","icon_value":"⏱️",
+           "project_status":"开发中","development_progress":58,"progress_source":"ai","last_reviewed":"2026-10-16T08:26:48+08:00",
+           "current_goal":"先核对迁入的 V2 范围，再完成真机复测。","latest_progress_summary":"先核对迁入的 V2 范围，再完成真机复测。",
+           "human_open_tasks":3,"human_blocked_tasks":0,"human_completed_tasks":0}]}
+        """.utf8)
+        let historicalSnapshot = try JSONDecoder().decode(Snapshot.self, from: historicalAssessmentData)
+        var historicalItem = StripItem.items(historicalSnapshot).first(where: \.isProject)!
+        check(historicalItem.progressAssessment == "AI估计 · 2026-10-16", "时价旧评估保留来源与原评估日期，不冒充本次验收")
+        let historicalOverview = StripDetailSection.content(for: historicalItem, locked: true, page: .overview)
+        check(historicalOverview.first(where: { $0.id == "progress" })?.note == "AI估计 · 2026-10-16", "概览进度下显示原评估说明")
+        let historicalHover = StripDetailSection.content(for: historicalItem, locked: false, page: .overview)
+        check(historicalHover.first(where: { $0.id == "progress" })?.note == "AI估计 · 2026-10-16", "悬停摘要同样不遗漏历史评估日期")
+        let historicalActions = StripDetailSection.content(for: historicalItem, locked: true, page: .actions)
+        check(!historicalActions.contains { $0.id == "latest" }, "当前目标和进度记录相同时只展示一次")
+        check(historicalActions.first(where: { $0.id == "manual" })?.label == "人工事项（未完成含准备中）", "人工数量明确包含尚在准备的后续事项")
+        check(historicalActions.first(where: { $0.id == "manual" })?.value == "3 项|0 项|0 项", "文案修正不改变原人工计数语义")
+        check(StripItem.assessmentNote(source: "ai", reviewedAt: nil) == "AI估计 · 评估日期待核对", "旧缓存缺少日期时明确待核对")
+        check(StripItem.assessmentNote(source: "manual", reviewedAt: "2026-10-16") == "人工评估 · 2026-10-16", "人工评估与AI估计来源分开")
+        historicalItem.managementFacts = historicalItem.managementFacts.map {
+            $0.label == "最新产出与进度记录" ? StripFact(label: $0.label, value: "新增真机复测记录，仍有未验证项。") : $0
+        }
+        check(StripDetailSection.content(for: historicalItem, locked: true, page: .actions).contains { $0.id == "latest" }, "与目标不同的新进展继续保留")
+        let provenanceLayout = StripDetailLayout.make(item: historicalItem, locked: true, page: .overview, maxHeight: 400)
+        check(provenanceLayout.maximumPageHeight <= 400, "新增评估说明计入短屏布局预算，不裁切日期")
         _ = NSApplication.shared
         let mainMenu = WidgetApplicationMenu.make()
         let edit = mainMenu.items.first(where: { $0.title == "编辑" })!.submenu!
@@ -77,11 +187,67 @@ struct StripChecks {
             """
             return try JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
         }
+        let cachedLegacy = Data("""
+        {"generated_at":"2026-10-24T06:00:00Z","total_tokens":100,"request_records":2,"legacy_updates":0,
+         "tasks":[],"notion":{"connected":true},"management_projects":[
+          {"task_id":"legacy","name":"旧Notion状态","total_tokens":100,"percent":100,"request_records":2,"development_progress":90,"progress_source":"ai"}]}
+        """.utf8)
+        check(SnapshotCache.decode(cachedLegacy) == nil, "旧Notion展示缓存不冒充Markdown数据，等待当前后端读取")
+        var localCache = try JSONSerialization.jsonObject(with: cachedLegacy) as! [String: Any]
+        localCache.removeValue(forKey: "notion")
+        localCache["management_provider"] = "markdown"
+        let currentCache = try JSONSerialization.data(withJSONObject: localCache)
+        check(SnapshotCache.decode(currentCache)?.total_tokens == 100,
+              "当前Markdown缓存仍可用于启动展示，计量值保留")
+        let usageOnlyCache = Data("{\"generated_at\":\"2026-10-24T06:00:00Z\",\"total_tokens\":100,\"request_records\":2,\"legacy_updates\":0,\"tasks\":[]}".utf8)
+        check(SnapshotCache.decode(usageOnlyCache)?.total_tokens == 100, "纯计量旧缓存继续兼容，不因缺管理字段丢失展示")
+        let enrichedRows: [[String: Any]] = [40, 25, 15, 12, 8].enumerated().map { index, tokens in
+            ["task_id": "folder-\(index)", "name": "工程\(index)", "display_name": "管理名称\(index)",
+             "total_tokens": tokens, "percent": tokens, "request_records": 1,
+             "project_id": "project-\(index)", "project_url": "obsidian://open?vault=Vault&file=\(index).md",
+             "project_status": "开发中", "icon_type": "emoji", "icon_value": "📦", "project_goal": "管理愿景",
+             "current_goal": "当前目标", "next_step": "下一步", "development_progress": 65, "progress_source": "ai",
+             "latest_output_title": "成果", "latest_output_url": "https://example.com/output"]
+        }
+        let enrichedData = try JSONSerialization.data(withJSONObject: ["generated_at":"2026-10-24T06:00:00Z",
+            "total_tokens":100,"request_records":5,"legacy_updates":0,"tasks":enrichedRows])
+        let enrichedSnapshot = try JSONDecoder().decode(Snapshot.self, from: enrichedData)
+        let disabledItems = StripItem.items(enrichedSnapshot, managementEnabled: false)
+        let disabledProjects = disabledItems.filter(\.isProject)
+        check(disabledProjects.map(\.title) == ["工程0", "工程1", "工程2", "工程3"],
+              "关闭管理立即恢复文件夹名称，不等待后端刷新")
+        check(disabledProjects.allSatisfy { $0.managementFacts.isEmpty && $0.projectURL == nil && $0.projectStatus == nil
+            && $0.secondaryRing == nil && $0.developmentProgress == nil && $0.avatar == .symbol("folder")
+            && $0.latestOutputTitle == nil && $0.latestOutputURL == nil },
+              "关闭管理立即隐藏旧管理图标、状态、进度、愿景和成果入口")
+        let disabledRemainder = disabledItems.first { $0.id == "remainder" }!
+        let disabledRemainderContent = StripDetailSection.content(for: disabledRemainder, locked: true, page: .overview)
+        check(disabledRemainder.detailValue == "8" && disabledRemainderContent.last?.label == "工程4"
+            && !disabledRemainderContent.contains { $0.kind == .artifact },
+              "关闭管理时其他任务仍保留真实Token，只去掉管理名称与链接")
+        check(disabledItems[1].detailValue == "100" && disabledProjects.map(\.detailValue) == ["40", "25", "15", "12"],
+              "关闭管理不改变总量、项目计量和排行")
         let fixture = try snapshot("""
         [{"name":"用量小助手","total_tokens":800,"percent":80,"request_records":20,"sessions_count":6},
          {"name":"Codex","total_tokens":200,"percent":20,"request_records":2,"sessions_count":1}]
         """)
         let items = StripItem.items(fixture)
+        let newSnapshot = try JSONDecoder().decode(Snapshot.self, from: Data("""
+        {"generated_at":"2026-10-25T06:00:00Z","total_tokens":1000,"request_records":22,"legacy_updates":0,
+         "tasks":[{"name":"主项目","total_tokens":970,"percent":97,"request_records":20},
+                  {"name":"小项目","total_tokens":30,"percent":3,"request_records":2}]}
+        """.utf8))
+        check(StripItem.items(newSnapshot).filter(\.isProject).count == 2
+              && StripItem.items(newSnapshot).contains { $0.caption == "小项目" },
+              "移除旧小框聚合字段后仍完整显示低用量项目")
+        let legacySnapshot = try snapshot("""
+        [{"name":"主项目","total_tokens":970,"percent":97,"request_records":20},
+         {"name":"其他","total_tokens":30,"percent":3,"request_records":2,"is_other":true}]
+        """, other: """
+        [{"name":"旧缓存小项目","total_tokens":30,"percent":3,"request_records":2}]
+        """)
+        check(StripItem.items(legacySnapshot).contains { $0.caption == "旧缓存小项目" },
+              "升级前的快照仍可恢复小项目，不把旧其他分类重复计入")
         let hitRect = CGRect(x: 10, y: 10, width: 64, height: 400)
         check(pointInCapsule(CGPoint(x: 42, y: 11), rect: hitRect), "竖胶囊顶部中心接收鼠标")
         check(!pointInCapsule(CGPoint(x: 11, y: 11), rect: hitRect), "胶囊圆角的透明部分不接收鼠标")
@@ -260,25 +426,25 @@ struct StripChecks {
         [{"name":"本地文件夹","task_id":"task-stable-001","display_name":"用量小助手：这是一个改名后依然应完整显示的长项目名称",
           "total_tokens":1000,"percent":100,"request_records":22,"sessions_count":6,
           "project_status":"开发中","icon_type":"emoji","icon_value":"📘",
-          "notion_url":"https://www.notion.so/abcdef0123456789abcdef0123456789","notion_stale":true}]
+          "project_url":"obsidian://open?vault=Vault&file=abcdef0123456789abcdef0123456789.md","management_stale":true}]
         """)
         let linkedItem = StripItem.items(linked)[2]
         check(linkedItem.id == "folder:task-stable-001", "项目改名使用稳定任务 ID")
         check(linkedItem.title == linked.tasks[0].display_name && linkedItem.title.count > 20, "长项目名称完整保留，不截断计量身份")
-        check(linkedItem.projectStatus == "开发中" && linkedItem.notionStale, "Notion 状态与离线旧缓存明确区分")
-        check(linkedItem.avatar == .emoji("📘") && linkedItem.notionURL?.contains("notion.so") == true, "使用用户 Notion 头像与项目链接")
+        check(linkedItem.projectStatus == "开发中" && linkedItem.managementStale, "Obsidian 状态与离线旧缓存明确区分")
+        check(linkedItem.avatar == .emoji("📘") && linkedItem.projectURL?.contains("obsidian://open") == true, "使用用户 Obsidian 头像与项目链接")
         check(items[2].avatar == .symbol("folder") && items[2].needsProjectIcon, "未绑定项目只用文件夹图标占位，不用文字首字")
-        check(linkedItem.needsProjectIcon == false, "真实 Notion 图标不提示补充图标")
+        check(linkedItem.needsProjectIcon == false, "真实 Obsidian 图标不提示补充图标")
         check(["🧭", "🎙️", "👩🏽‍💻", "1️⃣"].allSatisfy(StripAvatar.isEmojiIcon), "允许完整用户 emoji 图标，包括变体、肤色和组合图标")
         check(["IP", "用", "1", "🧭🌱", ""].allSatisfy { !StripAvatar.isEmojiIcon($0) }, "错误头像字段不能把项目字母或名称显示在常态胶囊")
         let remote = try snapshot("""
         [{"name":"远程头像","total_tokens":1000,"percent":100,"request_records":22,"icon_type":"external","icon_value":"https://example.com/avatar.png"}]
         """)
-        check(StripItem.items(remote)[2].avatar == .remote("https://example.com/avatar.png"), "支持 Notion HTTPS 项目 Logo")
+        check(StripItem.items(remote)[2].avatar == .remote("https://example.com/avatar.png"), "支持 Obsidian HTTPS 项目 Logo")
         let customAvatar = try snapshot("""
         [{"name":"自定义头像","total_tokens":1000,"percent":100,"request_records":22,"icon_type":"custom_emoji","icon_value":"https://example.com/custom.png"}]
         """)
-        check(StripItem.items(customAvatar)[2].avatar == .remote("https://example.com/custom.png"), "支持 Notion custom_emoji 的 HTTPS 头像")
+        check(StripItem.items(customAvatar)[2].avatar == .remote("https://example.com/custom.png"), "支持 Obsidian custom_emoji 的 HTTPS 头像")
         let unsafe = try snapshot("""
         [{"name":"安全头像","total_tokens":1000,"percent":100,"request_records":22,"icon_type":"external","icon_value":"file:///Users/user/private.png"}]
         """)
@@ -286,7 +452,7 @@ struct StripChecks {
         let rejectedAvatarURLs = ["https://fixture-user:fixture-password@example.com/icon.png", "https://fixture-user@example.com/icon.png", "http://example.com/icon.png", "https://example.com:0/icon.png", "https://example.com:65536/icon.png", "https://example.com/icon name.png", "https://example.com/icon\n.png", "https://", String(repeating: "x", count: 4097)]
         check(rejectedAvatarURLs.allSatisfy { StripAvatar.safeRemoteURL($0) == nil }, "旧缓存头像拒绝凭据、HTTP、非法端口、空白控制字符和超长地址")
         let signedAvatarURL = "https://assets.example.com/icon.png?X-Amz-Signature=fixture&X-Amz-Expires=3600"
-        check(StripAvatar.safeRemoteURL(signedAvatarURL)?.absoluteString == signedAvatarURL, "合法 Notion HTTPS 签名头像完整保留查询参数")
+        check(StripAvatar.safeRemoteURL(signedAvatarURL)?.absoluteString == signedAvatarURL, "合法 Obsidian HTTPS 签名头像完整保留查询参数")
         let userInfoAvatar = try snapshot("""
         [{"name":"旧缓存头像","total_tokens":1000,"percent":100,"request_records":22,"icon_type":"external","icon_value":"https://fixture-user:fixture-password@example.com/icon.png"}]
         """)
@@ -316,7 +482,7 @@ struct StripChecks {
         }
         check(redirected == nil, "头像重定向循环有上限，不无限跳转")
         disabledSettings.createEmoji = "IP"
-        check(disabledSettings.newProjectIcon == nil, "创建项目时不能以字母冒充 Notion 头像")
+        check(disabledSettings.newProjectIcon == nil, "创建项目时不能以字母冒充 Obsidian 头像")
         disabledSettings.createEmoji = "👩🏽‍💻"
         check(disabledSettings.newProjectIcon?["emoji"] as? String == "👩🏽‍💻", "创建项目可明确选择组合 emoji 头像")
         disabledSettings.createIconMode = "external"
@@ -326,7 +492,7 @@ struct StripChecks {
         check(disabledSettings.newProjectIcon?["type"] as? String == "external", "创建项目支持有效 HTTPS Logo，无需联网即可校验")
         let managed = try snapshot("""
         [{"name":"管理项目","total_tokens":1000,"percent":100,"request_records":22,"sessions_count":6,
-          "icon_type":"emoji","icon_value":"🧭","notion_url":"https://www.notion.so/abcdef0123456789abcdef0123456789",
+          "icon_type":"emoji","icon_value":"🧭","project_url":"obsidian://open?vault=Vault&file=abcdef0123456789abcdef0123456789.md",
           "project_status":"开发中","project_health":"顺利","weekly_goal":"旧目标","current_goal":"完成胶囊字段审阅，并核验正式产出链接。",
           "next_step":"确认界面后开发原生组件。","project_goal":"项目进度和投入随时可见。",
           "open_tasks":33,"blocked_tasks":11,"completed_tasks":55,"human_open_tasks":2,"human_blocked_tasks":0,"human_completed_tasks":15,
@@ -349,22 +515,23 @@ struct StripChecks {
         check(investmentSections.map(\.label) == ["本周 Token", "今日 Token", "本周占比", "估算投入"] && investmentSections.allSatisfy { $0.kind == .row }, "项目投入统一四行，去掉格子和冗余解释")
         check(investmentSections[1].value == "200" && investmentSections[3].value == "≈$7.00", "今日真实Token与订阅分摊估算金额分别展示")
         let sparse = StripDetailSection.content(for: items[2], locked: true, page: .actions)
-        check(sparse[1].value == "—|—|—" && sparse[2].value == "—", "未取得人工任务和正式产出保持未知")
+        check(sparse.first(where: { $0.id == "manual" })?.value == "—|—|—"
+              && !sparse.contains { $0.id == "latest" || $0.id == "output" }, "未取得人工任务保持未知，不显示空白进展或虚构产出")
         let managementOnly = try JSONDecoder().decode(Snapshot.self, from: Data("""
         {"generated_at":"2026-10-13T06:00:00Z","total_tokens":1000,"request_records":22,"legacy_updates":0,
          "tasks":[{"name":"真实耗费","total_tokens":1000,"percent":100,"request_records":22}],"other_tasks":[],
-         "management_projects":[{"name":"未关联Notion项目","task_id":"notion-1","total_tokens":0,"percent":0,"request_records":0,"usage_linked":false,"notion_url":"https://www.notion.so/zero-project"}]}
+         "management_projects":[{"name":"未关联Obsidian项目","task_id":"project-1","total_tokens":0,"percent":0,"request_records":0,"usage_linked":false,"project_url":"obsidian://open?vault=Vault&file=zero-project.md"}]}
         """.utf8))
         let managedZero = StripItem.items(managementOnly)[2]
-        check(managedZero.title == "未关联Notion项目" && managedZero.detailValue == "0" && !managedZero.usageLinked,
+        check(managedZero.title == "未关联Obsidian项目" && managedZero.detailValue == "0" && !managedZero.usageLinked,
               "零用量管理项目填入项目位，不采用管理缓存伪用量")
         check(StripItem.items(managementOnly)[1].facts.first { $0.label == "任务数量" }?.value == "1 个",
               "展示零用量管理项目不增加真实文件夹任务数")
         let zeroOther = StripItem.items(managementOnly).last!
         check(zeroOther.id == "remainder" && zeroOther.members.map(\.name) == ["真实耗费"] && zeroOther.detailValue == "1.0K",
               "未纳入管理的正用量目录进入其他，用量不会丢失")
-        check(managedZero.notionURL == "https://www.notion.so/zero-project",
-              "零用量项目仍可打开Notion工作台")
+        check(managedZero.projectURL == "obsidian://open?vault=Vault&file=zero-project.md",
+              "零用量项目仍可打开Obsidian工作台")
         let allUsage = try JSONDecoder().decode(Snapshot.self, from: Data("""
         {"generated_at":"2026-10-13T06:00:00Z","total_tokens":1000,"request_records":22,"legacy_updates":0,"task_count":6,
          "tasks":[{"name":"旧缓存主项目","total_tokens":1000,"percent":100,"request_records":22}],"other_tasks":[],
@@ -442,7 +609,7 @@ struct StripChecks {
             let layout = StripDetailLayout.make(item: longerActionItem, locked: true, page: .actions, sectionPage: page)
             return layout.height <= 520 && layout.contentWidth == reviewContentWidth
         }, "长内容每页把标题标签、间距、分页和项目入口都计入520高度预算")
-        check(StripItem.statusLabel("正常") == "顺利" && StripItem.statusLabel("阻塞") == "遇到卡点" && StripItem.statusLabel("有风险") == "有风险" && StripItem.statusLabel("开发中") == "开发中", "Notion健康词归一而开发中不冒充顺利")
+        check(StripItem.statusLabel("正常") == "顺利" && StripItem.statusLabel("阻塞") == "遇到卡点" && StripItem.statusLabel("有风险") == "有风险" && StripItem.statusLabel("开发中") == "开发中", "Obsidian健康词归一而开发中不冒充顺利")
         let explicitUnknown = try JSONDecoder().decode(Snapshot.self, from: Data("""
         {"generated_at":"2026-10-13T06:00:00Z","total_tokens":1000,"request_records":22,"legacy_updates":0,
          "estimated_cost_status":"unavailable","tasks":[],"other_tasks":[],
@@ -452,25 +619,25 @@ struct StripChecks {
         let dedupManaged = try JSONDecoder().decode(Snapshot.self, from: Data("""
         {"generated_at":"2026-10-13T06:00:00Z","total_tokens":1000,"request_records":22,"legacy_updates":0,
          "tasks":[{"task_id":"localA","name":"本地项目","total_tokens":1000,"percent":100,"request_records":22}],"other_tasks":[],
-         "management_projects":[{"task_id":"notion:page1","task_ids":["localA"],"name":"已关联项目","total_tokens":0,"percent":0,"request_records":0,"notion_url":"https://www.notion.so/page1"}]}
+         "management_projects":[{"task_id":"project:page1","task_ids":["localA"],"name":"已关联项目","total_tokens":0,"percent":0,"request_records":0,"project_url":"obsidian://open?vault=Vault&file=page1.md"}]}
         """.utf8))
-        check(!StripItem.items(dedupManaged).contains { $0.id == "remainder" }, "已绑定正用量folder的Notion管理页不在其他重复出现")
+        check(!StripItem.items(dedupManaged).contains { $0.id == "remainder" }, "已绑定正用量folder的Obsidian管理页不在其他重复出现")
 
         let pinSnapshot = try JSONDecoder().decode(Snapshot.self, from: Data("""
         {"generated_at":"2026-10-15T06:00:00Z","total_tokens":1000,"request_records":25,"legacy_updates":0,"task_count":5,
          "tasks":[],"other_tasks":[],"all_usage_tasks":[
-          {"task_id":"liveA","name":"用量A","total_tokens":600,"percent":60,"request_records":10,"today_tokens":150,"notion_url":"https://app.notion.com/p/0123456789abcdef0123456789abcdef"},
+          {"task_id":"liveA","name":"用量A","total_tokens":600,"percent":60,"request_records":10,"today_tokens":150,"project_url":"obsidian://open?vault=Vault&file=0123456789abcdef0123456789abcdef.md"},
           {"task_id":"liveB","name":"用量B","total_tokens":200,"percent":20,"request_records":6},
           {"task_id":"liveC","name":"用量C","total_tokens":100,"percent":10,"request_records":4},
           {"task_id":"liveD","name":"用量D","total_tokens":60,"percent":6,"request_records":3},
           {"task_id":"liveE","name":"用量E","total_tokens":40,"percent":4,"request_records":2}],
          "management_projects":[
-          {"task_id":"notion:cold1","name":"播客","total_tokens":999,"percent":99,"request_records":99,"usage_linked":false,"icon_type":"emoji","icon_value":"🎧","project_goal":"完成播客收藏工具","current_goal":"核验导入","next_step":"跑通收藏","development_progress":35,"progress_source":"ai"},
-          {"task_id":"notion:cold2","name":"问题单","total_tokens":0,"percent":0,"request_records":0},
-          {"task_id":"notion:cold3","name":"时间管理","total_tokens":0,"percent":0,"request_records":0},
-          {"task_id":"notion:liveA","task_ids":["liveA"],"name":"已绑定A","total_tokens":0,"percent":0,"request_records":0,"notion_url":"https://www.notion.so/0123456789abcdef0123456789abcdef"},
-          {"task_id":"notion:archived","name":"已归档","project_status":"归档","total_tokens":0,"percent":0,"request_records":0},
-          {"task_id":"notion:archived-old","name":"旧归档","project_status":"已归档","total_tokens":0,"percent":0,"request_records":0}]}
+          {"task_id":"project:cold1","name":"播客","total_tokens":999,"percent":99,"request_records":99,"usage_linked":false,"icon_type":"emoji","icon_value":"🎧","project_goal":"完成播客收藏工具","current_goal":"核验导入","next_step":"跑通收藏","development_progress":35,"progress_source":"ai"},
+          {"task_id":"project:cold2","name":"问题单","total_tokens":0,"percent":0,"request_records":0},
+          {"task_id":"project:cold3","name":"时间管理","total_tokens":0,"percent":0,"request_records":0},
+          {"task_id":"project:liveA","task_ids":["liveA"],"name":"已绑定A","total_tokens":0,"percent":0,"request_records":0,"project_url":"obsidian://open?vault=Vault&file=0123456789abcdef0123456789abcdef.md"},
+          {"task_id":"project:archived","name":"已归档","project_status":"归档","total_tokens":0,"percent":0,"request_records":0},
+          {"task_id":"project:archived-old","name":"旧归档","project_status":"已归档","total_tokens":0,"percent":0,"request_records":0}]}
         """.utf8))
         let dynamicItems = StripItem.items(pinSnapshot)
         check(dynamicItems.prefix(2).map(\.id) == ["quota", "total"], "前两个入口固定为Codex账号和本期Token")
@@ -489,16 +656,16 @@ struct StripChecks {
               "零用量管理项目拥有独立悬停摘要与完整项目详情")
         check(StripDetailSection.content(for: zeroProject, locked: true, page: .actions).first { $0.id == "goal" }?.value == "核验导入" && StripDetailSection.content(for: zeroProject, locked: true, page: .investment).first?.value == "0",
               "零用量项目的行动与投入页保持真实可用")
-        check(dynamicItems.filter(\.isProject).first?.id == "folder:notion:liveA" && dynamicItems.filter(\.isProject).first?.detailValue == "600" && dynamicItems.filter(\.isProject).first?.todayTokens == 150,
+        check(dynamicItems.filter(\.isProject).first?.id == "folder:project:liveA" && dynamicItems.filter(\.isProject).first?.detailValue == "600" && dynamicItems.filter(\.isProject).first?.todayTokens == 150,
               "已绑定项目使用真实folder计数与稳定管理项目身份")
         let byURLJSON = """
         {"generated_at":"2026-10-15T06:00:00Z","total_tokens":600,"request_records":10,"legacy_updates":0,
-         "tasks":[{"task_id":"liveA","name":"A","total_tokens":600,"percent":100,"request_records":10,"notion_url":"https://app.notion.com/p/0123456789abcdef0123456789abcdef"}],"other_tasks":[],
-         "management_projects":[{"task_id":"notion:pageA","name":"绑定A","total_tokens":0,"percent":0,"request_records":0,"notion_url":"https://www.notion.so/0123456789abcdef0123456789abcdef"}]}
+         "tasks":[{"project_id":"p-shared","task_id":"liveA","name":"A","total_tokens":600,"percent":100,"request_records":10,"project_url":"obsidian://open?vault=Vault&file=0123456789abcdef0123456789abcdef.md"}],"other_tasks":[],
+         "management_projects":[{"project_id":"p-shared","task_id":"project:pageA","name":"绑定A","total_tokens":0,"percent":0,"request_records":0,"project_url":"obsidian://open?vault=Vault&file=renamed-project.md"}]}
         """
         let byURL = try JSONDecoder().decode(Snapshot.self, from: Data(byURLJSON.utf8))
         check(StripItem.items(byURL).filter(\.isProject).map(\.detailValue) == ["600"] && !StripItem.items(byURL).contains { $0.id == "remainder" },
-              "不同Notion域名的同页可匹配真实用量且不重影")
+              "笔记地址改变后仍按固定项目ID匹配真实用量且不重影")
         check(StripItem.items(pinSnapshot, managementEnabled: false).filter(\.isProject).map(\.title) == ["用量A", "用量B", "用量C", "用量D"],
               "本机模式忽略管理项目缓存，回退原有前四正用量目录")
         let grouped = try JSONDecoder().decode(Snapshot.self, from: Data("""
@@ -510,8 +677,8 @@ struct StripChecks {
           {"task_id":"b","name":"B","total_tokens":300,"percent":30,"request_records":7,"today_tokens":90},
           {"task_id":"unmanaged","name":"Codex目录","total_tokens":100,"percent":10,"request_records":3,"today_tokens":10}],
          "management_projects":[
-          {"task_id":"project-a","task_ids":["a1"],"name":"合并A","total_tokens":999,"percent":99,"request_records":99,"notion_url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-          {"task_id":"project-a-copy","task_ids":["a2","a1"],"name":"合并A副本","total_tokens":999,"percent":99,"request_records":99,"notion_url":"https://www.notion.so/A-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+          {"project_id":"p-a","task_id":"project-a","task_ids":["a1"],"name":"合并A","total_tokens":999,"percent":99,"request_records":99,"project_url":"obsidian://open?vault=Vault&file=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md"},
+          {"project_id":"p-a","task_id":"project-a-copy","task_ids":["a2","a1"],"name":"合并A副本","total_tokens":999,"percent":99,"request_records":99,"project_url":"obsidian://open?vault=Vault&file=A-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md"},
           {"task_id":"project-b","task_ids":["b"],"name":"B","total_tokens":0,"percent":0,"request_records":0},
           {"task_id":"project-c","name":"C","total_tokens":0,"percent":0,"request_records":0},
           {"task_id":"project-d","name":"D","total_tokens":0,"percent":0,"request_records":0},
@@ -519,7 +686,7 @@ struct StripChecks {
         """.utf8))
         let groupedItems = StripItem.items(grouped)
         check(groupedItems.filter(\.isProject).map(\.title) == ["合并A", "B", "C", "D"],
-              "按Notion页合并多folder后排名，正用量优先，零用量同值按稳定ID排序")
+              "按Obsidian页合并多folder后排名，正用量优先，零用量同值按稳定ID排序")
         check(groupedItems[2].detailValue == "600" && groupedItems[2].value == "60.0%" && groupedItems[2].todayTokens == 120 && groupedItems[2].estimatedCost == "≈$6.00",
               "同页多个folder的本周、今日与金额均汇总，不取第一folder冒充项目总量")
         check(groupedItems.last?.members.map(\.task_id) == ["unmanaged"] && groupedItems.last?.managedMembers.map(\.name) == ["E"],
@@ -620,9 +787,9 @@ struct StripChecks {
             check(interaction.expanded == "quota" && interaction.locked, "从\(source)切回周额度仍保持展开")
             interaction.dismiss()
         }
-        let enabled: Set<WidgetKind> = [.horizontal, .vertical, .box]
+        let enabled: Set<WidgetKind> = [.horizontal, .vertical]
         let decoded = try JSONDecoder().decode(Set<WidgetKind>.self, from: JSONEncoder().encode(enabled))
-        check(decoded == enabled, "三个独立开关可同时开启并保存")
+        check(decoded == enabled, "横条与竖条两个开关可同时开启并保存")
         interaction.hover("A", inside: true, zone: "row")
         drain(0.22)
         interaction.hover("A", inside: true, zone: "capsule")
